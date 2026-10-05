@@ -7,10 +7,12 @@ def test_package_smoke():
     import rack_bench
 
     assert rack_bench is not None
-    result = subprocess.run(
+    for command in (
         [sys.executable, str(Path(__file__).resolve().parents[1] / "main.py")],
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "Hello from rack-bench!"
+        [sys.executable, "-m", "rack_bench"],
+        ["rack-bench"],
+    ):
+        result = subprocess.run([*command, "--help"], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        assert "usage: rack-bench" in result.stdout
+        assert "audit" in result.stdout
