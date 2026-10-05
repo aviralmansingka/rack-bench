@@ -7,6 +7,13 @@ from rack_bench.common.host import operation_echo
 from rack_bench.common.models import Result
 from rack_bench.common.output import emit, show_operation
 
+# Registry of audit scopes: CLI subcommand name -> scope module.
+# Each module must expose a module-level CHECKS dict mapping check name ->
+# probe function (a zero-arg callable returning a Check). Check names are
+# "<scope>.<check>", unique across scopes, stable across releases (they are
+# the public API: --only/--skip glob against them and they appear verbatim
+# in the JSON envelope). CHECKS insertion order is the execution order, so
+# dependent probes can rely on their prerequisites having already run.
 SCOPES = {}
 
 
