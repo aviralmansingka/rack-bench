@@ -1,6 +1,5 @@
-def main():
-    print("Hello from rack-bench!")
+from rack_bench.cli import main
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
