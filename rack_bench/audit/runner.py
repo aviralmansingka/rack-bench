@@ -7,8 +7,12 @@ from rack_bench.common.host import operation_echo
 from rack_bench.common.models import Result
 from rack_bench.common.output import emit, show_operation
 
+from . import system
+
 # CLI subcommand name -> scope module exposing CHECKS: {check name -> probe fn}
-SCOPES = {}
+SCOPES = {
+    "system": system,
+}
 
 
 def collect(scope=None, *, only=(), skip=(), show_command=False):
