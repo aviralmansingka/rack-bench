@@ -7,7 +7,7 @@ from rack_bench.common.host import operation_echo
 from rack_bench.common.models import Result
 from rack_bench.common.output import emit, show_operation
 
-from . import gpu, storage, system, topology
+from . import gpu, software, storage, system, topology
 
 # CLI subcommand name -> scope module exposing CHECKS: {check name -> probe fn}
 SCOPES = {
@@ -15,6 +15,7 @@ SCOPES = {
     "gpu": gpu,
     "storage": storage,
     "system": system,
+    "software": software,
 }
 
 
