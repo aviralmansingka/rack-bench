@@ -1,9 +1,11 @@
 """Bench dispatch and internet CLI contracts; no credentials or network required."""
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import dataclass
 from io import StringIO
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -85,16 +87,17 @@ class BenchTests(unittest.TestCase):
                      "tool", "keep-data", "yes", "json", "run-dir", "only", "skip", "show-command", "quiet"):
             self.assertIn("--" + flag, output.getvalue())
 
-    def test_globals_accumulate_before_and_after_stage(self):
+    def test_globals_accumulate_at_all_parser_levels(self):
         with patch.object(runner, "run", return_value=0) as run:
-            main(["--only", "internet.s3.*", "--skip", "*.path.*", "bench", "internet",
+            main(["--only", "internet.s3.*", "--skip", "*.path.*", "bench",
+                  "--only", "internet.gcs.*", "--skip", "*.upload.*", "internet",
                   "--only", "internet.r2.*", "--skip", "*.tcp.*", "--json"])
-        self.assertEqual(run.call_args.kwargs["only"], ["internet.s3.*", "internet.r2.*"])
-        self.assertEqual(run.call_args.kwargs["skip"], ["*.path.*", "*.tcp.*"])
+        self.assertEqual(run.call_args.kwargs["only"], ["internet.s3.*", "internet.gcs.*", "internet.r2.*"])
+        self.assertEqual(run.call_args.kwargs["skip"], ["*.path.*", "*.upload.*", "*.tcp.*"])
         self.assertEqual(run.call_args.kwargs["json_target"], "-")
 
     def test_provider_selection_in_registration_order(self):
-        result = runner.collect(options=internet.Options(providers=("gcs", "r2")))[0]
+        result = runner.collect("internet", options=internet.Options(providers=("gcs", "r2")))[0]
         self.assertEqual([c.name for c in result.checks], ["internet.r2.summary", "internet.gcs.summary"])
 
     def test_filters_prevent_probe_calls(self):
@@ -141,13 +144,15 @@ class BenchTests(unittest.TestCase):
             self.assertEqual(target.read_text(), (Path(tmp) / "bench.values.json").read_text())
             self.assertEqual(output.getvalue(), (Path(tmp) / "bench.out").read_text())
 
-    def test_certify_gate_before_collection_even_when_quiet(self):
-        with tempfile.TemporaryDirectory() as tmp, patch.object(runner, "collect") as collect, \
+    def test_certify_gate_before_probes_even_when_quiet(self):
+        probe = Mock()
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.dict(internet.CHECKS, {"internet.s3.summary": probe}, clear=True), \
              redirect_stderr(StringIO()) as error, redirect_stdout(StringIO()) as output:
             target = Path(tmp) / "unused"
             self.assertEqual(main(["bench", "internet", "--profile", "certify", "--quiet",
                                    "--json", "--run-dir", str(target)]), 2)
-            collect.assert_not_called()
+            probe.assert_not_called()
             self.assertFalse(target.exists())
         self.assertEqual(output.getvalue(), "")
         for expected in ("10 Gbit/s", "2.2 TB", "S3 ~$200", "R2 ~$0", "requires --yes"):
@@ -201,6 +206,103 @@ class BenchTests(unittest.TestCase):
         result = Result("internet", "test-host", checks=[Check("internet.s3.summary", "fail")])
         with patch.object(runner, "collect", return_value=[result]), patch.object(runner, "emit"):
             self.assertEqual(main(["bench", "internet"]), 1)
+
+    def dummy_category(self):
+        @dataclass
+        class Options:
+            duration: str = "forever"
+            tool: str = "native"
+            device: str = "test-device"
+            profile: str = "certify"  # Must not trigger the internet cost gate.
+
+        def add_arguments(parser):
+            parser.add_argument("--duration", choices=("forever", "short"), default="forever")
+            parser.add_argument("--tool", choices=("native", "other"), default="native")
+            parser.add_argument("--device", default="test-device")
+
+        return SimpleNamespace(
+            Options=Options, add_arguments=add_arguments,
+            options_from_args=lambda args: Options(duration=args.duration, tool=args.tool, device=args.device),
+            CHECKS={"dummy.summary": Mock(return_value=Check("dummy.summary", "pass", value=1))})
+
+    def test_bench_parent_help_has_only_generic_flags(self):
+        with redirect_stdout(StringIO()) as output, self.assertRaises(SystemExit) as exit_status:
+            main(["bench", "--help"])
+        self.assertEqual(exit_status.exception.code, 0)
+        self.assertIn("internet", output.getvalue())
+        for flag in ("json", "run-dir", "only", "skip", "show-command", "quiet"):
+            self.assertIn("--" + flag, output.getvalue())
+        for flag in ("providers", "directions", "profile", "regions", "concurrent", "duration",
+                     "tool", "keep-data", "yes"):
+            self.assertNotIn("--" + flag, output.getvalue())
+
+    def test_category_flags_are_not_accepted_on_parent(self):
+        for arguments in (["--providers", "s3"], ["--providers", "s3", "internet"],
+                          ["--duration", "60s", "internet"], ["--yes", "internet"]):
+            with self.subTest(arguments=arguments), redirect_stderr(StringIO()), \
+                 patch.object(runner, "run") as run, self.assertRaises(SystemExit) as error:
+                main(["bench", *arguments])
+            self.assertEqual(error.exception.code, 2)
+            run.assert_not_called()
+
+    def test_dummy_category_owns_colliding_flag_names_and_policy(self):
+        dummy = self.dummy_category()
+        with patch.dict(runner.CATEGORIES, {"dummy": dummy}), patch.object(runner, "emit"), \
+             patch.object(internet, "Options", side_effect=AssertionError("internet default used")), \
+             patch.object(internet, "before_run", side_effect=AssertionError("internet gate used")), \
+             patch.object(internet, "selected_checks", side_effect=AssertionError("internet filter used")):
+            self.assertEqual(main(["bench", "dummy", "--duration", "short", "--tool", "other",
+                                   "--device", "example"]), 0)
+        dummy.CHECKS["dummy.summary"].assert_called_once_with(
+            dummy.Options(duration="short", tool="other", device="example"))
+
+    def test_category_flags_do_not_leak_to_siblings(self):
+        dummy = self.dummy_category()
+        cases = [("dummy", "--providers", "s3"), ("dummy", "--regions", "s3=us-east-1"),
+                 ("dummy", "--duration", "60s"), ("internet", "--duration", "forever"),
+                 ("internet", "--device", "example")]
+        with patch.dict(runner.CATEGORIES, {"dummy": dummy}):
+            for arguments in cases:
+                with self.subTest(arguments=arguments), redirect_stderr(StringIO()), \
+                     self.assertRaises(SystemExit) as error:
+                    main(["bench", *arguments])
+                self.assertEqual(error.exception.code, 2)
+        dummy.CHECKS["dummy.summary"].assert_not_called()
+
+    def test_full_stage_uses_each_category_defaults_and_optional_hooks(self):
+        dummy = self.dummy_category()  # No before_run or selected_checks required.
+        with patch.dict(runner.CATEGORIES, {"dummy": dummy}), patch.object(runner, "emit") as emit:
+            self.assertEqual(main(["bench"]), 0)
+        dummy.CHECKS["dummy.summary"].assert_called_once_with(dummy.Options())
+        results = emit.call_args.args[0]
+        self.assertEqual([result.scope for result in results], ["internet", "dummy"])
+        self.assertEqual([c.name for c in results[0].checks], ["internet.s3.summary", "internet.r2.summary"])
+
+    def test_full_stage_globs_can_select_just_one_category(self):
+        dummy = self.dummy_category()
+        with patch.dict(runner.CATEGORIES, {"dummy": dummy}), patch.object(runner, "emit") as emit:
+            self.assertEqual(main(["bench", "--only", "dummy.*"]), 0)
+        results = emit.call_args.args[0]
+        self.assertEqual(results[0].checks, [])
+        self.assertEqual([c.name for c in results[1].checks], ["dummy.summary"])
+
+    def test_all_category_gates_run_before_any_probe(self):
+        dummy = self.dummy_category()
+        dummy.before_run = Mock(side_effect=ValueError("dummy gate"))
+        probe = Mock()
+        with patch.dict(runner.CATEGORIES, {"dummy": dummy}), \
+             patch.dict(internet.CHECKS, {"internet.s3.summary": probe}, clear=True), \
+             patch.object(runner, "emit") as emit, redirect_stderr(StringIO()) as error:
+            self.assertEqual(main(["bench"]), 2)
+        self.assertIn("dummy gate", error.getvalue())
+        dummy.before_run.assert_called_once_with(dummy.Options())
+        probe.assert_not_called()
+        dummy.CHECKS["dummy.summary"].assert_not_called()
+        emit.assert_not_called()
+
+    def test_category_options_cannot_be_shared_across_full_stage(self):
+        with self.assertRaisesRegex(ValueError, "Category-specific options require a category"):
+            runner.collect(options=internet.Options())
 
     def test_empty_registry_emits_empty_envelope(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(runner.CATEGORIES, {}, clear=True), \

@@ -311,10 +311,18 @@ cleanup are **not**. No network commands run, no objects are created, and no
 credentials are needed. See [the implementation spec](docs/bench-internet.md)
 for the remaining work.
 
+    rack-bench bench --help
+    rack-bench bench internet --help
     rack-bench bench internet
-    rack-bench bench internet --providers s3 --json
+    rack-bench bench internet --providers s3,r2 --json
     rack-bench bench internet --only 'internet.s3.*'
     rack-bench bench internet --profile certify --yes
+
+`internet` is a category subcommand with its own parser. The flags below
+must follow `bench internet`; they are not options of the `bench` parent
+or other categories. `bench --help` shows only categories and generic
+flags; `bench internet --help` shows the internet-specific options too.
+For example, `bench --providers s3 internet` is rejected.
 
 | Flag | Description |
 | --- | --- |
@@ -337,9 +345,11 @@ Each selected provider returns `internet.<provider>.summary` with status
 `expected` will remain `null` until the certification profile schema exists.
 Check names are stable public API. The default run returns two checks (S3
 and R2); GCS is opt-in. Bare `rack-bench bench` runs all registered categories
-(currently only this stub), not the unimplemented design targets above.
+with each category's own defaults (currently only this stub), not the
+unimplemented design targets above.
 
-Standard flags match audit: repeatable `--only`/`--skip` filter check-name
+Standard flags may appear before or after the stage/category and match
+audit: repeatable `--only`/`--skip` filter check-name
 globs (`--skip` wins); an empty selection exits 2. `--json` prints the
 version-1 envelope, while `--json FILE` exports it alongside human stdout.
 `--run-dir DIR` receives `bench.out` and `bench.values.json` (default
