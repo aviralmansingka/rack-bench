@@ -3,6 +3,17 @@ import subprocess
 import sys
 
 
+def test_internet_package_exports():
+    from rack_bench.bench import internet
+    from rack_bench.bench.internet import cli
+
+    assert Path(internet.__file__).name == "__init__.py"
+    assert callable(cli.add_arguments)
+    for name in ("add_arguments", "options_from_args", "before_run", "cost_estimate",
+                 "Options", "PROVIDERS", "DIRECTIONS"):
+        assert getattr(internet, name) is getattr(cli, name)
+
+
 def test_package_smoke():
     import rack_bench
 

@@ -1,10 +1,9 @@
-"""Internet category contract; no network operations are implemented yet."""
+"""Internet-specific arguments, defaults, validation, and cost acceptance."""
 import argparse
 from dataclasses import dataclass, field, fields
 from functools import partial
 import re
 
-from rack_bench.common.models import Check
 from rack_bench.common.output import show_cost_estimate
 
 PROVIDERS = ("s3", "r2", "gcs")
@@ -83,17 +82,6 @@ def add_arguments(parser):
 
 def options_from_args(args):
     return Options(**{item.name: getattr(args, item.name) for item in fields(Options)})
-
-
-def summary(provider, options):
-    return Check(f"internet.{provider}.summary", "skip", detail="not implemented")
-
-
-CHECKS = {f"internet.{provider}.summary": partial(summary, provider) for provider in PROVIDERS}
-
-
-def selected_checks(options):
-    return ((name, probe) for name, probe in CHECKS.items() if name.split(".")[1] in options.providers)
 
 
 def before_run(options):
