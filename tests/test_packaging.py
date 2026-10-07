@@ -16,3 +16,4 @@ def test_package_smoke():
         assert result.returncode == 0, result.stderr
         assert "usage: rack-bench" in result.stdout
         assert "audit" in result.stdout
+        assert "bench" in result.stdout
