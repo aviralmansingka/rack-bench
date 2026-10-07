@@ -1,0 +1,21 @@
+{
+  "commands": {
+    "ip -j -4 route show table all": [{"dst":"default","gateway":"192.0.2.1","dev":"eth0","prefsrc":"192.0.2.10"},{"dst":"192.0.2.0/24","dev":"eth0"}],
+    "ip -j -6 route show table all": [{"dst":"default","gateway":"fe80::1","dev":"eth0","metric":1024}],
+    "ip -j -4 route get 1.1.1.1": [{"dst":"1.1.1.1","gateway":"192.0.2.1","dev":"eth0","prefsrc":"192.0.2.10"}],
+    "ip -j -6 route get 2606:4700:4700::1111": [{"dst":"2606:4700:4700::1111","gateway":"fe80::1","dev":"eth0","src":"2001:db8::10"}],
+    "ip -j -d link": [{"ifname":"lo"},{"ifname":"eth0.100","linkinfo":{"info_kind":"vlan","info_data":{"id":100}}},{"ifname":"vrf-service","linkinfo":{"info_kind":"vrf","info_data":{"table":100}}}],
+    "ip -j -6 addr": [{"ifname":"eth0","addr_info":[{"family":"inet6","local":"2001:db8::10","prefixlen":64,"scope":"global"},{"family":"inet6","local":"fe80::10","scope":"link"}]}],
+    "ip -j -6 route show default": [{"dst":"default","gateway":"fe80::1","dev":"eth0"}]
+  },
+  "resolv_conf": "# managed locally\nnameserver 192.0.2.53 # service resolver\nnameserver 2001:db8::53\nsearch customer.example\noptions edns0 trust-ad\n",
+  "resolved_status": "Global\n       Protocols: -LLMNR +mDNS DNSSEC=yes/supported\n  resolv.conf mode: stub\nLink 2 (eth0)\n    Current Scopes: DNS\n         DNS Servers: 192.0.2.53\n",
+  "environment": "HTTPS_PROXY=\"http://bob:env-secret@proxy.example:8080\"\nno_proxy='localhost,.customer.example'\nUNRELATED=never-return-this\n",
+  "git_proxy": "http.proxy http://bob:git-secret@git-proxy.example:8080\n",
+  "docker_config": {"auths":{"registry.example":{"auth":"docker-auth-secret"}},"proxies":{"default":{"httpProxy":"http://bob:docker-secret@docker-proxy.example:8080","noProxy":"localhost"}}},
+  "daemon_config": {"proxies":{"https-proxy":"http://daemon-proxy.example:8080"}},
+  "network4": {"status":"ok","data":{"asns":["3333"],"prefix":"193.0.0.0/21"}},
+  "network6": {"status":"ok","data":{"asns":["3333"],"prefix":"2001:67c:2e8::/48"}},
+  "roa": {"status":"ok","data":{"status":"valid","validating_roas":[{"origin":"3333","prefix":"193.0.0.0/21","validity":"valid","max_length":21}],"validator":"routinator"}},
+  "ris": {"status":"ok","data":{"origins":[{"origin":3333,"route_objects":["RIPE"]}],"visibility":{"v4":{"ris_peers_seeing":12,"total_ris_peers":100}},"query_time":"2026-04-01T00:00:00"}}
+}

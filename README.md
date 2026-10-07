@@ -14,7 +14,7 @@ three-stage pipeline — **audit → bench → smoke** — that takes a rack fro
   combined stressors (notably GPU compute + interconnect together) to catch
   failures that only appear under sustained, concurrent load.
 
-> **Implementation status:** the `audit` stage (all seven scopes, 108 checks) is
+> **Implementation status:** the `audit` stage (all eight scopes, 122 checks) is
 > implemented and merged. `bench`, `smoke`, `report`, the certification profile
 > (`--config`), and multi-host fan-out (`--hosts`) are specified here as the
 > design target and are not yet implemented.
@@ -88,6 +88,7 @@ to `mpirun`. Independent per-node tests use the fan-out above.
       rack-bench audit topology           # NUMA, PCIe, NVLink fabric map
       rack-bench audit gpu  # GPU inventory, ECC, firmware, power limits
       rack-bench audit network  # NICs, link state, congestion control config
+      rack-bench audit connectivity       # routes, DNS, egress, ASN, ROA, RIS
       rack-bench audit storage  # Disks, NVMe namespaces, filesystems
       rack-bench audit system             # CPU, memory, BIOS, thermal profile
       rack-bench audit software  # OS, kernel, drivers, runtimes, libraries
@@ -179,6 +180,39 @@ no DCGM, no switch credentials). A `SKIP` on a gated field counts as a failure:
   profile; unreachable switches are recorded as `SKIP` (non-gating), with
   host-side RDMA error counters used as the fallback signal
 
+**Connectivity**
+
+- `connectivity.routes`: default routes/gateways and kernel source-IP selection
+  per family, plus VLAN/VRF interfaces; passive `ip` reads, no probes sent
+- `connectivity.resolver`: `/etc/resolv.conf`, systemd-resolved status when
+  available, and locally reported DNSSEC state (not an active validation test)
+- `connectivity.ipv6`: global-scope IPv6 addresses, default route, and libc AAAA
+  query capability (`no-aaaa` setting); not proof of IPv6 Internet reachability
+- `connectivity.proxies`: proxy environment, `/etc/environment`, and readable
+  git/Docker configuration, with embedded URL credentials redacted; proxies may
+  be part of the customer service path
+- `connectivity.egress_ip`: public egress IP per family, preferring direct
+  OpenDNS queries via optional `dig`, with HTTPS ipify fallback. The configured
+  recursive resolver's whoami answer can describe the resolver, not this host;
+  DNS and HTTPS paths (including proxies) can have different egress addresses
+- `connectivity.asn`: RIPEstat announced prefix and origin ASNs for that egress
+- `connectivity.roa`: covering ROA existence and RPKI origin/maxLength validity
+  via RIPEstat `rpki-validation` (coverage does not imply authorization)
+- `connectivity.ris`: exact prefix/origin visibility in RIPE RIS collectors,
+  including routes seen by only one peer; not proof of global propagation
+
+Connectivity makes **~4 external read-only queries** per available address
+family (DNS/HTTPS to RIPEstat/OpenDNS/ipify); fallback attempts, dual-stack, and
+multiple origin ASNs can add queries. Observations are shared within one audit
+run, including filtered runs, not cached across runs. Every external query has
+a hard 5-second deadline, including DNS/HTTPS resolution and response reads.
+External checks **SKIP cleanly offline**, with reasons and exact endpoints in
+`source`. Partial dual-stack observations also SKIP; successful-family values
+remain in JSON alongside the unavailable-family reasons. No credentials are
+required. Local routes/resolver/IPv6/proxy checks remain
+passive; use `--skip 'connectivity.*'` for an audit without these external
+queries, or `--only 'connectivity.routes'` for just passive routing facts.
+
 **NCCL configuration**
 
 - Fabric topology & adapter naming: expected HCA names per rail, plane mapping
@@ -243,6 +277,9 @@ scale-up boundary can silently halve bandwidth without failing loudly.
   versions
 - Workload frameworks: PyTorch, vLLM (anchors the training/inference benches)
 - Toolchain pins: compiler (gcc/nvcc) versions for reproducible bench binaries
+- Internet bench tools: `software.mtr`, `software.fping`, `software.traceroute`,
+  `software.iperf3`, `software.flent`, `software.curl`; missing optional tools
+  SKIP. This is version visibility only, not a dependency of the bench stage.
 
 The software audit produces a single version manifest per host so any
 bench/smoke result can be traced back to the exact stack it ran on; a mismatch

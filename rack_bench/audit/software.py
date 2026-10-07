@@ -232,6 +232,30 @@ def ibverbs():
     return _package("software.ibverbs", "libibverbs*")
 
 
+def mtr():
+    return _version("software.mtr", ["mtr", "--version"])
+
+
+def fping():
+    return _version("software.fping", ["fping", "--version"])
+
+
+def traceroute():
+    return _version("software.traceroute", ["traceroute", "--version"])
+
+
+def iperf3():
+    return _version("software.iperf3", ["iperf3", "--version"])
+
+
+def flent():
+    return _version("software.flent", ["flent", "--version"])
+
+
+def curl():
+    return _version("software.curl", ["curl", "--version"])
+
+
 def nccl_plugins():
     return _package("software.nccl_plugins", "*nccl*net*")
 
@@ -311,6 +335,8 @@ CHECKS = {
     "software.fabric_manager": fabric_manager, "software.docker": docker, "software.runtime_identity": runtime_identity,
     "software.podman": podman, "software.enroot": enroot, "software.nvidia_container_toolkit": nvidia_container_toolkit,
     "software.runc": runc, "software.ofed": ofed, "software.rdma_core": rdma_core, "software.ibverbs": ibverbs,
+    "software.mtr": mtr, "software.fping": fping, "software.traceroute": traceroute,
+    "software.iperf3": iperf3, "software.flent": flent, "software.curl": curl,
     "software.nccl_plugins": nccl_plugins, "software.dcgm": dcgm, "software.dcgm_exporter": dcgm_exporter,
     "software.bmc": bmc, "software.glibc": glibc, "software.lmod": lmod,
     "software.python": python, "software.mpi": mpi,
