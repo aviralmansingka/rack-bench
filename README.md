@@ -183,7 +183,8 @@ no DCGM, no switch credentials). A `SKIP` on a gated field counts as a failure:
 **Connectivity**
 
 - `connectivity.routes`: default routes/gateways and kernel source-IP selection
-  per family, plus VLAN/VRF interfaces; passive `ip` reads, no probes sent
+  per family, plus VLAN/VRF interfaces and policy rules to explain table
+  selection on multi-ISP/VRF nodes; passive `ip` reads, no probes sent
 - `connectivity.resolver`: `/etc/resolv.conf`, systemd-resolved status when
   available, and locally reported DNSSEC state (not an active validation test)
 - `connectivity.ipv6`: global-scope IPv6 addresses, default route, and libc AAAA

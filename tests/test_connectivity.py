@@ -70,8 +70,33 @@ class ConnectivityTests(unittest.TestCase):
         self.assertEqual(check.value["ipv4"]["source_selection"][0]["prefsrc"], "192.0.2.10")
         self.assertEqual(check.value["ipv6"]["source_selection"][0]["src"], "2001:db8::10")
         self.assertEqual([row["ifname"] for row in check.value["vlan_vrf_interfaces"]], ["eth0.100", "vrf-service"])
-        self.assertEqual(len(check.source), 5)
+        self.assertEqual(check.value["policy_rules"], FIXTURE["commands"]["ip -j rule"])
+        self.assertEqual(check.value["policy_rules"][1], {"priority": 100, "src": "192.0.2.0/24", "table": 100})
+        self.assertIn("ip -j rule", check.source)
+        self.assertEqual(len(check.source), 6)
         self.assertIn("no probes", check.detail)
+
+    def test_routes_policy_rules_degrade_independently(self):
+        for error in (Unavailable("ip -j rule", "Rules unavailable"), ValueError("Malformed rules")):
+            def command(args, **kwargs):
+                if args == ["ip", "-j", "rule"]:
+                    raise error
+                return self.command(args, **kwargs)
+            with self.subTest(error=error), patch.object(connectivity, "run_command", side_effect=command):
+                check = connectivity.routes()
+            self.assertEqual(check.status, "pass")
+            self.assertIsNone(check.value["policy_rules"])
+            self.assertEqual(check.value["unavailable"], {"policy_rules": str(error)})
+            self.assertEqual(check.value["ipv4"]["default_routes"][0]["gateway"], "192.0.2.1")
+            self.assertIn("ip -j rule", check.source)
+
+    def test_routes_policy_rules_alone_prevent_all_failed_skip(self):
+        with patch.object(connectivity, "run_command", side_effect=[Unavailable("ip", "Unavailable")] * 5 +
+                          [json.dumps(FIXTURE["commands"]["ip -j rule"])]):
+            check = connectivity.routes()
+        self.assertEqual(check.status, "pass")
+        self.assertEqual(check.value["policy_rules"], FIXTURE["commands"]["ip -j rule"])
+        self.assertEqual(len(check.value["unavailable"]), 5)
 
     def test_routes_empty_missing_and_malformed(self):
         with patch.object(connectivity, "run_command", return_value="[]"):
@@ -79,8 +104,11 @@ class ConnectivityTests(unittest.TestCase):
             self.assertEqual(check.status, "pass")
             self.assertEqual(check.value["ipv6"]["default_routes"], [])
         for error in (Unavailable("ip", "Command not found: ip."), "bad json", "{}"):
-            with self.subTest(error=error), patch.object(connectivity, "run_command", side_effect=[error] * 5):
-                self.assertEqual(connectivity.routes().status, "skip")
+            with self.subTest(error=error), patch.object(connectivity, "run_command", side_effect=[error] * 6) as command:
+                check = connectivity.routes()
+                self.assertEqual(check.status, "skip")
+                self.assertEqual(command.call_count, 6)
+                self.assertIn("ip -j rule", check.source)
 
     def test_resolver_from_files_and_resolved(self):
         with tempfile.TemporaryDirectory() as tmp:

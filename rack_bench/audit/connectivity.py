@@ -63,7 +63,12 @@ def routes():
         except (Unavailable, ValueError) as exc:
             values["vlan_vrf_interfaces"] = None
             errors["interfaces"] = str(exc)
-        if len(errors) == 5:
+        try:
+            values["policy_rules"] = _command_json(["ip", "-j", "rule"], sources)
+        except (Unavailable, ValueError) as exc:
+            values["policy_rules"] = None
+            errors["policy_rules"] = str(exc)
+        if len(errors) == 6:
             raise Unavailable("ip", "; ".join(errors.values()))
         return {**values, "unavailable": errors}
     check = collect_check("connectivity.routes", collect, sources)
