@@ -71,20 +71,28 @@ Run in this order; each is one or more `Check` entries per provider.
 
 1. **Path audit** — `mtr -zsb 100` to each provider endpoint; hop count,
    per-hop AS path, per-hop loss, RTT.
-2. **Sustained upload (egress)** — parallel multipart PUTs of ~1 GiB
+2. **DNS resolution** — resolve each endpoint hostname via the
+   configured resolver; first-resolution time vs cached (repeat
+   lookups); record returned address families.
+3. **Small-object latency** — GET/HEAD on 100 KiB objects, sequential;
+   doubles as the idle-TTFB **baseline** for the loaded-latency signal.
+4. **Sustained upload (egress)** — parallel multipart PUTs of ~1 GiB
    random objects for the profile duration. Random data defeats
-   provider-side compression/dedup.
-3. **Sustained download (ingress)** — parallel range GETs reading back
+   provider-side compression/dedup. **Concurrent small-object TTFB
+   probes** run during the window → loaded-latency signal: p95 under
+   load, inflation vs test 3's baseline.
+5. **Sustained download (ingress)** — parallel range GETs reading back
    the uploaded objects. Downloads read uploads; no pre-seeded data.
-4. **Single-stream** — upload + download with concurrency=1.
-5. **Small-object latency** — GET/HEAD on 100 KiB objects, sequential.
-6. **TCP health** — `ss -ti` retransmit deltas wrapped around tests 2–3;
-   PMTUD probe (`ping -M do`, stepped sizes) to each endpoint.
+6. **Single-stream** — upload + download with concurrency=1.
+7. **TCP health** — `ss -ti` retransmit deltas wrapped around tests
+   4–5; PMTUD probe (`ping -M do`, stepped sizes) to each endpoint.
 
 Directions run sequentially (up fully before down) so each is measured
 on an otherwise idle uplink. Per-op latency samples and per-second
 throughput splits are captured for every throughput test — consistency
 (p50/p95 of 1s buckets) lands in `detail`, not as separate checks.
+Loaded probes are upload-only in v1 (the cheap, high-signal case);
+Flent RRUL remains the certify/smoke-grade follow-up.
 
 ## 5. Profiles
 
@@ -111,7 +119,11 @@ internet.<p>.upload.throughput       float MiB/s sustained
 internet.<p>.upload.objs_per_sec     float
 internet.<p>.download.throughput     float MiB/s sustained
 internet.<p>.download.objs_per_sec   float
+internet.<p>.dns.resolve             float ms first look-up (detail:
+                                     cached ms, family)
 internet.<p>.latency.ttfb            float ms p50 (detail: p99)
+internet.<p>.latency.loaded          float ms p95 TTFB under load
+                                     (detail: baseline, inflation)
 internet.<p>.tcp.pmtud               int   largest passing DF payload
 internet.<p>.tcp.retransmit_ratio    float % across tests 2-4
 internet.<p>.summary                 dict  region, endpoint, tool, bytes
@@ -160,8 +172,9 @@ requires it.
 ## 9. Methodology (fixed; published in README when implemented)
 
 1. Fresh prefix `rack-bench/<ts>/` in a dedicated bench bucket.
-2. Path audit first (idle RTT) → upload → download → single-stream →
-   small-object → TCP health last (retransmits aggregate tests 2–4).
+2. Path audit first (idle RTT) → DNS → small-object (idle TTFB
+   baseline) → upload (loaded probes) → download → single-stream →
+   TCP health last (retransmits aggregate tests 4–6).
 3. Same object size upload and download; downloads read uploads.
 4. Certify: 3 runs, drop best and worst, report mean.
 5. Region pinned and recorded; runs are only comparable across
@@ -174,7 +187,7 @@ requires it.
 | --- | --- |
 | bench dispatch (mirrors audit runner) | 0.5 session |
 | `bench/s3client.py` (SigV4, multipart, range GET) | 1 session |
-| `bench/internet.py` (6 tests, CHECKS, parsing) | 1 session |
+| `bench/internet.py` (7 probes, CHECKS, parsing) | 1 session |
 | Cost gate, README section, integration tests | 0.5 session |
 
 Layout mirrors audit exactly: `CHECKS = {name: fn}` dict, scope module
@@ -302,3 +315,28 @@ storms somewhere on the request path.
 A PMTUD blackhole is the classic "SSH works, big transfers stall"
 failure — worth WARN-grade attention because it silently caps every
 other test's numbers (see §11 decision 4).
+
+### A.7 Loaded latency
+
+| Signal | Good | Bad |
+| --- | --- | --- |
+| p95 TTFB inflation vs idle | <=20 ms | large inflation |
+| TTFB spread while loaded | stable tail | growing tail |
+
+Idle TTFB (A.5) is the baseline; the loaded signal measures
+bufferbloat — queues filling upstream during the upload. >20 ms
+p95 inflation is the gate the Bangalore methodology proposes. Large
+inflation with clean retransmits points at missing queue management
+upstream, not loss.
+
+### A.8 DNS resolution
+
+| Signal | Good | Bad |
+| --- | --- | --- |
+| First look-up ms | regional band | slow or failing |
+| Cached / first ratio | fast cache | no caching benefit |
+| Answers | expected families | SERVFAIL/NXDOMAIN |
+
+Traps: cold resolver caches make "first" look-up ambiguous on the
+first cycle (record which); negative caching can mask a transient
+failure. Any SERVFAIL is a real finding, not noise.
