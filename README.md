@@ -8,16 +8,17 @@ three-stage pipeline — **audit → bench → smoke** — that takes a rack fro
   and any system specs that impact performance (power limits, firmware versions,
   thermal profiles, BIOS settings).
 - **`bench`** — per-component quick pass/fail. Short-duration single-component
-  tests across six categories: `gpu`, `network`, `storage`, `training`,
-  `inference`, `lifecycle`.
+  tests across seven categories: `gpu`, `network`, `internet`, `storage`,
+  `training`, `inference`, `lifecycle`.
 - **`smoke`** — burn-in. Long-duration stress testing per component, plus
   combined stressors (notably GPU compute + interconnect together) to catch
   failures that only appear under sustained, concurrent load.
 
 > **Implementation status:** the `audit` stage (all seven scopes, 108 checks) is
-> implemented and merged. `bench`, `smoke`, `report`, the certification profile
-> (`--config`), and multi-host fan-out (`--hosts`) are specified here as the
-> design target and are not yet implemented.
+> implemented and merged. `bench internet` has dispatch, flags, artifacts, and
+> a cost gate, but returns only `SKIP` placeholders (no measurements). Other
+> `bench` categories, `smoke`, `report`, the certification profile (`--config`),
+> and multi-host fan-out (`--hosts`) remain unimplemented design targets.
 
 ## CLI shape
 
@@ -96,6 +97,7 @@ to `mpirun`. Independent per-node tests use the fan-out above.
     rack-bench bench                      # everything below
       rack-bench bench gpu                # per-GPU compute quick check
       rack-bench bench network            # link + bandwidth quick check
+      rack-bench bench internet           # external network (dispatch stub)
       rack-bench bench storage            # I/O quick check
       rack-bench bench training           # single-node training sanity
       rack-bench bench inference          # inference server sanity
@@ -299,6 +301,70 @@ multi-stream, KV-cache/throughput stability over a short burst.
 
 **lifecycle** — power-cycle timing: BMC-driven cold boot → GPU ready → CUDA
 usable, measured end-to-end; NIC link-up time; time-to-job-ready.
+
+### Internet — external network (spec-status: dispatch stub)
+
+`rack-bench bench internet` targets single-host north-south throughput, path
+quality, and latency to S3 and R2, with GCS opt-in. The dispatch skeleton is
+implemented; measurements, credentials, the S3 client, Warp execution, and
+cleanup are **not**. No network commands run, no objects are created, and no
+credentials are needed. See [the implementation spec](docs/bench-internet.md)
+for the remaining work.
+
+    rack-bench bench --help
+    rack-bench bench internet --help
+    rack-bench bench internet
+    rack-bench bench internet --providers s3,r2 --json
+    rack-bench bench internet --only 'internet.s3.*'
+    rack-bench bench internet --profile certify --yes
+
+`internet` is a category subcommand with its own parser. The flags below
+must follow `bench internet`; they are not options of the `bench` parent
+or other categories. `bench --help` shows only categories and generic
+flags; `bench internet --help` shows the internet-specific options too.
+For example, `bench --providers s3 internet` is rejected.
+
+| Flag | Description |
+| --- | --- |
+| `--providers s3,r2` | Unique comma-separated providers: `s3`, `r2`, `gcs` |
+| `--directions up,down` | Unique comma-separated directions (default both) |
+| `--profile quick\|certify` | Default `quick`; certify requires `--yes` |
+| `--regions s3=us-east-1,...` | Region map; default: provider region |
+| `--concurrent N` | Positive parallel stream count (default 32) |
+| `--duration 60s` | Positive per-test duration: seconds or `s`/`m`/`h` suffix |
+| `--tool stdlib\|warp` | Default `stdlib`; neither executes yet |
+| `--keep-data` | Reserve the future option to skip object cleanup |
+| `--yes` | Accept the certify reference cost estimate |
+
+Duration defaults to 60 seconds for quick and 300 seconds for certify.
+Certify's planned concurrency sweep (1, 8, 32, 64) and three-run reduction
+are not implemented. All workload options are parsed and forwarded only.
+
+Each selected provider returns `internet.<provider>.summary` with status
+`SKIP`, detail `not implemented`, and `value`/`expected` both `null`.
+`expected` will remain `null` until the certification profile schema exists.
+Check names are stable public API. The default run returns two checks (S3
+and R2); GCS is opt-in. Bare `rack-bench bench` runs all registered categories
+with each category's own defaults (currently only this stub), not the
+unimplemented design targets above.
+
+Standard flags may appear before or after the stage/category and match
+audit: repeatable `--only`/`--skip` filter check-name
+globs (`--skip` wins); an empty selection exits 2. `--json` prints the
+version-1 envelope, while `--json FILE` exports it alongside human stdout.
+`--run-dir DIR` receives `bench.out` and `bench.values.json` (default
+`./rack-bench-runs/<timestamp>/`). `--show-command` echoes actual operations
+(none in the stub); `--quiet` suppresses traces and PASS rows, not SKIPs.
+Stub runs exit 0, which is **not** a certification verdict.
+
+Certify always prints a reference estimate to stderr, including with
+`--quiet` or JSON output, and exits 2 before collection/artifacts unless
+`--yes` is present. The spec's 10 Gbit/s baseline is ~2.2 TB per provider:
+S3 ~$200, R2 $0, GCS ~$260. Only selected providers are listed. These are
+reference figures, not adjusted for duration, concurrency, direction, or
+check filters; the current stub transfers nothing and incurs no charges.
+For comparison, the planned quick baseline is ~75 GB per provider (S3 ~$7,
+R2 $0, GCS ~$9).
 
 ## Stage 3 — smoke (burn-in)
 

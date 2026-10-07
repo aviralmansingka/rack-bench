@@ -4,6 +4,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import sys
 
 from .models import Result
 
@@ -15,6 +16,13 @@ def render_json(results: list[Result]) -> str:
 
 def show_operation(check_name, operation):
     print(f"[{check_name}] {operation}", flush=True)
+
+
+def show_cost_estimate(estimates):
+    costs = ", ".join(f"{provider.upper()} ~${cost}" for provider, cost in estimates.items())
+    print("Certify reference estimate at 10 Gbit/s: ~2.2 TB per provider; " + costs + ".\n"
+          "Not adjusted for overrides or check/direction filters; actual charges may vary.\n"
+          "Dispatch stub only: no transfers or charges in this implementation.", file=sys.stderr)
 
 
 def render_human(results: list[Result], *, quiet=False) -> str:
