@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from rack_bench.audit import network, runner
+from rack_bench.audit import nccl, network, runner
 from rack_bench.common.host import Unavailable
 from rack_bench.common.models import Check
 
@@ -128,13 +128,18 @@ class NetworkTests(unittest.TestCase):
              patch.object(network, "run_command", return_value="Id=ufm.service\nLoadState=not-found\nActiveState=inactive"):
             self.assertEqual(network.ufm().status, "skip")
 
-    def test_nic_registration_order_and_nccl_deferred(self):
+    def test_nic_registration_order_and_nccl_under_network(self):
         self.assertIs(runner.SCOPES["network"], network)
         names = list(network.CHECKS)
         self.assertEqual(names[names.index("network.rdma_ports") + 1], "network.gpudirect_rdma")
         self.assertEqual(names[names.index("network.congestion_control") + 1], "network.pkeys")
         self.assertEqual(names[names.index("network.switch") + 1], "network.ufm")
-        self.assertFalse(any(name.startswith("nccl.") for module in runner.SCOPES.values() for name in module.CHECKS))
+        self.assertEqual(names[-len(nccl.CHECKS):], list(nccl.CHECKS))
+        for name, probe in nccl.CHECKS.items():
+            self.assertIs(network.CHECKS[name], probe)
+        self.assertNotIn("nccl", runner.SCOPES)
+        self.assertNotIn("nccl.queue_pairs", network.CHECKS)
+        self.assertNotIn("nccl.all_reduce_canary", network.CHECKS)
 
     def test_no_rdma_devices(self):
         with patch.object(network, "run_command", return_value="No IB devices found"):

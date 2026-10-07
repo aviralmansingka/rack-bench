@@ -8,6 +8,8 @@ import shutil
 from rack_bench.common.host import Unavailable, collect_check, read_text, run_command
 from rack_bench.common.models import Check
 
+from . import nccl
+
 
 def nic_inventory():
     def collect():
@@ -215,4 +217,5 @@ CHECKS = {
     "network.congestion_control": congestion_control, "network.pkeys": pkeys,
     "network.tcp_config": tcp_config, "network.switch": switch, "network.ufm": ufm,
     "network.rdma_error_counters": rdma_error_counters,
+    **nccl.CHECKS,
 }
