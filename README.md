@@ -36,11 +36,50 @@ full stage. The most common certification flow is just three commands:
 | --- | --- |
 | `--json <file>` | Machine-readable results (also written to the run dir) |
 | `--run-dir <dir>` | Artifact directory (default `./rack-bench-runs/<ts>/`) |
-| `--hosts <list\|file>` | Remote nodes via ssh fan-out (default: localhost) |
+| `--hosts <list\|file\|group>` | SSH fan-out to certification-unit nodes |
 | `--config <file>` | Certification profile (spec, thresholds, durations) |
 | `--continue-on-fail` | Don't abort the run when a test fails |
 | `--only <pattern>` / `--skip <pattern>` | Filter tests by name glob |
 | `--show-command` | Echo each command/file read to stdout, with check name |
+
+### Multi-node execution (`--hosts`)
+
+`--hosts` accepts a literal host list, a `@hostfile` path, or a named group
+from the certification profile; the default is `localhost`. `all-nodes`
+resolves to the certification unit's node manifest — the trays this
+acceptance covers, declared in the profile (the 18 trays of an NVL72, or a
+multi-rack acceptance batch).
+
+Resolution is manifest-driven, not discovery-driven:
+
+1. The profile declares the expected nodes (literal list or pattern).
+2. If rack-manager (BMC/Redfish) credentials are configured, rack-bench
+   enumerates what the rack itself reports and diffs it against the
+   manifest — declared-but-unreachable or present-but-undeclared trays
+   are findings in the rollup.
+3. The audit ssh-fans-out (key-based, the certification user) to every
+   host in parallel, collects one envelope per host, and rolls up per-tray
+   results, cross-tray version-manifest drift, and per-tray NVLink health.
+   Unreachable or hung hosts are recorded as loud failures — an acceptance
+   run can never pass on a partial rack.
+
+rack-bench never scans subnets or sweeps for whatever answers; fleet
+discovery is out of scope.
+
+**Bootstrapping an NVL72** (first contact, before any profile exists):
+
+1. Run `rack-bench audit` on one tray (localhost mode) — this captures the
+   fabric domain UUID and topology that identify the rack.
+2. Pull the node manifest from the rack manager, or take it from the order
+   spec (18 trays).
+3. Write the profile: node manifest, ssh user/key, BMC credentials.
+4. Run `rack-bench audit --hosts all-nodes` — manifest/BMC cross-check
+   plus the full 18-tray fan-out with rollup.
+
+Coordinated multi-node tests (bench-network collectives, cross-rack smoke)
+do not use the ssh fan-out: rack-bench generates a rankfile from the
+audited topology (GPU/NIC/NUMA locality per tray) and delegates rendezvous
+to `mpirun`. Independent per-node tests use the fan-out above.
 | `--verbose` / `--quiet` | Output verbosity |
 
 ### Command tree
