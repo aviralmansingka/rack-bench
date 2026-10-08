@@ -79,7 +79,7 @@ class LatencyTests(unittest.TestCase):
             self.assertEqual(stats[field]["p99"], expected)
         self.assertEqual(detail["baseline_ms"]["p95"], 2)
         self.assertEqual(self.client.gets, 20)
-        self.assertIn("content-md5", self.client.upload_headers)
+        self.assertNotIn("content-md5", self.client.upload_headers)  # one checksum at a time
         self.assertIn("x-amz-checksum-crc32", self.client.upload_headers)
         self.assertIn("https://bench-bucket.s3.ap-south-1.amazonaws.com/", check.source[0])
 
