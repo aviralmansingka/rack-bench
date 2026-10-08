@@ -22,7 +22,24 @@ def show_cost_estimate(estimates):
     costs = ", ".join(f"{provider.upper()} ~${cost}" for provider, cost in estimates.items())
     print("Certify reference estimate at 10 Gbit/s: ~2.2 TB per provider; " + costs + ".\n"
           "Not adjusted for overrides or check/direction filters; actual charges may vary.\n"
-          "Only context/baseline probes are live; small-object requests may incur charges. Bulk probes remain unimplemented.", file=sys.stderr)
+          "Bulk transfers are live; small-object requests may incur charges too. "
+          "Nearest band uses full windows; far bands omit bulk and cap single-stream at 32 MiB each direction.", file=sys.stderr)
+
+
+def internet_summary(value):
+    """Compact full-provider rollup; the probe supplies data, never display text."""
+    checks = value.get("checks", {})
+    rates = []
+    for direction in ("upload", "download"):
+        check = checks.get(f"{direction}.throughput", {})
+        if check.get("status") == "pass":
+            rates.append(f"{direction}={check['value']:.2f} MiB/s")
+    counts = Counter(check["status"] for check in checks.values())
+    payload = value.get("bytes", {})
+    return (f"{value['region']} {value['endpoint']} tool={value['tool']}; " +
+            ", ".join(rates or ["no sustained rate observed"]) +
+            f"; bytes up={payload.get('uploaded', 0)} down={payload.get('downloaded', 0)}; " +
+            " ".join(f"{status.upper()}={counts[status]}" for status in ("pass", "warn", "fail", "skip")))
 
 
 def render_human(results: list[Result], *, quiet=False) -> str:
@@ -33,6 +50,9 @@ def render_human(results: list[Result], *, quiet=False) -> str:
             if quiet and check.status == "pass":
                 continue
             value = check.detail if check.status == "skip" else json.dumps(check.value, ensure_ascii=True)
+            if (check.status == "pass" and check.name.startswith("internet.") and
+                    check.name.endswith(".summary") and isinstance(check.value, dict) and "checks" in check.value):
+                value = internet_summary(check.value)
             if check.status in ("warn", "fail") and check.detail:
                 value += "; " + check.detail
             if check.expected is not None:

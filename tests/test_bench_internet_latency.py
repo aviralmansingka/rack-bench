@@ -174,13 +174,14 @@ class LatencyTests(unittest.TestCase):
         self.assertIn("Warp execution not implemented", self.probe().detail)
         self.factory.assert_not_called()
 
-    def test_part_two_remains_not_implemented(self):
-        suffixes = ("upload.throughput", "upload.objs_per_sec", "download.throughput",
-                    "download.objs_per_sec", "latency.loaded", "tcp.pmtud", "tcp.retransmit_ratio", "summary")
-        for suffix in suffixes:
+    def test_part_two_dependencies_do_not_launch_hidden_uploads(self):
+        for suffix, needed in (("download.throughput", "upload objects"),
+                               ("latency.loaded", "baseline_ms.p95"),
+                               ("tcp.retransmit_ratio", "transfer windows")):
             name = f"internet.s3.{suffix}"
             check = CHECKS[name](self.options)
-            self.assertEqual((check.name, check.status, check.detail), (name, "skip", "not implemented"))
+            self.assertEqual((check.name, check.status), (name, "skip"))
+            self.assertIn(needed, check.detail)
 
     def test_new_collection_clears_cached_path_and_prefix(self):
         self.options._internet_prefix = "rack-bench/old/"

@@ -17,13 +17,16 @@ class Options:
     profile: str = "quick"
     regions: dict[str, str] = field(default_factory=dict)
     buckets: dict[str, str] = field(default_factory=dict)
-    concurrent: int = 32
+    concurrent: int | None = None
     duration: int | None = None  # seconds per test; defaults depend on profile
     tool: str = "stdlib"
     keep_data: bool = False
     yes: bool = False
 
     def __post_init__(self):
+        self._concurrent_override = self.concurrent is not None
+        if self.concurrent is None:
+            self.concurrent = 32
         if self.duration is None:
             self.duration = 300 if self.profile == "certify" else 60
 
@@ -92,7 +95,7 @@ def add_arguments(parser):
                         help="region overrides; otherwise use provider defaults")
     parser.add_argument("--buckets", type=buckets, default={}, metavar="PROVIDER=BUCKET,...",
                         help="existing buckets, e.g. s3=my-bench,r2=my-bench; required for object probes")
-    parser.add_argument("--concurrent", type=positive_int, default=32, metavar="N",
+    parser.add_argument("--concurrent", type=positive_int, metavar="N",
                         help="parallel streams (default: 32)")
     parser.add_argument("--duration", type=duration_seconds, metavar="DURATION",
                         help="per-test duration: seconds, Ns, Nm, Nh (default: quick 60s, certify 5m)")
@@ -107,8 +110,8 @@ def options_from_args(args):
 
 def before_run(options):
     # Options may be reused by library callers; measurements/prefixes are run-local.
-    options.__dict__.pop("_path_reports", None)
-    options.__dict__.pop("_internet_prefix", None)
+    for cache in ("_path_reports", "_internet_prefix", "_transfer_reports", "_transfer_owners", "_internet_checks"):
+        options.__dict__.pop(cache, None)
     if options.profile == "certify":
         show_cost_estimate(cost_estimate(options))
         if not options.yes:

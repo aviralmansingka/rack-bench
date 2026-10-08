@@ -1,8 +1,9 @@
 # Spec: `rack-bench bench internet` — external network certification
 
-Status: **implementation in progress**; context/baseline probes are live
-(Session 3 Part 1); bulk/loaded/TCP/summary probes remain placeholders. Session
-2 contracts are frozen (§11). Companion research:
+Status: **v1 probes implemented** (Session 3 Parts 1–2): context, baseline,
+bulk/loaded, single-stream, TCP and summary. Live cloud transfer
+interoperability has not been certified. Remaining limitations are listed in
+§11. Session 2 contracts are frozen (§11). Companion research:
 `research/internet-performance` branch (`docs/internet-performance.md` —
 industry methodology, sources, and the full reliability-test taxonomy this
 derives from).
@@ -315,12 +316,13 @@ request fees and custom overrides still belong in the eventual cost gate. The
 current estimate is a full-transfer reference, not a quote for the probes
 implemented so far.
 
-Remaining implementation residue: bulk/loaded/single-stream/TCP/summary probes,
-GCS interoperability, certification thresholds/profile schema, optional Warp
-execution, effective matrix-aware cost estimates, and the captain-owned README
-rework. Context and small-object baseline probes now make live measurements;
-reference cost output is not a quote for their bounded traffic. Missing
-credentials still SKIP every provider check, including context and placeholders.
+Remaining implementation residue: GCS interoperability, certification
+thresholds/profile schema, optional Warp execution, and effective matrix-aware
+cost estimates. All v1 probes are implemented; cloud transfer interoperability
+still requires a paid live exercise. Reference cost output is not a quote for
+custom runs. Missing credentials still SKIP every provider check, including
+context and summary. See README for orchestration, TCP sampling limitations,
+part-boundary duration overruns, and filtered-prerequisite behavior.
 
 ## 12. Deferred extension: self-hosted diagnostic endpoints
 

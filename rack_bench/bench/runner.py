@@ -37,19 +37,27 @@ def collect(category=None, *, options=None, only=(), skip=(), show_command=False
     for name, module, category_options in selected:
         result = Result(scope=name, host=socket.gethostname())
         checks = module.selected_checks(category_options) if hasattr(module, "selected_checks") else module.CHECKS.items()
-        for check_name, probe in checks:
-            if only and not any(fnmatchcase(check_name, pattern) for pattern in only):
-                continue
-            if any(fnmatchcase(check_name, pattern) for pattern in skip):
-                continue
-            token = operation_echo.set(partial(show_operation, check_name) if show_command else None)
-            try:
-                check = probe(category_options)
-            finally:
-                operation_echo.reset(token)
-            if check.name != check_name:
-                raise ValueError(f"Registered check {check_name} returned mismatched name {check.name}.")
-            result.checks.append(check)
+        try:
+            for check_name, probe in checks:
+                if only and not any(fnmatchcase(check_name, pattern) for pattern in only):
+                    continue
+                if any(fnmatchcase(check_name, pattern) for pattern in skip):
+                    continue
+                token = operation_echo.set(partial(show_operation, check_name) if show_command else None)
+                try:
+                    check = probe(category_options)
+                finally:
+                    operation_echo.reset(token)
+                if check.name != check_name:
+                    raise ValueError(f"Registered check {check_name} returned mismatched name {check.name}.")
+                result.checks.append(check)
+        finally:
+            if hasattr(module, "after_run"):
+                token = operation_echo.set(partial(show_operation, f"{name}.cleanup") if show_command else None)
+                try:
+                    module.after_run(category_options, result)
+                finally:
+                    operation_echo.reset(token)
         results.append(result)
     if CATEGORIES and not any(result.checks for result in results):
         raise ValueError("No bench checks matched the selection.")
