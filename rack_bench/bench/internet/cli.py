@@ -16,6 +16,7 @@ class Options:
     directions: tuple[str, ...] = DIRECTIONS
     profile: str = "quick"
     regions: dict[str, str] = field(default_factory=dict)
+    buckets: dict[str, str] = field(default_factory=dict)
     concurrent: int = 32
     duration: int | None = None  # seconds per test; defaults depend on profile
     tool: str = "stdlib"
@@ -46,6 +47,24 @@ def regions(value):
     return result
 
 
+def buckets(value):
+    result = {}
+    for item in value.split(","):
+        provider, separator, bucket = item.strip().partition("=")
+        if (not separator or provider not in PROVIDERS or
+                not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket) or
+                ".." in bucket or ".-" in bucket or "-." in bucket or
+                re.fullmatch(r"[0-9]+(?:\.[0-9]+){3}", bucket) or
+                provider == "s3" and "." in bucket):
+            raise argparse.ArgumentTypeError(
+                "expected provider=bucket pairs with DNS-compatible bucket names "
+                "(S3 virtual-hosted TLS names cannot contain dots)")
+        if provider in result:
+            raise argparse.ArgumentTypeError(f"duplicate bucket for {provider}")
+        result[provider] = bucket
+    return result
+
+
 def positive_int(value):
     try:
         number = int(value)
@@ -71,12 +90,14 @@ def add_arguments(parser):
     parser.add_argument("--profile", choices=("quick", "certify"), default="quick")
     parser.add_argument("--regions", type=regions, default={}, metavar="PROVIDER=REGION,...",
                         help="region overrides; otherwise use provider defaults")
+    parser.add_argument("--buckets", type=buckets, default={}, metavar="PROVIDER=BUCKET,...",
+                        help="existing buckets, e.g. s3=my-bench,r2=my-bench; required for object probes")
     parser.add_argument("--concurrent", type=positive_int, default=32, metavar="N",
                         help="parallel streams (default: 32)")
     parser.add_argument("--duration", type=duration_seconds, metavar="DURATION",
                         help="per-test duration: seconds, Ns, Nm, Nh (default: quick 60s, certify 5m)")
     parser.add_argument("--tool", choices=("stdlib", "warp"), default="stdlib")
-    parser.add_argument("--keep-data", action="store_true", help="skip bucket cleanup (stub: no data created)")
+    parser.add_argument("--keep-data", action="store_true", help="retain objects under this run's rack-bench/ prefix")
     parser.add_argument("--yes", action="store_true", help="accept the certify reference cost estimate")
 
 
@@ -85,6 +106,9 @@ def options_from_args(args):
 
 
 def before_run(options):
+    # Options may be reused by library callers; measurements/prefixes are run-local.
+    options.__dict__.pop("_path_reports", None)
+    options.__dict__.pop("_internet_prefix", None)
     if options.profile == "certify":
         show_cost_estimate(cost_estimate(options))
         if not options.yes:
