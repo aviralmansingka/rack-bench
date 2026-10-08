@@ -128,10 +128,10 @@ class PayloadTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             s3.SeededPayload("x", 1, 0)
 
-    def test_checksum_headers_known_crc32_md5_sha256(self):
+    def test_checksum_headers_known_crc32_sha256(self):
         headers = s3.checksum_headers((b"123", b"456789"))
         self.assertEqual(headers["x-amz-checksum-crc32"], "y/Q5Jg==")
-        self.assertEqual(headers["content-md5"], "JfnnlDI7RTiF9RgfG2JNCw==")
+        self.assertNotIn("content-md5", headers)  # one checksum at a time
         self.assertEqual(headers["x-amz-content-sha256"],
                          "15e2b0d3c33891ebb0f1ef609ec419420c20e320ce94c65fbc8c3312448eb225")
 
@@ -195,7 +195,6 @@ class MockS3(BaseHTTPRequestHandler):
         record = {"method": self.command, "path": self.path, "headers": headers}
         state["requests"].append(record)
         remaining = int(headers.get("content-length", "0"))
-        md5 = hashlib.md5(usedforsecurity=False)
         sha = hashlib.sha256()
         crc = 0
         xml = bytearray()
@@ -205,7 +204,6 @@ class MockS3(BaseHTTPRequestHandler):
                 return
             remaining -= len(data)
             state["max_read"] = max(state["max_read"], len(data))
-            md5.update(data)
             sha.update(data)
             crc = zlib.crc32(data, crc)
             if self.command == "POST":
@@ -224,10 +222,9 @@ class MockS3(BaseHTTPRequestHandler):
             self.reply(400, b"<Error><Code>BadDigest</Code></Error>")
             return
         if self.command == "PUT" or xml:
-            expected_md5 = base64.b64encode(md5.digest()).decode()
             expected_crc = base64.b64encode(crc.to_bytes(4, "big")).decode()
             record["crc32"] = expected_crc
-            if (headers.get("content-md5") != expected_md5 or
+            if ("content-md5" in headers or
                     self.command == "PUT" and headers.get("x-amz-checksum-crc32") != expected_crc or
                     state.get("reject_digest")):
                 self.reply(400, b"<Error><Code>InvalidDigest</Code></Error>")

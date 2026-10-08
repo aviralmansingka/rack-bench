@@ -227,16 +227,18 @@ class SeededPayload:
 
 
 def checksum_headers(chunks: Iterable[bytes]) -> dict[str, str]:
-    """One bounded pre-pass; MD5/CRC32 request server verification on every PUT."""
+    """One bounded pre-pass; CRC32 request server verification on every PUT.
+
+    S3 forbids combining the legacy content-md5 with a flexible x-amz-checksum-*
+    header ("You can only specify one non-default checksum at a time"), so
+    uploads carry CRC32 only; x-amz-content-sha256 is the SigV4 payload hash.
+    """
     sha = hashlib.sha256()
-    md5 = hashlib.md5(usedforsecurity=False)
     crc = 0
     for chunk in chunks:
         sha.update(chunk)
-        md5.update(chunk)
         crc = zlib.crc32(chunk, crc)
     return {"x-amz-content-sha256": sha.hexdigest(),
-            "content-md5": base64.b64encode(md5.digest()).decode(),
             "x-amz-checksum-crc32": base64.b64encode(crc.to_bytes(4, "big")).decode()}
 
 
@@ -332,8 +334,12 @@ class S3Client:
         query = tuple(query)
         if query:
             target += "?" + encoded_query(query)
+        # content-length is sent but never signed: providers canonicalize
+        # zero-length bodies inconsistently (R2 signs it as an empty value),
+        # and known-good signers (aws cli/botocore) leave it unsigned.
         request_headers = dict(headers or {})
-        request_headers.update({"host": authority, "content-length": str(size)})
+        request_headers.update({"host": authority})
+        transport_only = {"content-length": str(size)}
         digest = request_headers.get("x-amz-content-sha256", hashlib.sha256(b"").hexdigest())
         attempts = 1 if measurement else self.control_retries + 1
         for attempt in range(1, attempts + 1):
@@ -358,7 +364,7 @@ class S3Client:
                 signed = sign_headers(self.credentials, method, path, query,
                                       request_headers, digest, endpoint.region)
                 conn.putrequest(method, target, skip_host=True, skip_accept_encoding=True)
-                for name, value in signed.items():
+                for name, value in {**signed, **transport_only}.items():
                     conn.putheader(name, value)
                 connect_start = time.perf_counter()
                 conn.connect()
