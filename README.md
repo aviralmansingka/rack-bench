@@ -15,10 +15,11 @@ three-stage pipeline — **audit → bench → smoke** — that takes a rack fro
   failures that only appear under sustained, concurrent load.
 
 > **Implementation status:** the `audit` stage (all eight scopes, 122 checks) is
-> implemented and merged. `bench internet` has dispatch, flags, artifacts, and
-> a cost gate, but returns only `SKIP` placeholders (no measurements). Other
-> `bench` categories, `smoke`, `report`, the certification profile (`--config`),
-> and multi-host fan-out (`--hosts`) remain unimplemented design targets.
+> implemented and merged. `bench internet` measures paths, DNS, idle/loaded
+> latency, sustained and single-stream transfers, PMTUD, and TCP retransmits.
+> Other `bench` categories, `smoke`, `report`, the certification profile
+> (`--config`), and multi-host fan-out (`--hosts`) remain unimplemented design
+> targets.
 
 ## CLI shape
 
@@ -33,55 +34,55 @@ full stage. The most common certification flow is just three commands:
 
 ### Global options
 
-| Flag | Description |
-| --- | --- |
-| `--json <file>` | Machine-readable results (also written to the run dir) |
-| `--run-dir <dir>` | Artifact directory (default `./rack-bench-runs/<ts>/`) |
-| `--hosts <list\|file\|group>` | SSH fan-out to certification-unit nodes |
-| `--config <file>` | Certification profile (spec, thresholds, durations) |
-| `--continue-on-fail` | Don't abort the run when a test fails |
-| `--only <pattern>` / `--skip <pattern>` | Filter tests by name glob |
-| `--show-command` | Echo each command/file read to stdout, with check name |
+| Flag                                    | Description                                            |
+| --------------------------------------- | ------------------------------------------------------ |
+| `--json <file>`                         | Machine-readable results (also written to the run dir) |
+| `--run-dir <dir>`                       | Artifact directory (default `./rack-bench-runs/<ts>/`) |
+| `--hosts <list\|file\|group>`           | SSH fan-out to certification-unit nodes                |
+| `--config <file>`                       | Certification profile (spec, thresholds, durations)    |
+| `--continue-on-fail`                    | Don't abort the run when a test fails                  |
+| `--only <pattern>` / `--skip <pattern>` | Filter tests by name glob                              |
+| `--show-command`                        | Echo each command/file read to stdout, with check name |
 
 ### Multi-node execution (`--hosts`)
 
-`--hosts` accepts a literal host list, a `@hostfile` path, or a named group
-from the certification profile; the default is `localhost`. `all-nodes`
-resolves to the certification unit's node manifest — the trays this
-acceptance covers, declared in the profile (the 18 trays of an NVL72, or a
-multi-rack acceptance batch).
+`--hosts` accepts a literal host list, a `@hostfile` path, or a named group from
+the certification profile; the default is `localhost`. `all-nodes` resolves to
+the certification unit's node manifest — the trays this acceptance covers,
+declared in the profile (the 18 trays of an NVL72, or a multi-rack acceptance
+batch).
 
 Resolution is manifest-driven, not discovery-driven:
 
 1. The profile declares the expected nodes (literal list or pattern).
 2. If rack-manager (BMC/Redfish) credentials are configured, rack-bench
-   enumerates what the rack itself reports and diffs it against the
-   manifest — declared-but-unreachable or present-but-undeclared trays
-   are findings in the rollup.
-3. The audit ssh-fans-out (key-based, the certification user) to every
-   host in parallel, collects one envelope per host, and rolls up per-tray
-   results, cross-tray version-manifest drift, and per-tray NVLink health.
-   Unreachable or hung hosts are recorded as loud failures — an acceptance
-   run can never pass on a partial rack.
+   enumerates what the rack itself reports and diffs it against the manifest —
+   declared-but-unreachable or present-but-undeclared trays are findings in the
+   rollup.
+3. The audit ssh-fans-out (key-based, the certification user) to every host in
+   parallel, collects one envelope per host, and rolls up per-tray results,
+   cross-tray version-manifest drift, and per-tray NVLink health. Unreachable or
+   hung hosts are recorded as loud failures — an acceptance run can never pass
+   on a partial rack.
 
-rack-bench never scans subnets or sweeps for whatever answers; fleet
-discovery is out of scope.
+rack-bench never scans subnets or sweeps for whatever answers; fleet discovery
+is out of scope.
 
 **Bootstrapping an NVL72** (first contact, before any profile exists):
 
 1. Run `rack-bench audit` on one tray (localhost mode) — this captures the
    fabric domain UUID and topology that identify the rack.
-2. Pull the node manifest from the rack manager, or take it from the order
-   spec (18 trays).
+2. Pull the node manifest from the rack manager, or take it from the order spec
+   (18 trays).
 3. Write the profile: node manifest, ssh user/key, BMC credentials.
-4. Run `rack-bench audit --hosts all-nodes` — manifest/BMC cross-check
-   plus the full 18-tray fan-out with rollup.
+4. Run `rack-bench audit --hosts all-nodes` — manifest/BMC cross-check plus the
+   full 18-tray fan-out with rollup.
 
-Coordinated multi-node tests (bench-network collectives, cross-rack smoke)
-do not use the ssh fan-out: rack-bench generates a rankfile from the
-audited topology (GPU/NIC/NUMA locality per tray) and delegates rendezvous
-to `mpirun`. Independent per-node tests use the fan-out above.
-| `--verbose` / `--quiet` | Output verbosity |
+Coordinated multi-node tests (bench-network collectives, cross-rack smoke) do
+not use the ssh fan-out: rack-bench generates a rankfile from the audited
+topology (GPU/NIC/NUMA locality per tray) and delegates rendezvous to `mpirun`.
+Independent per-node tests use the fan-out above. | `--verbose` / `--quiet` |
+Output verbosity |
 
 ### Command tree
 
@@ -98,7 +99,7 @@ to `mpirun`. Independent per-node tests use the fan-out above.
     rack-bench bench                      # everything below
       rack-bench bench gpu                # per-GPU compute quick check
       rack-bench bench network            # link + bandwidth quick check
-      rack-bench bench internet           # external network (dispatch stub)
+      rack-bench bench internet           # external network measurements
       rack-bench bench storage            # I/O quick check
       rack-bench bench training           # single-node training sanity
       rack-bench bench inference          # inference server sanity
@@ -141,8 +142,8 @@ no DCGM, no switch credentials). A `SKIP` on a gated field counts as a failure:
   root or group membership and skip honestly without it; Redfish needs
   credentials, not root.
 - For certification, audit as a regular cluster user to validate non-root GPU
-  usability; optionally re-run only root-gated probes, e.g. `sudo rack-bench
-  audit --only 'system.dram'`.
+  usability; optionally re-run only root-gated probes, e.g.
+  `sudo rack-bench audit --only 'system.dram'`.
 - Running everything as root weakens the `gpu_permissions` finding; non-root
   CUDA usability is functionally verified in bench.
 
@@ -207,14 +208,14 @@ no DCGM, no switch credentials). A `SKIP` on a gated field counts as a failure:
 Connectivity makes **~4 external read-only queries** per available address
 family (DNS/HTTPS to RIPEstat/OpenDNS/ipify); fallback attempts, dual-stack, and
 multiple origin ASNs can add queries. Observations are shared within one audit
-run, including filtered runs, not cached across runs. Every external query has
-a hard 5-second deadline, including DNS/HTTPS resolution and response reads.
+run, including filtered runs, not cached across runs. Every external query has a
+hard 5-second deadline, including DNS/HTTPS resolution and response reads.
 External checks **SKIP cleanly offline**, with reasons and exact endpoints in
 `source`. Partial dual-stack observations also SKIP; successful-family values
 remain in JSON alongside the unavailable-family reasons. No credentials are
-required. Local routes/resolver/IPv6/proxy checks remain
-passive; use `--skip 'connectivity.*'` for an audit without these external
-queries, or `--only 'connectivity.routes'` for just passive routing facts.
+required. Local routes/resolver/IPv6/proxy checks remain passive; use
+`--skip 'connectivity.*'` for an audit without these external queries, or
+`--only 'connectivity.routes'` for just passive routing facts.
 
 **NCCL configuration**
 
@@ -231,9 +232,9 @@ queries, or `--only 'connectivity.routes'` for just passive routing facts.
 - Multi-node NVLink path: IMEX daemon state and host-level NVLink fabric config;
   jobs must not silently cross the NVLink domain onto RDMA
 
-Active validation of the NCCL fabric belongs to bench, not audit: `bench
-network` runs the queue-pair sanity per rail (QP creation mutates RDMA state)
-and the 2-rank all-reduce canary that validates the config end-to-end.
+Active validation of the NCCL fabric belongs to bench, not audit:
+`bench network` runs the queue-pair sanity per rail (QP creation mutates RDMA
+state) and the 2-rank all-reduce canary that validates the config end-to-end.
 
 NCCL misconfiguration is the single richest source of "cluster mysteriously
 slow" bugs — wrong HCA pinning, missing plugins, or jobs spilling across the
@@ -328,13 +329,12 @@ latency (all-reduce), SM clock stability under load.
 bandwidth matrix sample, small-message latency, packet-loss counter check, and
 the NCCL collective bandwidth sweep: allreduce, allgather, and alltoall across
 message sizes from 8 B to 16 GB, launched through both MPI and
-`torch.distributed`, reporting algbw/busbw as a percentage of line rate
-(untuned RoCEv2 sits near 60%, tuned deployments near 98%) with a
-monotonicity check on the busbw-vs-message-size curve — a jagged curve
-indicates misconfiguration (e.g. automatic GID selection picking an
-unroutable address). Beyond the intra-rack matrix sample, an N-node
-collective validates scale-out performance across the audited topology via
-the `mpirun` rankfile path.
+`torch.distributed`, reporting algbw/busbw as a percentage of line rate (untuned
+RoCEv2 sits near 60%, tuned deployments near 98%) with a monotonicity check on
+the busbw-vs-message-size curve — a jagged curve indicates misconfiguration
+(e.g. automatic GID selection picking an unroutable address). Beyond the
+intra-rack matrix sample, an N-node collective validates scale-out performance
+across the audited topology via the `mpirun` rankfile path.
 
 **storage** — sequential/random read+write IOPS and bandwidth, fsync latency,
 short-duration sustained-write check for burst caches.
@@ -349,69 +349,130 @@ multi-stream, KV-cache/throughput stability over a short burst.
 **lifecycle** — power-cycle timing: BMC-driven cold boot → GPU ready → CUDA
 usable, measured end-to-end; NIC link-up time; time-to-job-ready.
 
-### Internet — external network (spec-status: dispatch stub)
+### Internet — external network
 
-`rack-bench bench internet` targets single-host north-south throughput, path
-quality, and latency to S3 and R2, with GCS opt-in. The dispatch skeleton is
-implemented; measurements, credentials, the S3 client, Warp execution, and
-cleanup are **not**. No network commands run, no objects are created, and no
-credentials are needed. See [the implementation spec](docs/bench-internet.md)
-for the remaining work.
+`rack-bench bench internet` measures single-host north-south performance to S3
+and R2 using an IPv4-only, stdlib S3 client. All 13 checks per provider are
+wired: path AS/hops/RTT, DNS, idle TTFB, upload/download MiB/s and obj/s, loaded
+TTFB, PMTUD, TCP retransmits, and summary. Single-stream rates live in
+throughput detail, not a new check name. GCS interoperability and Warp execution
+remain unsupported and SKIP explicitly.
 
-    rack-bench bench --help
-    rack-bench bench internet --help
-    rack-bench bench internet
-    rack-bench bench internet --providers s3,r2 --json
-    rack-bench bench internet --only 'internet.s3.*'
-    rack-bench bench internet --profile certify --yes
+**PASS means observed, not certified.** `expected` stays `null` until the
+certification profile schema exists. Only path RTT sanity can WARN; instability,
+asymmetry, loaded p95 inflation above 20 ms, BDP shortfalls, and retransmit
+findings are diagnostic detail. Missing credentials/tools/buckets, failed
+transfers, invalid timings, and checksum failures SKIP with reasons. A run
+containing SKIPs can exit 0; inspect the checks, not just the exit code.
 
-`internet` is a category subcommand with its own parser. The flags below
-must follow `bench internet`; they are not options of the `bench` parent
-or other categories. `bench --help` shows only categories and generic
-flags; `bench internet --help` shows the internet-specific options too.
-For example, `bench --providers s3 internet` is rejected.
+#### Workload and ownership
 
-| Flag | Description |
-| --- | --- |
-| `--providers s3,r2` | Unique comma-separated providers: `s3`, `r2`, `gcs` |
-| `--directions up,down` | Unique comma-separated directions (default both) |
-| `--profile quick\|certify` | Default `quick`; certify requires `--yes` |
-| `--regions s3=us-east-1,...` | Region map; default: provider region |
-| `--concurrent N` | Positive parallel stream count (default 32) |
-| `--duration 60s` | Positive per-test duration: seconds or `s`/`m`/`h` suffix |
-| `--tool stdlib\|warp` | Default `stdlib`; neither executes yet |
-| `--keep-data` | Reserve the future option to skip object cleanup |
-| `--yes` | Accept the certify reference cost estimate |
+Path/DNS and a verified 100 KiB idle-TTFB baseline run first. Uploads use
+seeded, checksummed ~1 GiB multipart objects with concurrent small-object GETs
+for loaded TTFB. Downloads verify ranges from this run's completed uploads; they
+never use pre-seeded data. All upload windows, including a separate unloaded
+concurrency-1 test, finish before download windows start. TCP socket sampling
+brackets these windows; PMTUD uses stepped DF pings.
 
-Duration defaults to 60 seconds for quick and 300 seconds for certify.
-Certify's planned concurrency sweep (1, 8, 32, 64) and three-run reduction
-are not implemented. All workload options are parsed and forwarded only.
+Quick uses 32 streams for 60 seconds per sustained direction plus separate
+concurrency-1 windows. Certify uses 1/8/32/64 streams, five minutes per window,
+three runs per concurrency, dropping the best and worst by measured rate.
+Dedicated single-stream windows also have three runs. The scalar rate is the
+largest concurrency's retained run, not the fastest result. Scheduling stops at
+a part/range boundary; actual elapsed time includes setup and the current
+operation's overrun. Incomplete multipart uploads are aborted. A slow/short run
+can measure uploaded parts without completing an object: download then SKIPs
+rather than manufacturing data.
 
-Each selected provider returns `internet.<provider>.summary` with status
-`SKIP`, detail `not implemented`, and `value`/`expected` both `null`.
-`expected` will remain `null` until the certification profile schema exists.
-Check names are stable public API. The default run returns two checks (S3
-and R2); GCS is opt-in. Bare `rack-bench bench` runs all registered categories
-with each category's own defaults (currently only this stub), not the
-unimplemented design targets above.
+Quick targets S3 Mumbai and R2 apac. Certify adds Singapore and N. Virginia as
+**light bands**, not two more full certifications: no sustained transfers or
+loaded probes; one object at most 32 MiB each direction per far band. Including
+the idle baseline, both far bands add at most 64 MiB uploaded and about 68 MiB
+downloaded, plus setup/control traffic. `--regions` replaces this default
+matrix. R2 placement hints do not prove a regional path, so unpinnable far bands
+SKIP. S3 redirects at inaccessible regional endpoints also SKIP rather than
+silently changing the measured region.
 
-Standard flags may appear before or after the stage/category and match
-audit: repeatable `--only`/`--skip` filter check-name
-globs (`--skip` wins); an empty selection exits 2. `--json` prints the
-version-1 envelope, while `--json FILE` exports it alongside human stdout.
-`--run-dir DIR` receives `bench.out` and `bench.values.json` (default
-`./rack-bench-runs/<timestamp>/`). `--show-command` echoes actual operations
-(none in the stub); `--quiet` suppresses traces and PASS rows, not SKIPs.
-Stub runs exit 0, which is **not** a certification verdict.
+Supply `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` and optional
+`AWS_SESSION_TOKEN`; R2 additionally needs `R2_ACCOUNT_ID`. These AWS-named
+variables must contain the selected provider's credentials; separate provider
+invocations are usually appropriate. There is no SDK/config/IMDS discovery. Use
+an existing bucket with scoped read/write/delete/multipart permissions. Each
+collection owns a fresh `rack-bench/<run-id>/...` prefix. Cleanup deletes only
+exact owned keys, even when summary is filtered out; `--keep-data` retains keys
+and seeds. Configure a 24-hour object-expiry and incomplete-upload abort
+lifecycle rule as crash insurance. A lost initiation response can leave an
+unknown upload ID that object listings cannot reclaim.
 
-Certify always prints a reference estimate to stderr, including with
-`--quiet` or JSON output, and exits 2 before collection/artifacts unless
-`--yes` is present. The spec's 10 Gbit/s baseline is ~2.2 TB per provider:
-S3 ~$200, R2 $0, GCS ~$260. Only selected providers are listed. These are
-reference figures, not adjusted for duration, concurrency, direction, or
-check filters; the current stub transfers nothing and incurs no charges.
-For comparison, the planned quick baseline is ~75 GB per provider (S3 ~$7,
-R2 $0, GCS ~$9).
+`--only`/`--skip` never launch hidden prerequisites. Download without an upload
+manifest (including `--directions down`) SKIPs. Loaded latency without the idle
+baseline or upload windows SKIPs. TCP retransmits without observable transfer
+socket deltas SKIP. TCP detail describes sampling coverage: short-lived sockets
+can be missed, and local counters cannot measure the remote download sender's
+retransmits. BDP uses observed advertised window/RTT when available; `rcv_space`
+is not treated as an advertised receive window. The client opens a connection
+per request: concurrency 1 is sequential requests, not one persistent TCP flow.
+
+#### Options and artifacts
+
+Internet flags follow `bench internet`, not the `bench` parent.
+
+| Flag                            | Description                                           |
+| ------------------------------- | ----------------------------------------------------- |
+| `--providers s3,r2`             | Unique providers: `s3`, `r2`, `gcs` (GCS unsupported) |
+| `--directions up,down`          | Selected directions; down needs this run's uploads    |
+| `--profile quick\|certify`      | Default `quick`; certify requires `--yes`             |
+| `--regions s3=us-east-1,...`    | Override the tiered provider region matrix            |
+| `--buckets s3=<name>,r2=<name>` | Existing buckets; required for object probes          |
+| `--concurrent N`                | Override quick's 32 streams or certify's sweep        |
+| `--duration 60s`                | Per-window duration; defaults: quick 60s, certify 5m  |
+| `--tool stdlib\|warp`           | Default `stdlib`; Warp execution unsupported          |
+| `--keep-data`                   | Retain completed objects under the run-owned prefix   |
+| `--yes`                         | Accept the certify reference cost estimate            |
+
+The default run selects 26 checks (S3 and R2); bare `rack-bench bench` runs only
+implemented categories, currently internet. Generic flags match audit:
+`--only`/`--skip` are repeatable globs (`--skip` wins); an empty selection
+exits 2. `--json` prints the version-1 envelope; `--json FILE` exports it
+alongside human stdout. `--run-dir DIR` receives `bench.out` and
+`bench.values.json`. JSON-encoded detail retains all regions/runs, per-operation
+timings, per-second throughput buckets, byte accounting, diagnostic signals, and
+cleanup results. `--show-command` traces real operations; `--quiet` suppresses
+traces and PASS rows, not SKIPs.
+
+**Transfers incur charges.** Certify always prints its reference estimate to
+stderr and requires `--yes`, even with JSON or `--quiet`. The spec's
+nearest-band 10 Gbit/s references are quick ~75 GB (S3 ~$7, R2 $0, GCS
+~$9) and certify
+~2.2 TB (S3 ~$200, R2 $0, GCS ~$260), per provider. These are
+not live quotes and are not adjusted for sweeps, overrides, filters, directions,
+request fees, or operation overruns. Far bands stay within the light budget
+above; they do not multiply the nearest-band reference by three. See the
+[implementation spec](docs/bench-internet.md) for methodology and remaining
+work.
+
+#### Try it without cloud traffic
+
+These commands were exercised from the repo root. They need no real credentials,
+make no cloud requests, and write only temporary artifacts. The transfer tests
+use fake clients, clocks, and commands; no real-duration benchmark was run.
+
+    uv run rack-bench bench internet --help
+    uv run python -m unittest tests.test_bench_internet_transfer -v
+    (
+      demo_dir="$(mktemp -d)"
+      trap 'rm -rf "$demo_dir"' EXIT
+      env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY \
+        uv run rack-bench bench internet --json --run-dir "$demo_dir/default"
+      env AWS_ACCESS_KEY_ID=fake AWS_SECRET_ACCESS_KEY=fake \
+        uv run rack-bench bench internet --providers s3 \
+        --buckets s3=example-bench --directions down --only '*.download.*' \
+        --json --run-dir "$demo_dir/down"
+    )
+
+The first collection yields 26 credential SKIPs; the second yields two SKIPs
+naming the missing upload objects. Live cloud interoperability and paid transfer
+rates were not exercised here.
 
 ## Stage 3 — smoke (burn-in)
 
@@ -434,25 +495,24 @@ and interference failures invisible to single-component tests.
 
 ## ClusterMAX coverage
 
-The security scope already consumes ClusterMAX's `minimum-versions.json` as
-its CVE floor. For network performance specifically, ClusterMAX additionally
-tests three things this spec does not yet cover; they are roadmap items, not
-part of the first implementation:
+The security scope already consumes ClusterMAX's `minimum-versions.json` as its
+CVE floor. For network performance specifically, ClusterMAX additionally tests
+three things this spec does not yet cover; they are roadmap items, not part of
+the first implementation:
 
 - **Fabric fault injection** — link flap and node kill during running
   collectives, plus job-level failover, to measure how the fabric and jobs
   behave when a component dies (ClusterMAX 3.0 fault-tolerance testing).
 - **Observability functional validation** — DCGM exporter and NCCL inspector
-  actually emitting metrics while tests run; this spec audits their versions
-  but never validates emission end-to-end.
+  actually emitting metrics while tests run; this spec audits their versions but
+  never validates emission end-to-end.
 - **Multi-tenant network isolation** — tenant-segmented networking (e.g. RoCE
   VPC isolation); the security scope covers host-level isolation, not tenant
   network segmentation.
 
 Internet egress/ingress performance to public object stores (S3, R2, GCS) is
-outside ClusterMAX's scope entirely; it is being specified on the
-`research/internet-performance` branch and will land as a `bench internet` /
-`smoke internet` category.
+outside ClusterMAX's scope entirely. `bench internet` now measures it for S3 and
+R2; the longer `smoke internet` soak remains future work.
 
 ## Certification flow
 
