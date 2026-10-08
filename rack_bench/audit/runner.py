@@ -7,13 +7,14 @@ from rack_bench.common.host import operation_echo
 from rack_bench.common.models import Result
 from rack_bench.common.output import emit, show_operation
 
-from . import gpu, network, security, software, storage, system, topology
+from . import connectivity, gpu, network, security, software, storage, system, topology
 
 # CLI subcommand name -> scope module exposing CHECKS: {check name -> probe fn}
 SCOPES = {
     "topology": topology,
     "gpu": gpu,
     "network": network,
+    "connectivity": connectivity,
     "storage": storage,
     "system": system,
     "software": software,
@@ -21,6 +22,7 @@ SCOPES = {
 }
 
 
+@connectivity.query_session()
 def collect(scope=None, *, only=(), skip=(), show_command=False):
     results = []
     for name in [scope] if scope else SCOPES:

@@ -37,6 +37,27 @@ class SoftwareTests(unittest.TestCase):
         with patch.object(software.shutil, "which", return_value="/usr/bin/dpkg-query"), patch.object(software, "run_command", return_value="ii \tlibnccl2\t2.26.2-1\nrc \tlibnccl-old\t1.0\n"):
             self.assertEqual(software.nccl().value, {"libnccl2": "2.26.2-1"})
 
+    def test_internet_tools_present_and_missing(self):
+        banners = {"mtr": ("mtr 0.95", "0.95"), "fping": ("fping: Version 5.1", "5.1"),
+                   "traceroute": ("Modern traceroute for Linux, version 2.1.6", "2.1.6"),
+                   "iperf3": ("iperf 3.17.1 (cJSON 1.7.15)", "3.17.1"),
+                   "flent": ("Flent 2.2.0", "2.2.0"),
+                   "curl": ("curl 8.12.1 (x86_64-pc-linux-gnu) libcurl/8.12.1", "8.12.1")}
+        for tool, (banner, version) in banners.items():
+            name = "software." + tool
+            probe = software.CHECKS[name]
+            with self.subTest(tool=tool), patch.object(software, "run_command", return_value=banner) as command:
+                check = probe()
+                self.assertEqual(check.name, name)
+                self.assertEqual(check.status, "pass")
+                self.assertEqual(check.value, version)
+                self.assertEqual(check.source, [tool + " --version"])
+                command.assert_called_once_with([tool, "--version"])
+            with self.subTest(missing=tool), patch("subprocess.Popen", side_effect=FileNotFoundError()):
+                check = probe()
+                self.assertEqual(check.status, "skip")
+                self.assertIn("Command not found: " + tool, check.detail)
+
     def test_dpkg_empty_or_unavailable_falls_back_to_python_distributions(self):
         for response in ("", Unavailable("dpkg-query", "Command not found: dpkg-query.")):
             with self.subTest(response=response), \
