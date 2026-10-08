@@ -65,7 +65,8 @@ class FakeTCP:
 
 class FakeClient:
     def __init__(self, *args, invalid=None):
-        self.endpoint = SimpleNamespace(host="bucket.example.invalid")
+        self.endpoint = SimpleNamespace(host="example.invalid", path_style=False)
+        self.bucket = "bench-test"
         self.objects, self.deleted, self.calls = {}, [], []
         self.invalid = invalid or {}
 

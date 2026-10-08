@@ -29,6 +29,13 @@ class _WindowEnded(S3Error):
     """Normal part-boundary stop; multipart_upload aborts the known upload ID."""
 
 
+def object_url(client, key):
+    endpoint = client.endpoint
+    if endpoint.path_style:
+        return f"https://{endpoint.host}/{client.bucket}/{key}"
+    return f"https://{client.bucket}.{endpoint.host}/{key}"
+
+
 def sample_timing(timing, size, direction):
     fields = {"connect_ms": timing.connect_seconds,
               "response_first_byte_ms": timing.response_first_byte_seconds,
@@ -134,7 +141,7 @@ def transfer_window(client, *, direction, prefix, concurrency, duration, objects
                 if direction == "up":
                     with lock:
                         owned.append(key)
-                    _echo(f"multipart PUT {client.endpoint.host}/{key} ({payload.size} bytes)")
+                    _echo(f"multipart PUT {object_url(client, key)} ({payload.size} bytes)")
                     def on_part(response):
                         accept(response, min(PART_SIZE, payload.size - part_number * PART_SIZE))
                         if part_number * PART_SIZE < payload.size and (stop.is_set() or not one_object and clock() >= deadline):
@@ -147,7 +154,7 @@ def transfer_window(client, *, direction, prefix, concurrency, duration, objects
                     # One stream reads one uploaded object in bounded, verified ranges.
                     for offset in range(0, payload.size, PART_SIZE):
                         count = min(PART_SIZE, payload.size - offset)
-                        _echo(f"GET {client.endpoint.host}/{key} Range: bytes={offset}-{offset + count - 1}")
+                        _echo(f"GET {object_url(client, key)} Range: bytes={offset}-{offset + count - 1}")
                         def consume(data, _offset):
                             progress(last + len(data), 0)
                         response = client.get_object(key, byte_range=(offset, offset + count - 1), payload=payload, consume=consume)
@@ -179,6 +186,7 @@ def transfer_window(client, *, direction, prefix, concurrency, duration, objects
             began = clock()
             cpu_start = time.thread_time()
             try:
+                _echo(f'GET {object_url(client, loaded["key"])} (loaded latency)')
                 response = client.get_object(loaded["key"], payload=loaded["payload"])
                 loaded_bytes += response.timing.bytes_received
                 sample = timing_sample(response.timing)
@@ -281,8 +289,10 @@ def upload_reports(provider, options, *, client_factory=S3Client, window=transfe
         if target["band"] == "nearest" and baseline(provider, options) is not None:
             key = prefix + "loaded.bin"
             record["owned"].append(key)
+            record["loaded_key"] = key
             payload = SeededPayload(key, LATENCY_SIZE)
             try:
+                _echo(f"PUT {object_url(client, key)} (loaded setup)")
                 response = client.put_object(key, payload)
                 sample_timing(response.timing, LATENCY_SIZE, "up")
                 record["loaded_setup_bytes"] = response.timing.bytes_sent
@@ -290,7 +300,8 @@ def upload_reports(provider, options, *, client_factory=S3Client, window=transfe
             except ERRORS as exc:
                 record["loaded_reason"] = f"loaded-object setup failed: {reason(exc)}"
         else:
-            record["loaded_reason"] = "needs successful internet.%s.latency.ttfb baseline_ms.p95" % provider
+            record["loaded_reason"] = ("omitted by light-band budget; no sustained upload window" if target["band"] == "light" else
+                                       f"needs successful internet.{provider}.latency.ttfb baseline_ms.p95")
         for concurrency, kind, runs in plan(target, options):
             for index in range(runs):
                 run, objects = window(client, direction="up", prefix=f"{prefix}{kind}-{concurrency}-{index}/",
@@ -389,6 +400,8 @@ def loaded_probe(provider, options):
     valid = bool(samples) and len(reduced) == len(groups) and not errors and all(r["status"] == "pass" for r in runs)
     inflation = stats["p95"] - idle if valid else None
     detail = {"baseline_ms": {"p95": idle}, "loaded_ms": stats, "inflation_ms": inflation,
+              "regions": [{"region": r["region"], "endpoint": r["endpoint"], "band": r["band"],
+                           "reason": r["reason"] or r.get("loaded_reason")} for r in records],
               "gate_ms": 20, "gate_exceeded": inflation > 20 if valid else None,
               "selection": "median loaded p95 of 3 runs per concurrency; scalar is largest concurrency",
               "retained_run_by_concurrency": {c: r["run"] for c, r in reduced.items()},
@@ -397,7 +410,7 @@ def loaded_probe(provider, options):
     if not valid:
         detail["reason"] = records[0].get("loaded_reason", "needs valid concurrent TTFB samples inside successful upload windows")
     return Check(name, "pass" if valid else "skip", stats["p95"] if valid else None,
-                 detail=json.dumps(detail), source=[f'concurrent verified GET {records[0]["endpoint"]}; upload windows only'])
+                 detail=json.dumps(detail), source=[f'concurrent verified GET {records[0]["endpoint"]} bucket={options.buckets[provider]} key={records[0].get("loaded_key")}; upload windows only'])
 
 
 def cleanup(options):
@@ -411,7 +424,7 @@ def cleanup(options):
             try:
                 if not key.startswith(prefix) or not prefix.startswith(run_prefix(options)):
                     raise ValueError("refusing cleanup outside owned prefix")
-                _echo(f"DELETE {client.endpoint.host}/{key}")
+                _echo(f"DELETE {object_url(client, key)}")
                 client.delete_object(key)
             except ERRORS as exc:
                 errors.append({"key": key, "reason": reason(exc)})
