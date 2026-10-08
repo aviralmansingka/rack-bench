@@ -128,9 +128,43 @@ def pkeys():
 
 
 def tcp_config():
-    return collect_check("network.tcp_config", lambda: {name: read_text(f"/proc/sys/net/ipv4/{name}")
-                         for name in ("tcp_congestion_control", "tcp_ecn")},
-                         ["/proc/sys/net/ipv4/tcp_congestion_control", "/proc/sys/net/ipv4/tcp_ecn"])
+    paths = {name: f"/proc/sys/net/{directory}/{name}"
+             for directory, names in (
+                 ("ipv4", ("tcp_congestion_control", "tcp_ecn", "tcp_rmem", "tcp_wmem", "ip_local_port_range",
+                           "tcp_window_scaling", "tcp_mtu_probing", "tcp_available_congestion_control")),
+                 ("core", ("rmem_max", "wmem_max"))) for name in names}
+    command = ["tc", "qdisc", "show"]
+    sources = [*paths.values(), shlex.join(command)]
+    def collect():
+        values, errors = {}, {}
+        for name, path in paths.items():
+            try:
+                value = read_text(path)
+                if name in ("tcp_rmem", "tcp_wmem", "ip_local_port_range"):
+                    value = [int(part) for part in value.split()]
+                    count = 2 if name == "ip_local_port_range" else 3
+                    if len(value) != count:
+                        raise ValueError(f"Expected {count} integers for {name}.")
+                elif name == "tcp_available_congestion_control":
+                    value = value.split()
+                elif name not in ("tcp_congestion_control", "tcp_ecn"):
+                    value = int(value)
+                values[name] = value
+            except (Unavailable, ValueError) as exc:
+                errors[name] = str(exc)
+        try:
+            values["qdisc"] = run_command(command)
+        except Unavailable as exc:
+            errors["qdisc"] = str(exc)
+        if not values:
+            raise Unavailable(sources[0], "; ".join(f"{name}: {reason}" for name, reason in errors.items()))
+        return {**values, "unavailable": errors}
+    check = collect_check("network.tcp_config", collect, sources)
+    if check.status == "pass":
+        check.detail = ("Host TCP configuration facts that bound single-stream throughput "
+                        "(socket buffer maxima vs path RTT, congestion control, port range, qdisc); "
+                        "not a circuit measurement. No certification profile applied.")
+    return check
 
 
 def switch():
