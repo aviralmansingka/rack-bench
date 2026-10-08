@@ -1,9 +1,11 @@
 # Spec: `rack-bench bench internet` — external network certification
 
-Status: **implementation in progress**; Session 2 contracts are frozen (§11).
-Companion research: `research/internet-performance` branch
-(`docs/internet-performance.md` — industry methodology, sources, and the full
-reliability-test taxonomy this derives from).
+Status: **implementation in progress**; context/baseline probes are live
+(Session 3 Part 1); bulk/loaded/TCP/summary probes remain placeholders. Session
+2 contracts are frozen (§11). Companion research:
+`research/internet-performance` branch (`docs/internet-performance.md` —
+industry methodology, sources, and the full reliability-test taxonomy this
+derives from).
 
 ## 1. Summary
 
@@ -52,6 +54,7 @@ rack-bench bench internet
     [--directions up,down]         # default both
     [--profile quick|certify]      # default quick
     [--regions s3=us-east-1,...]    # override the tiered region matrix (§11)
+    [--buckets s3=<name>,r2=<name>] # existing buckets for object probes (§8)
     [--concurrent N]               # override parallel streams (default 32)
     [--duration 60s]               # override per-test duration
     [--tool stdlib|warp]           # default stdlib; warp for certify (§7)
@@ -67,13 +70,45 @@ glob against check names.
 
 Run in this order; each is one or more `Check` entries per provider.
 
-1. **Path audit** — `mtr -zsb 100` to each provider endpoint; hop count, per-hop
-   AS path, per-hop loss, RTT.
-2. **DNS resolution** — resolve each endpoint hostname via the configured
-   resolver; first-resolution time vs cached (repeat lookups); record returned
-   address families.
-3. **Small-object latency** — GET/HEAD on 100 KiB objects, sequential; doubles
-   as the idle-TTFB **baseline** for the loaded-latency signal.
+1. **Path audit** — `mtr -4 -r -w -z -b -s 100 -c 10 <endpoint>`; observed hop
+   count (including unanswered hops), per-hop AS path, loss, RTT and StDev. The
+   former `-zsb 100` shorthand incorrectly grouped `-s`'s argument; spell out
+   the flags. Fall back to `traceroute -4 -A -q 3 -w 1 -m 30 <endpoint>` when
+   mtr is absent. Traceroute records individual RTTs/timeouts, not invented mtr
+   loss percentages or StDev. No ASN annotations means the AS check SKIPs.
+   Destination RTT grading requires a final-hop address matching the endpoint's
+   IPv4 resolution; an answering transit router is not a destination sample.
+2. **DNS resolution** — query each endpoint hostname through the first IPv4
+   nameserver in `/etc/resolv.conf` (including a configured local resolver
+   stub), preserving DNS response codes; UDP with same-resolver TCP truncation
+   fallback. One first query plus five repeats records first-resolution vs
+   repeated-query latency and returned families. Endpoint queries are A-only in
+   v1; no search suffixes, public-resolver fallback, or cache flushing. “First”
+   is first observed in this run, not a claim of a cold upstream cache; repeats
+   do not prove hits. Each idle pass also queries A and AAAA for a fresh random
+   name under RFC 2606 `.invalid`. It must return NXDOMAIN for both: any address
+   is an interception finding (NXDOMAIN hijacking). SERVFAIL, NODATA, timeouts
+   and malformed replies are distinct ungradable findings, not successful
+   NXDOMAIN tests. Wrong trap answers invalidate the baseline and SKIP with a
+   reason, not a new WARN/FAIL exception. AAAA trap queries never enable IPv6
+   endpoint connections. **Deferred extension:** DNSSEC tamper comparison
+   (known-good resolver vs configured resolver, answer-divergence grading) is
+   future work; unsigned-zone expectations are unspecified and are not tested in
+   v1.
+3. **Small-object latency** — create one 100 KiB seeded object using a
+   checksummed PUT, then 20 sequential verified GETs per idle run; delete the
+   owned key at teardown unless `--keep-data`. Setup PUT is not a latency
+   sample. This is the idle-TTFB **baseline** for the loaded-latency signal.
+   Detail records p50/p95/p99, min/max/mean and raw samples for `connect_ms`
+   (TCP+TLS duration), `response_first_byte_ms` (first status-line byte
+   available to the buffered HTTP reader), `headers_ms`, `body_first_byte_ms`,
+   and `total_ms`. The last four are cumulative from request start, not additive
+   phases. Check value is response TTFB p50; `baseline_ms.p95` uses that same
+   response-byte clock for Part 2's loaded comparison. Per-operation process CPU
+   includes payload generation or verification, not just network time.
+   Failed/invalid samples never become zero latency. Certify's nearest band
+   retains three runs and drops best/worst ranked by response-TTFB p50; each
+   light band has only one 20-GET run.
 4. **Sustained upload (egress)** — parallel multipart PUTs of ~1 GiB random
    objects for the profile duration. Random data defeats provider-side
    compression/dedup. **Concurrent small-object TTFB probes** run during the
@@ -132,10 +167,16 @@ internet.<p>.summary                 dict  region, endpoint, tool, bytes
 ```
 
 Throughput checks carry `detail`: single-stream MiB/s, p95 of 1s buckets,
-retransmit %. `source` carries the exact commands/endpoint per check
-(`--show-command` parity). Missing credentials → every check for that provider
-is `SKIP` with reason "credentials not set"; missing `mtr` → that check `SKIP`s,
-others proceed. `rtt_sanity` is the only WARN-grading check in v1; the
+retransmit %. For multi-band probes, the scalar value represents the
+nearest/overridden band; JSON-encoded `detail` retains the effective region
+matrix, individual runs, unsupported-band reasons, raw path reports and timing
+samples. These survive in `bench.values.json` without a separate artifact
+writer. RTT sanity can WARN on any measured band's reference excursion; its
+value still describes the nearest band. R2 has no guaranteed regional RTT band,
+so RTT sanity SKIPs with a reason. `source` carries the exact commands/endpoint
+per check (`--show-command` parity). Missing credentials → every check for that
+provider is `SKIP` with reason "credentials not set"; missing `mtr` → that check
+`SKIP`s, others proceed. `rtt_sanity` is the only WARN-grading check in v1; the
 expected-band table ships in-code (from the research doc's RTT reference) until
 profiles exist.
 
@@ -166,6 +207,20 @@ it.
   orchestration and GCS interop remain later probe work.
 - Keys need only a scoped policy: create/delete one bench prefix + read/write
   objects in it. The doc ships the minimal IAM policy.
+- **Bucket configuration:** `--buckets s3=<name>,r2=<name>` is a provider-keyed
+  map of existing bucket names, following `--regions`: known, unique providers
+  only. Names must be DNS-compatible; S3 virtual-hosted TLS bucket names cannot
+  contain dots. Flags are run configuration; environment variables remain
+  credentials-only. Path and DNS ignore this map. Object probes without a bucket
+  SKIP with a reason naming `--buckets <provider>=<name>`. No buckets are
+  created. A bucket must be accessible at the selected endpoint/region: regional
+  S3 redirects/errors are ungradable, never silently followed into another band.
+- **Prefix ownership:** each collection owns a fresh `rack-bench/<run-id>/...`
+  prefix. Create objects only beneath it; cleanup may list/delete only under
+  that prefix, never any other key or the bucket root. Buckets may contain real
+  user data. The baseline deletes its exact owned key, including after a failed
+  PUT with an ambiguous response; `--keep-data` retains it and records the
+  key/seed. Cleanup failures remain explicit in detail.
 - Nothing runs as root; mtr in report mode, `ss`, ping are all non-root.
 - Objects are deterministic seeded pseudorandom bytes (§11). Normal cleanup
   deletes the scoped prefix and aborts known failed multipart uploads. A
@@ -257,12 +312,15 @@ Thus the two far bands add at most 64 MiB uploaded and about 68 MiB downloaded
 per provider, plus protocol/control traffic, not another two ~2.2 TB runs. At
 the S3 reference egress rate this is under $0.01 of extra payload egress;
 request fees and custom overrides still belong in the eventual cost gate. The
-present dispatch stub's estimate is a reference, not a live quote.
+current estimate is a full-transfer reference, not a quote for the probes
+implemented so far.
 
-Remaining implementation residue: probe orchestration, GCS interoperability,
-certification thresholds/profile schema, optional Warp execution, effective
-matrix-aware cost estimates, and README updates when CLI measurements land. This
-library does not implement those policies or make live measurements.
+Remaining implementation residue: bulk/loaded/single-stream/TCP/summary probes,
+GCS interoperability, certification thresholds/profile schema, optional Warp
+execution, effective matrix-aware cost estimates, and the captain-owned README
+rework. Context and small-object baseline probes now make live measurements;
+reference cost output is not a quote for their bounded traffic. Missing
+credentials still SKIP every provider check, including context and placeholders.
 
 ## 12. Deferred extension: self-hosted diagnostic endpoints
 

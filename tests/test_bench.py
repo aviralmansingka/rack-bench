@@ -3,6 +3,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from io import StringIO
 import json
+import os
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -16,17 +17,33 @@ from rack_bench.common.models import Check, Result
 from rack_bench.common.output import render_human
 
 
+SUFFIXES = ("path.as_path", "path.hops", "path.rtt_sanity", "dns.resolve", "latency.ttfb",
+            "upload.throughput", "upload.objs_per_sec", "latency.loaded", "download.throughput",
+            "download.objs_per_sec", "tcp.pmtud", "tcp.retransmit_ratio", "summary")
+
+
+def names(providers):
+    return [f"internet.{p}.{suffix}" for p in providers for suffix in SUFFIXES]
+
+
 class BenchTests(unittest.TestCase):
-    def test_registry_and_stub_envelope(self):
+    def setUp(self):
+        # Default CLI runs must remain offline even on a developer's credentialed host.
+        environment = patch.dict(os.environ, {}, clear=True)
+        environment.start()
+        self.addCleanup(environment.stop)
+
+    def test_registry_and_missing_credentials_envelope(self):
         self.assertEqual(runner.CATEGORIES, {"internet": internet})
-        self.assertEqual(list(internet.CHECKS), [f"internet.{p}.summary" for p in internet.PROVIDERS])
+        self.assertEqual(list(internet.CHECKS), names(internet.PROVIDERS))
         result = runner.collect("internet")[0]
         self.assertEqual(result.scope, "internet")
         self.assertTrue(result.host)
         self.assertTrue(result.ts)
         self.assertEqual(result.manifest, {})
-        self.assertEqual(result.checks, [Check(f"internet.{p}.summary", "skip", detail="not implemented")
-                                         for p in ("s3", "r2")])
+        self.assertEqual(result.checks, [Check(name, "skip", detail=
+            "credentials not set: missing environment variable: AWS_ACCESS_KEY_ID")
+            for name in names(("s3", "r2"))])
         self.assertEqual([r.checks for r in runner.collect()], [result.checks])
 
     def test_default_flags(self):
@@ -40,12 +57,14 @@ class BenchTests(unittest.TestCase):
             self.assertEqual(main([
                 "bench", "internet", "--providers", "gcs,s3", "--directions", "down",
                 "--profile", "certify", "--regions", "s3=us-east-1,gcs=us-central1",
+                "--buckets", "s3=bench-s3,gcs=bench-gcs",
                 "--concurrent", "8", "--duration", "2m", "--tool", "warp", "--keep-data", "--yes",
                 "--json", "export.json", "--run-dir", "artifacts", "--show-command", "--quiet",
             ]), 0)
         self.assertEqual(run.call_args.kwargs["options"], internet.Options(
             providers=("gcs", "s3"), directions=("down",), profile="certify",
-            regions={"s3": "us-east-1", "gcs": "us-central1"}, concurrent=8, duration=120,
+            regions={"s3": "us-east-1", "gcs": "us-central1"},
+            buckets={"s3": "bench-s3", "gcs": "bench-gcs"}, concurrent=8, duration=120,
             tool="warp", keep_data=True, yes=True))
         self.assertEqual(run.call_args.kwargs["json_target"], "export.json")
         self.assertEqual(run.call_args.kwargs["run_dir"], "artifacts")
@@ -71,6 +90,10 @@ class BenchTests(unittest.TestCase):
             ("--regions", "azure=east"), ("--regions", "s3="),
             ("--regions", "s3=east,s3=west"), ("--regions", "s3=a=b"),
             ("--regions", "s3=east,"), ("--regions", ""), ("--unknown", "x"),
+            ("--buckets", ""), ("--buckets", "azure=bench"), ("--buckets", "s3="),
+            ("--buckets", "s3=bench,s3=other"), ("--buckets", "s3=ab"),
+            ("--buckets", "s3=dotted.bucket"), ("--buckets", "r2=bad..bucket"),
+            ("--buckets", "r2=127.0.0.1"), ("--buckets", "s3=bench,"),
         ]
         for flags in cases:
             with self.subTest(flags=flags), patch.object(runner, "run") as run, \
@@ -83,7 +106,7 @@ class BenchTests(unittest.TestCase):
         with redirect_stdout(StringIO()) as output, self.assertRaises(SystemExit) as exit_status:
             main(["bench", "internet", "--help"])
         self.assertEqual(exit_status.exception.code, 0)
-        for flag in ("providers", "directions", "profile", "regions", "concurrent", "duration",
+        for flag in ("providers", "directions", "profile", "regions", "buckets", "concurrent", "duration",
                      "tool", "keep-data", "yes", "json", "run-dir", "only", "skip", "show-command", "quiet"):
             self.assertIn("--" + flag, output.getvalue())
 
@@ -98,16 +121,18 @@ class BenchTests(unittest.TestCase):
 
     def test_provider_selection_in_registration_order(self):
         result = runner.collect("internet", options=internet.Options(providers=("gcs", "r2")))[0]
-        self.assertEqual([c.name for c in result.checks], ["internet.r2.summary", "internet.gcs.summary"])
+        self.assertEqual([c.name for c in result.checks], names(("r2", "gcs")))
 
     def test_filters_prevent_probe_calls(self):
         checks = {name: Mock(return_value=Check(name, "skip")) for name in internet.CHECKS}
         with patch.dict(internet.CHECKS, checks, clear=True):
             result = runner.collect(only=["internet.*"], skip=["internet.r2.*"])[0]
-        self.assertEqual([c.name for c in result.checks], ["internet.s3.summary"])
-        checks["internet.s3.summary"].assert_called_once()
-        checks["internet.r2.summary"].assert_not_called()
-        checks["internet.gcs.summary"].assert_not_called()
+        self.assertEqual([c.name for c in result.checks], names(("s3",)))
+        for name, probe in checks.items():
+            if name.startswith("internet.s3."):
+                probe.assert_called_once()
+            else:
+                probe.assert_not_called()
 
     def test_empty_selection_is_error_without_artifacts(self):
         for flags in (["--only", "no.such.check"], ["--skip", "*"],
@@ -131,10 +156,11 @@ class BenchTests(unittest.TestCase):
             self.assertEqual(result["scope"], "internet")
             self.assertEqual(result["manifest"], {})
             self.assertEqual(result["checks"], [
-                {"name": f"internet.{p}.summary", "status": "skip", "value": None,
-                 "expected": None, "detail": "not implemented", "source": []} for p in ("s3", "r2")])
+                {"name": name, "status": "skip", "value": None, "expected": None,
+                 "detail": "credentials not set: missing environment variable: AWS_ACCESS_KEY_ID",
+                 "source": []} for name in names(("s3", "r2"))])
             self.assertEqual((Path(tmp) / "bench.values.json").read_text(), output.getvalue())
-            self.assertIn("SKIP=2", (Path(tmp) / "bench.out").read_text())
+            self.assertIn("SKIP=26", (Path(tmp) / "bench.out").read_text())
 
     def test_json_file_and_full_stage_dispatch(self):
         with tempfile.TemporaryDirectory() as tmp, redirect_stdout(StringIO()) as output:
@@ -163,10 +189,10 @@ class BenchTests(unittest.TestCase):
              redirect_stdout(StringIO()) as output:
             self.assertEqual(main(["bench", "internet", "--profile", "certify", "--yes",
                                    "--providers", "gcs,r2", "--json", "--run-dir", tmp]), 0)
-        self.assertEqual(len(json.loads(output.getvalue())["results"][0]["checks"]), 2)
+        self.assertEqual(len(json.loads(output.getvalue())["results"][0]["checks"]), 26)
         self.assertIn("GCS ~$260, R2 ~$0", error.getvalue())
         self.assertNotIn("S3 ~$200", error.getvalue())
-        self.assertIn("no transfers or charges", error.getvalue())
+        self.assertIn("small-object requests may incur charges", error.getvalue())
 
     def test_quick_does_not_require_acceptance(self):
         with patch.object(runner, "emit"), redirect_stderr(StringIO()) as error:
@@ -232,7 +258,7 @@ class BenchTests(unittest.TestCase):
         self.assertIn("internet", output.getvalue())
         for flag in ("json", "run-dir", "only", "skip", "show-command", "quiet"):
             self.assertIn("--" + flag, output.getvalue())
-        for flag in ("providers", "directions", "profile", "regions", "concurrent", "duration",
+        for flag in ("providers", "directions", "profile", "regions", "buckets", "concurrent", "duration",
                      "tool", "keep-data", "yes"):
             self.assertNotIn("--" + flag, output.getvalue())
 
@@ -276,7 +302,7 @@ class BenchTests(unittest.TestCase):
         dummy.CHECKS["dummy.summary"].assert_called_once_with(dummy.Options())
         results = emit.call_args.args[0]
         self.assertEqual([result.scope for result in results], ["internet", "dummy"])
-        self.assertEqual([c.name for c in results[0].checks], ["internet.s3.summary", "internet.r2.summary"])
+        self.assertEqual([c.name for c in results[0].checks], names(("s3", "r2")))
 
     def test_full_stage_globs_can_select_just_one_category(self):
         dummy = self.dummy_category()

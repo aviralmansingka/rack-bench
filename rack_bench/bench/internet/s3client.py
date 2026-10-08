@@ -120,6 +120,9 @@ class Timing:
 
     attempts makes control retries explicit; measurement requests always use 1.
 
+    connect_seconds is TCP+TLS duration (excludes signing); other timestamps
+    are cumulative from attempt start. response_first_byte_seconds observes
+    the first available status-line byte through HTTPResponse's buffered reader.
     headers_seconds includes connect/TLS/upload and response headers, not body
     TTFB. first_byte_seconds is the first response body byte (None for HEAD).
     elapsed_seconds includes body consumption and verification. bytes_sent counts
@@ -133,6 +136,17 @@ class Timing:
     bytes_sent: int = 0
     bytes_received: int = 0
     attempts: int = 1
+    connect_seconds: float | None = None  # TCP + TLS, excludes signing
+    response_first_byte_seconds: float | None = None  # status line, not headers/body
+
+
+class _TimedHTTPResponse(http.client.HTTPResponse):
+    """Peek through the existing buffered reader before parsing the status line."""
+
+    def _read_status(self):
+        if self.fp.peek(1):
+            self.on_first_byte()
+        return super()._read_status()
 
 
 class S3Error(Exception):
@@ -328,12 +342,27 @@ class S3Client:
             cls = http.client.HTTPSConnection if endpoint.tls else http.client.HTTPConnection
             conn = cls(host, endpoint.port, timeout=self.timeout)
             conn._create_connection = connect_ipv4
+
+            def response_class(*args, **kwargs):
+                response = _TimedHTTPResponse(*args, **kwargs)
+
+                def first_byte():
+                    if timing.response_first_byte_seconds is None:
+                        timing.response_first_byte_seconds = time.perf_counter() - start
+
+                response.on_first_byte = first_byte
+                return response
+
+            conn.response_class = response_class
             try:
                 signed = sign_headers(self.credentials, method, path, query,
                                       request_headers, digest, endpoint.region)
                 conn.putrequest(method, target, skip_host=True, skip_accept_encoding=True)
                 for name, value in signed.items():
                     conn.putheader(name, value)
+                connect_start = time.perf_counter()
+                conn.connect()
+                timing.connect_seconds = time.perf_counter() - connect_start
                 conn.endheaders()
                 for chunk in body():
                     conn.send(chunk)

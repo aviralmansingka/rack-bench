@@ -22,7 +22,7 @@ def show_cost_estimate(estimates):
     costs = ", ".join(f"{provider.upper()} ~${cost}" for provider, cost in estimates.items())
     print("Certify reference estimate at 10 Gbit/s: ~2.2 TB per provider; " + costs + ".\n"
           "Not adjusted for overrides or check/direction filters; actual charges may vary.\n"
-          "Dispatch stub only: no transfers or charges in this implementation.", file=sys.stderr)
+          "Only context/baseline probes are live; small-object requests may incur charges. Bulk probes remain unimplemented.", file=sys.stderr)
 
 
 def render_human(results: list[Result], *, quiet=False) -> str:
