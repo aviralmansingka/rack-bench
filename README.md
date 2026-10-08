@@ -323,9 +323,18 @@ certification profile. Default profile targets GB300 NVL72-class nodes.
 throughput vs. spec, memory bandwidth, NVLink bandwidth per pair, collective
 latency (all-reduce), SM clock stability under load.
 
-**network** — port-to-port link check, single-pair bandwidth (TCP & RDMA),
-intra-rack bandwidth matrix sample, small-message latency, packet-loss counter
-check.
+**network** — port-to-port link check, point-to-point RDMA perftest
+(`ib_write_bw`/`ib_read_bw`), single-pair bandwidth (TCP & RDMA), intra-rack
+bandwidth matrix sample, small-message latency, packet-loss counter check, and
+the NCCL collective bandwidth sweep: allreduce, allgather, and alltoall across
+message sizes from 8 B to 16 GB, launched through both MPI and
+`torch.distributed`, reporting algbw/busbw as a percentage of line rate
+(untuned RoCEv2 sits near 60%, tuned deployments near 98%) with a
+monotonicity check on the busbw-vs-message-size curve — a jagged curve
+indicates misconfiguration (e.g. automatic GID selection picking an
+unroutable address). Beyond the intra-rack matrix sample, an N-node
+collective validates scale-out performance across the audited topology via
+the `mpirun` rankfile path.
 
 **storage** — sequential/random read+write IOPS and bandwidth, fsync latency,
 short-duration sustained-write check for burst caches.
@@ -422,6 +431,28 @@ fabric and network links run sustained traffic. Catches thermal, power-sharing,
 and interference failures invisible to single-component tests.
 
 **full** — all of the above concurrently; the final gate before certification.
+
+## ClusterMAX coverage
+
+The security scope already consumes ClusterMAX's `minimum-versions.json` as
+its CVE floor. For network performance specifically, ClusterMAX additionally
+tests three things this spec does not yet cover; they are roadmap items, not
+part of the first implementation:
+
+- **Fabric fault injection** — link flap and node kill during running
+  collectives, plus job-level failover, to measure how the fabric and jobs
+  behave when a component dies (ClusterMAX 3.0 fault-tolerance testing).
+- **Observability functional validation** — DCGM exporter and NCCL inspector
+  actually emitting metrics while tests run; this spec audits their versions
+  but never validates emission end-to-end.
+- **Multi-tenant network isolation** — tenant-segmented networking (e.g. RoCE
+  VPC isolation); the security scope covers host-level isolation, not tenant
+  network segmentation.
+
+Internet egress/ingress performance to public object stores (S3, R2, GCS) is
+outside ClusterMAX's scope entirely; it is being specified on the
+`research/internet-performance` branch and will land as a `bench internet` /
+`smoke internet` category.
 
 ## Certification flow
 
