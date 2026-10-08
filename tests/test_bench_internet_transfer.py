@@ -20,7 +20,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from rack_bench.bench import internet, runner
-from rack_bench.bench.internet import download, tcp, upload
+from rack_bench.bench.internet import download, tcp, transfer, upload
 from rack_bench.bench.internet.cli import Options, before_run
 from rack_bench.bench.internet.s3client import S3Client, Timing, TransportError
 from rack_bench.common.models import Check
@@ -112,8 +112,8 @@ class TransferTests(unittest.TestCase):
         self.clock = Clock()
 
     def window(self, **kwargs):
-        with patch.object(upload, "PART_SIZE", 8):
-            return upload.transfer_window(self.client, direction="up", prefix="rack-bench/test/", concurrency=2,
+        with patch.object(transfer, "PART_SIZE", 8):
+            return transfer.transfer_window(self.client, direction="up", prefix="rack-bench/test/", concurrency=2,
                                           duration=.1, objects=[], owned=[], size=16, one_object=True,
                                           clock=self.clock, tcp_factory=FakeTCP, **kwargs)
 
@@ -125,13 +125,13 @@ class TransferTests(unittest.TestCase):
         self.assertEqual(len(run["samples"]), 4)
         self.assertEqual(len(objects), 2)
         self.assertEqual(sum(b["bytes"] for b in run["buckets"]), 32)
-        self.assertAlmostEqual(run["mib_per_sec"], 32 / upload.MIB / run["elapsed_seconds"])
+        self.assertAlmostEqual(run["mib_per_sec"], 32 / transfer.MIB / run["elapsed_seconds"])
         self.assertTrue(all(s["cpu_ms"] >= 0 for s in run["samples"]))
 
     def test_range_gets_read_uploaded_objects_and_single_stream(self):
         _, objects = self.window()
-        with patch.object(upload, "PART_SIZE", 8):
-            run, _ = upload.transfer_window(self.client, direction="down", prefix="unused/", concurrency=1,
+        with patch.object(transfer, "PART_SIZE", 8):
+            run, _ = transfer.transfer_window(self.client, direction="down", prefix="unused/", concurrency=1,
                                             duration=.1, objects=objects, owned=[], one_object=True,
                                             clock=self.clock, tcp_factory=FakeTCP)
         self.assertEqual(run["bytes"], 16)
@@ -163,8 +163,8 @@ class TransferTests(unittest.TestCase):
         self.assertIn("broken socket", run["errors"][0]["reason"])
 
     def test_deadline_stops_at_part_boundary_without_forcing_gib_objects(self):
-        with patch.object(upload, "PART_SIZE", 8):
-            run, objects = upload.transfer_window(self.client, direction="up", prefix="rack-bench/test/",
+        with patch.object(transfer, "PART_SIZE", 8):
+            run, objects = transfer.transfer_window(self.client, direction="up", prefix="rack-bench/test/",
                                                   concurrency=1, duration=.1, objects=[], owned=[], size=1024,
                                                   clock=self.clock, tcp_factory=FakeTCP)
         self.assertEqual(run["status"], "pass")
@@ -186,8 +186,8 @@ class TransferTests(unittest.TestCase):
             return result
         client.upload_part = part
         def run():
-            return upload.transfer_window(client, direction="up", prefix="rack-bench/test/", concurrency=1,
-                                          duration=.1, objects=[], owned=[], size=16 * upload.MIB,
+            return transfer.transfer_window(client, direction="up", prefix="rack-bench/test/", concurrency=1,
+                                          duration=.1, objects=[], owned=[], size=16 * transfer.MIB,
                                           clock=Clock(), tcp_factory=FakeTCP)[0]
         self.assertEqual(run()["status"], "pass")
         client.abort_multipart.assert_called_once_with("rack-bench/test/0-0.bin", "owned-upload-id")
@@ -198,7 +198,7 @@ class TransferTests(unittest.TestCase):
         self.assertIn("abort denied", failed["errors"][0]["reason"])
 
     def test_buckets_idle_seconds_boundary_and_partial_tail(self):
-        buckets = upload.throughput_buckets([(0.1, upload.MIB), (2., upload.MIB)], 2.5)
+        buckets = transfer.throughput_buckets([(0.1, transfer.MIB), (2., transfer.MIB)], 2.5)
         self.assertEqual([b["mib_per_sec"] for b in buckets], [1, 0, 2])
         self.assertEqual([b["start_seconds"] for b in buckets], [0, 1, 2])
 
@@ -228,7 +228,7 @@ class TransferTests(unittest.TestCase):
 
     def fake_window(self, client, **kwargs):
         self.calls.append(kwargs)
-        size = kwargs.get("size", upload.OBJECT_SIZE) if kwargs["direction"] == "up" else kwargs["objects"][0]["payload"]["size"]
+        size = kwargs.get("size", transfer.OBJECT_SIZE) if kwargs["direction"] == "up" else kwargs["objects"][0]["payload"]["size"]
         key = kwargs["prefix"] + "object.bin"
         if kwargs["direction"] == "up":
             kwargs["owned"].append(key)
@@ -260,7 +260,7 @@ class TransferTests(unittest.TestCase):
         self.assertEqual([len(r["runs_detail"]) for r in records], [15, 1, 1])
         self.assertEqual([c["concurrency"] for c in self.calls[:12]], [1]*3 + [8]*3 + [32]*3 + [64]*3)
         self.assertTrue(all(c["duration"] == 300 for c in self.calls))
-        self.assertTrue(all(c["one_object"] and c["size"] == 32 * upload.MIB and c["loaded"] is None for c in self.calls[-2:]))
+        self.assertTrue(all(c["one_object"] and c["size"] == 32 * transfer.MIB and c["loaded"] is None for c in self.calls[-2:]))
         download.download_reports("s3", self.options, client_factory=lambda *a, **k: self.client, window=self.fake_window)
         self.assertEqual(len(self.calls), 34)
         self.assertTrue(all(c["direction"] == "up" for c in self.calls[:17]))
@@ -275,10 +275,10 @@ class TransferTests(unittest.TestCase):
 
     def test_three_run_reduction_drops_best_worst_and_rejects_failures(self):
         runs = [{"status": "pass", "mib_per_sec": n} for n in (10, 100, 20)]
-        self.assertEqual(upload.reduce_runs(runs)["mib_per_sec"], 20)
+        self.assertEqual(transfer.reduce_runs(runs)["mib_per_sec"], 20)
         runs[0]["status"] = "skip"
-        self.assertIsNone(upload.reduce_runs(runs))
-        self.assertIsNone(upload.reduce_runs(runs[:2]))
+        self.assertIsNone(transfer.reduce_runs(runs))
+        self.assertIsNone(transfer.reduce_runs(runs[:2]))
 
     def test_loaded_gate_is_detail_not_warn_or_expected(self):
         self.baseline()
@@ -326,33 +326,33 @@ class TransferTests(unittest.TestCase):
     def test_asymmetry_bdp_and_no_invented_download_window(self):
         self.reports()
         records = download.download_reports("s3", self.options, client_factory=lambda *a, **k: self.client, window=self.fake_window)
-        check = upload.transfer_check("s3", "down", "throughput", self.options, records)
+        check = transfer.transfer_check("s3", "down", "throughput", self.options, records)
         self.assertEqual(json.loads(check.detail)["download_to_upload_ratio"], .5)
         self.assertIsNone(json.loads(check.detail)["single_stream"]["expected_mib_per_sec"])
-        signal = upload.bdp(1, 100, upload.MIB, 10)
+        signal = transfer.bdp(1, 100, transfer.MIB, 10)
         self.assertEqual(signal["expected_mib_per_sec"], 100)
         self.assertIn("node-side", signal["finding"])
-        self.assertAlmostEqual(upload.bdp(1, 1000, 1024 * upload.MIB, 1)["expected_mib_per_sec"], 5e9/8/upload.MIB)
-        self.assertIsNone(upload.bdp(1, 100, None, 10)["expected_mib_per_sec"])
+        self.assertAlmostEqual(transfer.bdp(1, 1000, 1024 * transfer.MIB, 1)["expected_mib_per_sec"], 5e9/8/transfer.MIB)
+        self.assertIsNone(transfer.bdp(1, 100, None, 10)["expected_mib_per_sec"])
 
     def test_cleanup_exact_owned_keys_keep_data_and_failure(self):
         records = self.reports()
         owned = list(records[0]["owned"])
         records[0]["owned"].append("someone-elses/key")
-        upload.cleanup(self.options)
+        transfer.cleanup(self.options)
         self.assertEqual(self.client.deleted, owned)
         self.assertIn("outside owned prefix", records[0]["cleanup_errors"][0]["reason"])
-        self.assertEqual(upload.transfer_check("s3", "up", "throughput", self.options, records).status, "skip")
+        self.assertEqual(transfer.transfer_check("s3", "up", "throughput", self.options, records).status, "skip")
         self.options.keep_data = True
         self.client.deleted.clear()
-        upload.cleanup(self.options)
+        transfer.cleanup(self.options)
         self.assertEqual(self.client.deleted, [])
         self.assertIn("retained", records[0]["cleanup"])
 
     def test_finalizer_runs_with_filtered_summary_and_on_exception(self):
         def probe(options):
             self.reports()
-            return upload.transfer_check("s3", "up", "throughput", options, options._transfer_reports["s3"]["up"])
+            return transfer.transfer_check("s3", "up", "throughput", options, options._transfer_reports["s3"]["up"])
         with patch.dict(internet.CHECKS, {"internet.s3.upload.throughput": probe}, clear=True):
             result = runner.collect("internet", options=self.options)[0]
         self.assertTrue(self.client.deleted)
@@ -370,7 +370,7 @@ class TransferTests(unittest.TestCase):
         def failed(options):
             records = self.reports()
             records[0]["runs_detail"][0]["status"] = "skip"
-            return upload.transfer_check("s3", "up", "throughput", options, records)
+            return transfer.transfer_check("s3", "up", "throughput", options, records)
         self.client.delete_object = Mock(side_effect=TransportError("delete failed"))
         with patch.dict(internet.CHECKS, {"internet.s3.upload.throughput": failed}, clear=True):
             check = runner.collect("internet", options=self.options)[0].checks[0]
@@ -398,14 +398,14 @@ class TransferTests(unittest.TestCase):
     def test_summary_artifacts_json_and_human_rendering(self):
         def probe(options):
             records = self.reports()
-            return upload.transfer_check("s3", "up", "throughput", options, records)
+            return transfer.transfer_check("s3", "up", "throughput", options, records)
         checks = {"internet.s3.upload.throughput": probe, "internet.s3.summary": internet.CHECKS["internet.s3.summary"]}
         with patch.dict(internet.CHECKS, checks, clear=True), tempfile.TemporaryDirectory() as tmp, redirect_stdout(StringIO()) as out:
             runner.run("internet", options=self.options, json_target="-", run_dir=tmp)
             document = json.loads(out.getvalue())
             summary = document["results"][0]["checks"][-1]
             self.assertEqual(summary["status"], "pass")
-            self.assertEqual(summary["value"]["bytes"]["uploaded"], 2 * upload.OBJECT_SIZE)
+            self.assertEqual(summary["value"]["bytes"]["uploaded"], 2 * transfer.OBJECT_SIZE)
             self.assertEqual(json.loads(summary["detail"])["cleanup"][0]["status"], "deleted exact owned keys")
             self.assertEqual(Path(tmp, "bench.values.json").read_text(), out.getvalue())
             self.assertIn("upload=100.00 MiB/s", Path(tmp, "bench.out").read_text())

@@ -7,7 +7,8 @@ from .path import dns_probe, path_probe
 from .download import download_probe
 from .summary import summary
 from .tcp import pmtud_probe, retransmit_probe
-from .upload import cleanup, loaded_probe, transfer_check, upload_probe
+from .transfer import cleanup, transfer_check
+from .upload import loaded_probe, upload_probe
 
 CHECKS = {}
 for provider in PROVIDERS:

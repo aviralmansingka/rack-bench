@@ -1,8 +1,11 @@
-"""Sequential-after-upload range GETs; never manufacture a setup upload."""
+"""Download policy: verified range GET windows over this run's upload manifest.
+The shared transfer instrument supplies measurement and grading; this module
+reads only the options-local manifest and never manufactures a setup upload.
+"""
 from rack_bench.common.models import Check
 from .s3client import S3Client
 from .targets import reason, run_prefix
-from .upload import ERRORS, plan, prerequisites, transfer_check, transfer_window
+from .transfer import ERRORS, plan, prerequisites, transfer_check, transfer_window
 
 
 def download_reports(provider, options, *, client_factory=S3Client, window=transfer_window):
