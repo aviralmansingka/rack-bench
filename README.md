@@ -368,7 +368,8 @@ containing SKIPs can exit 0; inspect the checks, not just the exit code.
 #### Workload and ownership
 
 Path/DNS and a verified 100 KiB idle-TTFB baseline run first. Uploads use
-seeded, checksummed ~1 GiB multipart objects with concurrent small-object GETs
+seeded, checksummed multipart objects (32 MiB quick, ~1 GiB certify) with
+concurrent small-object GETs
 for loaded TTFB. Downloads verify ranges from this run's completed uploads; they
 never use pre-seeded data. All upload windows, including a separate unloaded
 concurrency-1 test, finish before download windows start. TCP socket sampling

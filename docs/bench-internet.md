@@ -110,8 +110,9 @@ Run in this order; each is one or more `Check` entries per provider.
    Failed/invalid samples never become zero latency. Certify's nearest band
    retains three runs and drops best/worst ranked by response-TTFB p50; each
    light band has only one 20-GET run.
-4. **Sustained upload (egress)** — parallel multipart PUTs of ~1 GiB random
-   objects for the profile duration. Random data defeats provider-side
+4. **Sustained upload (egress)** — parallel multipart PUTs of profile-sized
+   random objects for the profile duration (32 MiB in quick so objects
+   complete and feed downloads; ~1 GiB in certify for sustained streams). Random data defeats provider-side
    compression/dedup. **Concurrent small-object TTFB probes** run during the
    window → loaded-latency signal: p95 under load, inflation vs test 3's
    baseline.

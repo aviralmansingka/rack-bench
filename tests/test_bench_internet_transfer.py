@@ -251,6 +251,9 @@ class TransferTests(unittest.TestCase):
     def test_quick_plan_and_cache_prevent_duplicate_transfers(self):
         records = self.reports()
         self.assertEqual([(c["concurrency"], c["duration"]) for c in self.calls], [(32, 1), (1, 1)])
+        # quick completes 32 MiB objects so download windows can run
+        self.assertTrue(all(c["size"] == transfer.LIGHT_SIZE for c in self.calls))
+        self.assertEqual(records[0]["object_size"], transfer.LIGHT_SIZE)
         self.assertIs(upload.upload_reports("s3", self.options), records)
         self.assertEqual(len(self.calls), 2)
 
@@ -260,12 +263,20 @@ class TransferTests(unittest.TestCase):
         self.assertEqual([len(r["runs_detail"]) for r in records], [15, 1, 1])
         self.assertEqual([c["concurrency"] for c in self.calls[:12]], [1]*3 + [8]*3 + [32]*3 + [64]*3)
         self.assertTrue(all(c["duration"] == 300 for c in self.calls))
+        self.assertTrue(all(c["size"] == transfer.OBJECT_SIZE for c in self.calls[:12]))  # certify keeps sustained 1 GiB streams
         self.assertTrue(all(c["one_object"] and c["size"] == 32 * transfer.MIB and c["loaded"] is None for c in self.calls[-2:]))
         download.download_reports("s3", self.options, client_factory=lambda *a, **k: self.client, window=self.fake_window)
         self.assertEqual(len(self.calls), 34)
         self.assertTrue(all(c["direction"] == "up" for c in self.calls[:17]))
         self.assertTrue(all(c["direction"] == "down" for c in self.calls[17:]))
         self.assertTrue(all(c["one_object"] for c in self.calls[-2:]))
+
+    def test_object_size_override_wins_for_quick_and_certify(self):
+        for profile in ("quick", "certify"):
+            self.options = Options(profile=profile, object_size=64, buckets={"s3": "bench-test"})
+            self.reports()
+            self.assertTrue(all(c["size"] == 64 * transfer.MIB for c in self.calls))
+            self.client.deleted.clear()
 
     def test_certify_explicit_concurrency_override_and_region_override(self):
         self.options = Options(profile="certify", concurrent=8, regions={"s3": "us-east-1"}, buckets={"s3": "bench-test"})
@@ -405,7 +416,7 @@ class TransferTests(unittest.TestCase):
             document = json.loads(out.getvalue())
             summary = document["results"][0]["checks"][-1]
             self.assertEqual(summary["status"], "pass")
-            self.assertEqual(summary["value"]["bytes"]["uploaded"], 2 * transfer.OBJECT_SIZE)
+            self.assertEqual(summary["value"]["bytes"]["uploaded"], 2 * transfer.LIGHT_SIZE)  # quick uploads 32 MiB objects
             self.assertEqual(json.loads(summary["detail"])["cleanup"][0]["status"], "deleted exact owned keys")
             self.assertEqual(Path(tmp, "bench.values.json").read_text(), out.getvalue())
             self.assertIn("upload=100.00 MiB/s", Path(tmp, "bench.out").read_text())
