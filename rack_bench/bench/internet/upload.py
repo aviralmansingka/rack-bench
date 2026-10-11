@@ -10,7 +10,7 @@ from .latency import OBJECT_SIZE as LATENCY_SIZE
 from .s3client import S3Client, SeededPayload
 from .stats import describe
 from .targets import reason, run_prefix
-from .transfer import (ERRORS, LIGHT_SIZE, OBJECT_SIZE, baseline, object_url, plan,
+from .transfer import (ERRORS, LIGHT_SIZE, MIB, OBJECT_SIZE, baseline, object_url, plan,
                        prerequisites, sample_timing, transfer_check, transfer_window)
 
 
@@ -50,11 +50,18 @@ def upload_reports(provider, options, *, client_factory=S3Client, window=transfe
         else:
             record["loaded_reason"] = ("omitted by light-band budget; no sustained upload window" if target["band"] == "light" else
                                        f"needs successful internet.{provider}.latency.ttfb baseline_ms.p95")
+        if options.object_size:
+            size = options.object_size * MIB
+        elif target["band"] == "light" or options.profile == "quick":
+            size = LIGHT_SIZE  # quick completes objects so download windows can run
+        else:
+            size = OBJECT_SIZE  # certify: sustained streams, tenant-shaped objects
+        record["object_size"] = size
         for concurrency, kind, runs in plan(target, options):
             for index in range(runs):
                 run, objects = window(client, direction="up", prefix=f"{prefix}{kind}-{concurrency}-{index}/",
                                       concurrency=concurrency, duration=options.duration, objects=[], owned=record["owned"],
-                                      size=LIGHT_SIZE if target["band"] == "light" else OBJECT_SIZE,
+                                      size=size,
                                       one_object=target["band"] == "light", loaded=loaded if kind == "bulk" else None,
                                       host=target["host"] if provider == "r2" else f'{options.buckets[provider]}.{target["host"]}')
                 run.update(kind=kind, run=index)

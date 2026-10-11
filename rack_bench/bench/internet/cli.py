@@ -19,6 +19,7 @@ class Options:
     buckets: dict[str, str] = field(default_factory=dict)
     concurrent: int | None = None
     duration: int | None = None  # seconds per test; defaults depend on profile
+    object_size: int | None = None  # MiB per uploaded object; default depends on profile
     tool: str = "stdlib"
     keep_data: bool = False
     yes: bool = False
@@ -99,6 +100,8 @@ def add_arguments(parser):
                         help="parallel streams (default: 32)")
     parser.add_argument("--duration", type=duration_seconds, metavar="DURATION",
                         help="per-test duration: seconds, Ns, Nm, Nh (default: quick 60s, certify 5m)")
+    parser.add_argument("--object-size", type=positive_int, metavar="MIB",
+                        help="uploaded object size in MiB (default: quick 32, certify 1024)")
     parser.add_argument("--tool", choices=("stdlib", "warp"), default="stdlib")
     parser.add_argument("--keep-data", action="store_true", help="retain objects under this run's rack-bench/ prefix")
     parser.add_argument("--yes", action="store_true", help="accept the certify reference cost estimate")
