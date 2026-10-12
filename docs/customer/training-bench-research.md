@@ -62,27 +62,30 @@ The bench puts these measurements on record:
 Use this architecture for workload checks and the Check evidence envelope.
 
 ```mermaid
-flowchart TB
-  Rack["Rack<br/>18 trays"]
-  Nodes["Nodes<br/>rank map"]
-  Canary["Short training canary<br/>MFU / throughput"]
-  Checkpoint["Save / resume cycle<br/>checkpoint / restart correctness"]
-  Sampling["Sustained sampling<br/>loss spikes / stragglers"]
-  Pipeline["Data pipeline probe<br/>loader stalls"]
-  Artifacts["Run artifacts<br/>metrics / events / state"]
-  Assertions["Assertion checks<br/>profile criteria"]
-  Envelope["Check envelope<br/>verdicts / evidence"]
-  Rack --> Nodes
-  Nodes --> Canary
-  Nodes --> Checkpoint
-  Nodes --> Sampling
-  Nodes --> Pipeline
-  Canary --> Artifacts
-  Checkpoint --> Artifacts
-  Sampling --> Artifacts
-  Pipeline --> Artifacts
-  Artifacts --> Assertions
-  Assertions --> Envelope
+flowchart TD
+  subgraph rackScope["Rack scope"]
+    Rack["Rack<br/>18 trays"]
+    Nodes["Nodes<br/>rank map"]
+    Rack --> Nodes
+  end
+  Nodes --> J((" "))
+  subgraph probes["Resilience probes"]
+    J --> Canary["Short training canary<br/>MFU / throughput"]
+    J --> Checkpoint["Save / resume cycle<br/>checkpoint / restart correctness"]
+    J --> Sampling["Sustained sampling<br/>loss spikes / stragglers"]
+    J --> Pipeline["Data pipeline probe<br/>loader stalls"]
+  end
+  subgraph evidence["Evidence"]
+    Artifacts["Run artifacts<br/>metrics / events / state"]
+    Assertions["Assertion checks<br/>profile criteria"]
+    Envelope["Check envelope<br/>verdicts / evidence"]
+    Canary --> Artifacts
+    Checkpoint --> Artifacts
+    Sampling --> Artifacts
+    Pipeline --> Artifacts
+    Artifacts --> Assertions
+    Assertions --> Envelope
+  end
 ```
 
 ### Why we test this

@@ -25,44 +25,53 @@ The bench runs on one architecture. Each instrument maps to one
 concept under test:
 
 ```mermaid
-flowchart TB
+flowchart TD
   subgraph host["bench node - Chennai"]
-    P["1. path audit - mtr, AS path, whois, RPKI"]
-    B["2. idle baseline - RTT, jitter, DNS suite"]
-    E["3. transfer engine - stdlib S3 client"]
-    L["4. loaded-latency probes - 10 Hz RTT, TCP_INFO"]
-    T["5. attribution - congestion signatures, BBR/CUBIC pair"]
+    P["1. Path audit<br/>mtr, AS path, whois, RPKI"]
+    B["2. Idle baseline<br/>RTT, jitter, DNS suite"]
+    E["3. Transfer engine<br/>stdlib S3 client"]
+    L["4. Loaded-latency probes<br/>10 Hz RTT, TCP_INFO"]
+    T["5. Attribution<br/>congestion signatures, BBR/CUBIC pair"]
+    P --> B --> E --> L --> T
   end
   subgraph tgt["public targets"]
+    J((" "))
     S3["S3 ap-south-1"]
     R2["R2 auto"]
     GC["GCS Mumbai/Singapore"]
     HFC["HF CDN edges"]
   end
-  P --> B --> E --> L --> T
-  E -.-> S3
-  E -.-> R2
-  E -.-> GC
+  E -.-> J
+  J -.-> S3
+  J -.-> R2
+  J -.-> GC
   P -.-> HFC
-  T --> R["Check envelope + run-dir artifacts"]
+  T --> R["Check envelope +<br/>run-dir artifacts"]
 ```
 
 A certification window runs six stages per node:
 
 ```mermaid
-flowchart TB
-  subgraph window["2-hour certification window - per node"]
-    direction LR
-    A["1. Path audit - mtr, AS path,<br/>RTT sanity, whois, RPKI"]
-    B["2. Idle baseline - RTT, jitter,<br/>DNS suite"]
-    C["3. Upload egress - sustained,<br/>staircase burst"]
-    D["4. Download ingress - sustained,<br/>single + multi-stream"]
-    E["5. Loaded latency - RRUL class,<br/>RTT under own load"]
-    F["6. Attribution - congestion<br/>signature, BBR/CUBIC pair"]
-    A --> B --> C --> D --> E --> F
-  end
-  G["Evening-peak scheduling -<br/>19:00-23:00 IST option"]
+flowchart TD
+  G["Evening-peak scheduling<br/>19:00-23:00 IST option"]
   H["RIPE Atlas inter-window<br/>probes - runbook"]
+  subgraph window["2-hour certification window - per node"]
+    subgraph row1["Stages 1-3"]
+      direction LR
+      A["1. Path audit<br/>mtr, AS path, whois, RPKI"]
+      B["2. Idle baseline<br/>RTT, jitter, DNS suite"]
+      C["3. Upload egress<br/>sustained, staircase burst"]
+      A --> B --> C
+    end
+    subgraph row2["Stages 4-6"]
+      direction LR
+      D["4. Download ingress<br/>sustained, single + multi-stream"]
+      E["5. Loaded latency<br/>RRUL, RTT under own load"]
+      F["6. Attribution<br/>congestion signature, BBR/CUBIC pair"]
+      D --> E --> F
+    end
+    C --> D
+  end
   G --> window
   window --> H
 ```
@@ -427,9 +436,9 @@ The default circuit looks like this:
 ```mermaid
 flowchart LR
     T["Rack trays"] --> FS["Frontend switch"] --> HO["Rack handoff"]
-    HO --> C["One carrier — committed rate, both directions"]
-    C --> N["Internet: S3 + R2 + GCS + HF"]
-    S["DNS resolver + NTP, reachable"] -.-> FS
+    HO --> C["One carrier —<br/>committed rate, both directions"]
+    C --> N["Internet:<br/>S3 + R2 + GCS + HF"]
+    S["DNS resolver + NTP,<br/>reachable"] -.-> FS
 ```
 
 Send your answers to Aviral. He replies with a test plan in a few

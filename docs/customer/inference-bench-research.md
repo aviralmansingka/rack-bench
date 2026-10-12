@@ -110,22 +110,35 @@ All identifiers below are proposed names, not claims about existing repository c
 This diagram shows the bench-run architecture and the evidence path into the Check envelope.
 
 ```mermaid
-flowchart TB
+flowchart TD
   B["Bench node<br/>bench inference"] --> H((" "))
-  H --> G["Synthetic load generator<br/>Request-rate sweep"]
-  H --> S["Model server under test<br/>vLLM or adapter"]
+  subgraph load_service["Load and service"]
+    G["Synthetic load generator<br/>Request-rate sweep"]
+    S["Model server under test<br/>vLLM or adapter"]
+    G -->|Requests| S
+  end
+  H --> G
+  H --> S
   H --> C["Cold-start timer<br/>Model load"]
-  H --> K["KV-cache pressure probe<br/>KV-cache behavior"]
-  G -->|Requests| S
+  H --> K
+  subgraph measurement["Measurement"]
+    L["Latency collector: TTFT / TPOT<br/>event-gap ITL, p50/p99 tails"]
+    T["Throughput collector<br/>Throughput vs rate, scheduler behavior"]
+    K["KV-cache pressure probe<br/>KV-cache behavior"]
+  end
   S --> J((" "))
-  J --> L["Client latency collector<br/>TTFT / TPOT / event-gap ITL<br/>p50/p99: tail latency"]
-  J --> T["Throughput collector<br/>Throughput vs request rate<br/>Scheduler behavior"]
+  J --> L
+  J --> T
   J --> K
-  L --> E["Evidence artifacts<br/>Request ledger + telemetry"]
+  subgraph evidence["Evidence"]
+    E["Evidence artifacts<br/>Request ledger + telemetry"]
+    X["Check envelope<br/>Evidence + target verdict"]
+  end
+  L --> E
   T --> E
   C --> E
   K --> E
-  E --> X["Check envelope<br/>Evidence + target verdict"]
+  E --> X
 ```
 
 Do not make deprecated engine metrics necessary.

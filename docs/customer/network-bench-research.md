@@ -32,18 +32,34 @@ rack certification.
 Use this proposed architecture to put measured evidence in the Check envelope.
 
 ```mermaid
-flowchart TB
-B["bench network<br/>Plan and profile"]
-S["Single node<br/>Host and GPU"]
-R["Rail pairs<br/>Peer and direction"]
-T["Up to 18 trays<br/>13+ node scale-out"]
+flowchart TD
+B["bench network<br/>plan and profile"]
+S["single node<br/>host and GPU"]
+R["rail pairs<br/>peer and direction"]
+T["up to 18 trays<br/>13+ node scale-out"]
 J((" "))
-C["nccl-tests sweep<br/>Collective goodput vs line rate"]
-P["ib_write_bw / ib_read_bw<br/>Per-rail health"]
-M["Monotonicity check<br/>Congestion/fabric degradation"]
-F["Fabric telemetry<br/>ECN/PFC/link events"]
-E["Evidence checks<br/>Transport and curve metadata"]
-K["Check envelope<br/>Results and raw evidence"]
+C["nccl-tests sweep<br/>goodput vs line rate"]
+P["ib_write_bw / ib_read_bw<br/>per-rail health"]
+M["monotonicity check<br/>congestion and degradation"]
+F["fabric telemetry<br/>ECN, PFC, link events"]
+E["evidence checks<br/>transport and curve metadata"]
+K["check envelope<br/>results and raw evidence"]
+subgraph scope["Bench scope"]
+  B
+  S
+  R
+  T
+end
+subgraph checks["Fabric checks"]
+  C
+  P
+  M
+  F
+end
+subgraph evidence["Evidence"]
+  E
+  K
+end
 B --> S
 S --> R
 R --> T

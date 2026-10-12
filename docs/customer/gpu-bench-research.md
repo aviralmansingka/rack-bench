@@ -142,18 +142,22 @@ An injected ECC value tests monitoring response, not physical defect detection.
 The proposed bench architecture keeps measurement evidence with or without an acceptance profile.
 
 ```mermaid
-flowchart TB
+flowchart TD
     BENCH["Bench coordinator<br/>allocation / deadline"]
-    HOSTS["Bench nodes<br/>per-GPU phase workers"]
+    HOSTS["Bench nodes<br/>phase workers per GPU"]
     J((" "))
-    RAS["DCGM / NVML / logs<br/>XID / ECC / row-remap"]
-    EXACT["Checked kernels<br/>memory / selected SDC"]
-    LOAD["Sustained workload<br/>thermal / power / clocks"]
-    RATE["GEMM / HBM probes<br/>compute / memory rates"]
-    LINK["NVLink snapshots<br/>per-GPU link health"]
-    RAW["Run-dir artifacts<br/>raw evidence / provenance"]
-    PROFILE["Acceptance profile<br/>declared quality rules"]
-    CHECK["Check envelope<br/>value / expected / status"]
+    subgraph probes["per-GPU probe phases"]
+        RAS["DCGM / NVML / logs<br/>XID / ECC / row remap"]
+        EXACT["Checked kernels<br/>memory / SDC checks"]
+        LOAD["Sustained workload<br/>thermal / power / clocks"]
+        RATE["GEMM / HBM probes<br/>compute / memory rates"]
+        LINK["NVLink snapshots<br/>per-GPU link health"]
+    end
+    subgraph evidence["Evidence"]
+        RAW["Run-dir artifacts<br/>raw evidence / provenance"]
+        PROFILE["Acceptance profile<br/>declared quality rules"]
+        CHECK["Check envelope<br/>value / expected / status"]
+    end
     BENCH --> HOSTS --> J
     J --> RAS
     J --> EXACT

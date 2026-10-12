@@ -22,12 +22,15 @@ A full run has six stages. The last stage removes the test objects:
 
 ```mermaid
 flowchart TD
-    A["1. Path audit — route and idle delay"]
-    A --> B["2. Upload pass — egress speed"]
-    B --> C["3. Download pass — ingress speed"]
-    C --> D["4. Single-stream vs parallel"]
-    D --> E["5. Latency — idle vs under load"]
-    E --> F["6. Cleanup — test objects removed"]
+    subgraph row1
+        direction LR
+        A["1. Path audit<br/>route and idle delay"] --> B["2. Upload pass<br/>egress speed"] --> C["3. Download pass<br/>ingress speed"]
+    end
+    subgraph row2
+        direction LR
+        D["4. Single-stream vs parallel"] --> E["5. Latency<br/>idle vs under load"] --> F["6. Cleanup<br/>test objects removed"]
+    end
+    C --> D
 ```
 
 The tool measures the real internet path from a rack handoff:
@@ -45,11 +48,14 @@ Your traffic leaves the rack, crosses your carrier, and reaches each cloud:
 
 ```mermaid
 flowchart LR
-    RACK["Rack host (rack-bench)"] --> SW["Frontend switch"]
-    SW --> HO["Rack handoff"] --> CAR["Carrier transit"]
-    CAR --> NET["Internet path"]
-    NET --> S3["Amazon S3"]
-    NET --> R2["Cloudflare R2"]
+    RACK["Rack-bench<br/>host"] --> SW["Frontend<br/>switch"]
+    SW --> HO["Rack<br/>handoff"] --> CAR["Carrier<br/>transit"]
+    CAR --> NET["Internet<br/>path"]
+    NET --> J((" "))
+    subgraph targets["Public targets"]
+        J --> S3["Amazon<br/>S3"]
+        J --> R2["Cloudflare<br/>R2"]
+    end
 ```
 
 When the rack has more than one ISP, we run the same passes once per
@@ -164,9 +170,9 @@ The default circuit looks like this:
 ```mermaid
 flowchart LR
     T["Rack trays"] --> FS["Frontend switch"] --> HO["Rack handoff"]
-    HO --> C["One carrier — committed rate, both directions"]
+    HO --> C["One carrier<br/>committed rate, both ways"]
     C --> N["Internet: S3 + R2"]
-    S["DNS resolver + NTP, reachable"] -.-> FS
+    S["DNS + NTP<br/>reachable"] -.-> FS
 ```
 
 Send your answers to Aviral. He replies with a test plan in a few

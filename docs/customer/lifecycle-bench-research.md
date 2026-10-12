@@ -53,18 +53,26 @@ The tool measures the lease lifecycle from first request to final exit:
 The proposed bench-run architecture uses this path from control node to target nodes and the Check envelope.
 
 ```mermaid
-flowchart TB
-Control["Control node<br/>rack-bench CLI<br/>Consent and deadline gate"]
-Dispatch((" "))
-Target["Isolated target node(s)<br/>Tenant adapter"]
-Probe((" "))
-API["API provisioning timer<br/>Lead time"]
-Image["Image/container pull check<br/>Bring-up hygiene"]
-Cycle["Reboot/reclaim cycle<br/>State hygiene<br/>Approved scope only"]
-Wipe["Wipe verification<br/>Data-destruction evidence<br/>Document review only"]
-Config["Config snapshot<br/>Drift baseline"]
-Evidence["Raw evidence<br/>IDs, times, logs, source kind"]
-Envelope["Check envelope<br/>name, status, value<br/>expected, detail, source"]
+flowchart TD
+subgraph controlplane[Control plane]
+  Control["Control node, rack-bench CLI<br/>consent and deadline gate"]
+  Dispatch((" "))
+end
+subgraph targetplane[Target plane]
+  Target["Isolated target node(s)<br/>tenant adapter"]
+  Probe((" "))
+  API["API provisioning<br/>timer, lead time"]
+  Image["Image/container pulls<br/>bring-up hygiene check"]
+  Cycle["Reboot/reclaim cycle state<br/>hygiene, approved scope"]
+  Config["Config snapshot<br/>drift baseline"]
+end
+subgraph docreview[Document review]
+  Wipe["Wipe verification<br/>destruction records"]
+end
+subgraph evidencezone[Evidence]
+  Evidence["Raw evidence<br/>IDs, times, logs, source kind"]
+  Envelope["Check envelope: name, status<br/>value, expected, detail, source"]
+end
 Control --> Dispatch
 Dispatch --> Target
 Dispatch --> Wipe
