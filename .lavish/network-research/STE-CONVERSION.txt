@@ -1,0 +1,35 @@
+FILE CONVERSION TASK. This is NOT web research.
+
+Context: Convert every Markdown page in the network research run to the parent's strict ASD-STE100 rules. The evidence concerns east-west fabric diagnosis for a GB300 NVL72-class, 18-tray rack in Chennai, India, within two hours. PASS requires measured target-rack evidence. Do not change that evidence boundary. The parent publishes the staged design copy later.
+
+You use agent=researcher only because the worker profile is unavailable. Act as a file converter, not a web researcher. Do not search or fetch the web. Do not start agents. Read every assigned file completely. Convert SHORT SECTIONS with targeted edit calls. Do not use whole-file writes. Check each section before the next edit. Change ONLY the explicitly assigned Markdown files under .lavish/network-research/. Do not change project files, shared instructions, check scripts, or other agents' files.
+
+Rules for every prose sentence, including table cells:
+1. Fewer than 20 words. One topic.
+2. Active voice. Name the actor. Instructions may use an implied actor in the imperative.
+3. Present tense. Use the imperative for instructions. Preserve historical dates while using present-tense evidence statements.
+4. Use ONLY these main verbs: make, show, start, use, check, run, send, keep, put, remove. Negative imperatives may use 'Do not'. Preserve exact verbs inside genuine verbatim source quotes and technical commands. Avoid other prose main verbs, including require, describe, support, establish, record, provide, indicate, verify, retain, consider, document, interpret, allow, select, identify, demonstrate, mean, give, imply, prove, find, and say. Never use utilize, facilitate, implement, leverage, or endeavor as prose verbs.
+5. One term per concept. Do not introduce synonyms.
+6. At most six sentences per paragraph. Split paragraphs when necessary without adding or deleting evidence.
+7. Do not stack clauses. Split sentences. Keep a cause-and-effect or conditional chain only if splitting changes its meaning.
+
+Preservation:
+- Preserve every claim, condition, limitation, uncertainty, negative statement, source attribution, verdict, and distinction between facts/calculations/inferences. Do not add or delete claims. Do not turn an observation into an instruction that changes its meaning.
+- Preserve all URLs and citations exactly, with the same occurrence counts. Do not move evidence to another claim. Citations may remain at the end of a split evidence block.
+- Preserve numbers, units, versions, identifiers, commands, inline code, quoted source strings, and genuine verbatim source quotes exactly. Do not duplicate numbers or code when splitting a sentence. Technical nouns stay unchanged.
+- Freeze quotation delimiters and all source quote wording and punctuation. Check original versus converted quote counts after every short section.
+- Preserve Markdown structure: exact headings and heading order, tables and row/column order, list hierarchy/order, code fences, diagrams, anchors, and links. Simplify cell prose without changing table shape. Do not add sections, collapse tables, or delete bullets.
+- Preserve [observed], [calculated], [inference] labels and their occurrence counts.
+- Preserve the exact phrase 'not publicly retrievable as of 2026-10-11' and every gap declaration's field scope and source URLs. Keep each final declaration on one physical line. You may split its surrounding prose into short sentences on that same line.
+- Convert the date boilerplate 'All claims below carry a source URL.' to 'All claims below use a source URL.' Keep 'Research date: 2026-10-11.' unchanged.
+- Keep every research.md lesson below 50 physical Markdown lines. Do not hide prose in an oversized physical line. Short sentences on separate lines are useful, but protect the line limit.
+- Do not replace technical precision with vague prose. Keep transport differences, catalog/format distinctions, counter units, editions, dates, coverage limits, and the measured-PASS boundary.
+
+Useful conversions, only when they preserve the original claim:
+'The publisher describes X.' -> 'The publisher shows X.'
+'The public listing gives no year.' -> 'The public listing shows no year.'
+'No inspected source establishes X.' -> 'The inspected sources show no evidence for X.'
+'PASS requires target-rack measurements.' -> 'Use target-rack measurements for PASS.'
+'The counter was reset.' -> 'The source shows a counter reset.' (Only use a source actor when the existing evidence supports it.)
+
+Check each file before completion. Check every sentence and every table cell manually. Compare citations, URLs, numbers, technical strings, and conditions against the original file. Return one confirmation per assigned file. State any exact remaining blocker; do not claim completion if you do not write the file. Do not write extra files.

@@ -1,0 +1,50 @@
+# Linux for Networking Professionals, first edition — source supplement N03
+
+Research date: 2026-10-11. All claims below use a source URL.
+
+## 1. Identity and access
+
+[observed] The requested O’Reilly URL is [9781800202399](https://learning.oreilly.com/library/view/-/9781800202399/?orm_source=mcp). The fetch shows HTTP 403 Forbidden in this research session. Therefore this session shows no access to the text. Packt’s first-edition product pages show *Linux for Networking Professionals* by Rob VandenBrink and ISBN 9781800202399. Search-indexed product metadata shows its subject as Linux networking services. [Packt first-edition listing](https://www.packtpub.com/en-us/product/linux-for-networking-professionals-9781800202399?type=print) [Packt “What this book covers” page](https://www.packtpub.com/en-us/product/linux-for-networking-professionals-9781800202399/chapter/preface-pref/section/what-this-book-covers-preflvl1sec03)
+
+[observed] Packt TOC search output shows a “Table of Contents (20) Chapters” navigation label. Packt’s first-edition GitHub repository shows code organized for Chapters 1–14. The discrepancy does not show 20 actual book chapters. The label may show navigation/content sections instead. This evidence shows no resolution.
+
+Chapter 3 is “Using Linux and Linux Tools for Network Diagnostics”. Chapter 8 is “Certificate Services on Linux.” The supplied catalogue record shows 528 pages and 2021. This session makes no independent confirmation here. [Packt TOC search result](https://www.packtpub.com/en-us/product/linux-for-networking-professionals-9781800202399/chapter/chapter-1-welcome-to-the-linux-family-2/section/virtualization) [Chapter 3 result](https://www.packtpub.com/en-us/product/linux-for-networking-professionals-9781800202399/chapter/chapter-3-using-linux-and-linux-tools-for-network-diagnostics-5/section/further-reading?chapterId=5) [Chapter 8 result](https://www.packtpub.com/en-TH/product/linux-for-networking-professionals-9781800202399/chapter/assessments-18/section/chapter-8-certificate-services-on-linux-ch18lvl1sec52)
+
+[observed] The second-edition O’Reilly record shows the title *Linux for Networking Professionals, Second Edition*, ISBN 9781835881101. This shows a separately identified 2e, not its detailed contents. It shows no evidence on supersession of particular 1e chapters. Another researcher keeps the 2e review. This comparison deliberately uses edition identity only. [O’Reilly 2e catalogue](https://www.oreilly.com/library/view/linux-for-networking/9781835881101)
+
+## 2. Verified chapters
+
+[observed] Chapter 3 explicitly shows the title “Using Linux and Linux Tools for Network Diagnostics.” The indexed description shows networking basics. It also shows use of a Linux workstation for network troubleshooting. This is the strongest direct relevance to the rack-bench work. But the public evidence shows no tool list and no RDMA/RoCE/InfiniBand coverage. [Packt Chapter 3 result](https://www.packtpub.com/en-us/product/linux-for-networking-professionals-9781800202399/chapter/chapter-3-using-linux-and-linux-tools-for-network-diagnostics-5/section/further-reading?chapterId=5)
+
+[observed] Chapter 8 shows the title “Certificate Services on Linux”. Packt’s indexed description shows certificates and securing/encrypting of traffic. It shows no evidence of GPU-fabric or RDMA testing content. [Packt Chapter 8 result](https://www.packtpub.com/en-TH/product/linux-for-networking-professionals-9781800202399/chapter/assessments-18/section/chapter-8-certificate-services-on-linux-ch18lvl1sec52)
+
+[observed] The product description shows the book’s coverage: Linux networking foundations, diagnostics, firewalling, DNS, IPS, DHCP, load balancing. It also shows authentication/authorization, logging, honeypots and virtualization. These are broad Linux network-service topics. They show no proof of NCCL collectives, per-rail verbs benchmarks, fabric counters, ECN/PFC or SHARP chapters. [Packt product listing](https://www.packtpub.com/en-us/product/linux-for-networking-professionals-9781800202399?type=subscription) [OverDrive description](https://www.overdrive.com/media/11007262/linux-for-networking-professionals)
+
+## 3. Relevance to the rack bench
+
+[inference] For a two-hour, 18-tray GB300 NVL72-class east-west certification, this is at most a Linux troubleshooting orientation. The verifiable Chapter 3 title may make a useful frame for host-side diagnosis. But available TOC/product evidence shows no required 8 B–16 GB NCCL collectives or goodput-versus-line-rate normalization. It shows no rail/topology analysis, ECN/PFC, flaps, per-rail RDMA write/read/latency, or scale-out methodology. Use the existing canon’s current NCCL, perftest, NIC/switch and fabric-manager references for those claims, not this book. [inference] [NCCL troubleshooting, versioned operational guidance](https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2312/user-guide/docs/troubleshooting/networking_troubleshooting.html) [perftest](https://github.com/linux-rdma/perftest)
+
+[observed] A title about Linux networking and a chapter about Linux diagnostics do not show evidence for RDMA coverage. No public evidence in this pass shows RDMA verbs, RoCE/InfiniBand, NCCL or GPU collective testing in this first edition. Keep the coverage as unverified. Do not make a negative claim about unseen pages. NVLink success is not RDMA proof. [inference] [Packt Chapter 3 result](https://www.packtpub.com/en-us/product/linux-for-networking-professionals-9781800202399/chapter/chapter-3-using-linux-and-linux-tools-for-network-diagnostics-5/section/further-reading?chapterId=5)
+
+## 4. Portable techniques suggested by the TOC (not observed book commands)
+
+These are recommendations from inference on the verified scope. They are not commands or procedures from the book.
+
+1. [inference] Use Chapter 3 as a prompt to keep host-side network diagnosis separate from fabric-wide diagnosis. Keep a record of host interface/link state. Then check NIC, switch and fabric-manager evidence for corroboration. [Packt Chapter 3](https://www.packtpub.com/en-us/product/linux-for-networking-professionals-9781800202399/chapter/chapter-3-using-linux-and-linux-tools-for-network-diagnostics-5/section/further-reading?chapterId=5) [NCCL guide](https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2312/user-guide/docs/troubleshooting/networking_troubleshooting.html)
+2. [inference] Use an evidence chain for diagnosis. Check which interface/path the selection uses. Run an explicit per-rail RDMA write/read test. Run NCCL collectives separately. Host reachability alone does not show RDMA or collective health. [NCCL guide](https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2312/user-guide/docs/troubleshooting/networking_troubleshooting.html) [perftest](https://github.com/linux-rdma/perftest)
+3. [inference] Keep time-stamped before/after error and congestion-counter snapshots around controlled loads. Check the deltas against throughput and latency. Do not show old nonzero counters as active faults. Check counter semantics in the deployed vendor documentation. [NCCL guide](https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2312/user-guide/docs/troubleshooting/networking_troubleshooting.html)
+4. [inference] Keep service/security configuration topics—firewall, certificates, DNS and logging—distinct from data-plane certification. They can show the cause of setup/bootstrap or observability problems. But they do not make a substitute for RDMA and collective measurements. [Packt product listing](https://www.packtpub.com/en-us/product/linux-for-networking-professionals-9781800202399?type=subscription)
+5. [inference] Keep the book time-boxed to the diagnostic chapter. Use primary vendor/tool manuals for commands and pass criteria. The available record shows broad orientation only. This evidence shows no command from the book. [Packt Chapter 3](https://www.packtpub.com/en-us/product/linux-for-networking-professionals-9781800202399/chapter/chapter-3-using-linux-and-linux-tools-for-network-diagnostics-5/section/further-reading?chapterId=5)
+
+## 5. Canon verdict
+
+**SKIM (Chapter 3 only); otherwise SKIP for this certification.** [inference] It is not a core east-west fabric reference. It shows no verified RDMA/NCCL-specific technique beyond the established canon of Gregg/Jain/Kurose plus current NCCL, perftest and vendor manuals. If the full book is accessible, check Chapter 3 for concrete host diagnostics. Use them for a local operational gap. Do not use the broad title for inference about its contents. [Packt Chapter 3](https://www.packtpub.com/en-us/product/linux-for-networking-professionals-9781800202399/chapter/chapter-3-using-linux-and-linux-tools-for-network-diagnostics-5/section/further-reading?chapterId=5) [existing canon](../books.md)
+
+## Gaps
+
+- [observed] The O’Reilly fetch shows an access denial. The full text and the complete TOC show no verification. [Catalog](https://learning.oreilly.com/library/view/-/9781800202399/?orm_source=mcp)
+- [observed] The supplied catalog shows 2021 and 528 pages. Readable primary metadata makes no independent confirmation of those fields. [Catalog](https://learning.oreilly.com/library/view/-/9781800202399/?orm_source=mcp)
+- [observed] Indexed chapter evidence shows no complete TOC and no RDMA coverage. [Chapter 3](https://www.packtpub.com/en-us/product/linux-for-networking-professionals-9781800202399/chapter/chapter-3-using-linux-and-linux-tools-for-network-diagnostics-5/section/further-reading?chapterId=5)
+- [observed] The 1e chapter-count discrepancy shows no resolution. Code requirements show Chapters 1–14, not necessarily every book chapter. [Repository](https://github.com/PacktPublishing/Linux-for-Networking-Professionals)
+- [inference] No verified chapter comparison shows extra 1e content beyond 2e. Keep the editions separate. [2e note](linux-networking-2e.md)
+- [inference] Use current manuals and measurements for GB300 transport and performance claims. [Canon](../books.md)
