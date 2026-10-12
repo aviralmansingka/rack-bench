@@ -28,15 +28,7 @@ could not verify is declared as a dated gap, not hidden.
 Each track (except the earlier storage effort) fanned out into seven
 category briefs: neoclouds, hyperscalers, ai-labs, large-companies,
 clustermax, academia, and books. Researchers worked in parallel with
-one brief per category. A second pass searched the O'Reilly Learning
-catalog for each domain and produced a supplement plus per-source
-notes. All prose was then converted to Simplified Technical English
-and reformatted into the customer-facing briefing pattern.
-
-The sources directory for each track holds the full evidence trail:
-the seven category briefs, the O'Reilly supplement and notes, node
-maps, verification reports, and declared gaps. The briefings link
-into them.
+one brief per category.
 
 ## Numbers
 
