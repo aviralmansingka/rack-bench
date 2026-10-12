@@ -7,7 +7,7 @@ when something dies on day 12?* Drills inject a named fault under a
 controlled window and measure the system's honest behavior.
 
 Grounded in the seven research corpora: the storage corpus
-(`.lavish/storage-research/`, `docs/storage-bench-research.md`) and the
+(`docs/research/storage-research/`, `docs/storage-bench-research.md`) and the
 six domain studies (gpu, network, lifecycle, training, inference,
 internet-quality; `docs/*-bench-research.md` in their research
 worktrees, to be merged). Section references below point into those

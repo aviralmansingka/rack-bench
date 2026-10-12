@@ -1,7 +1,7 @@
 # Storage bench research: failure modes and suite design
 
 Seven sourced research briefs back this document, one per category:
-`.lavish/storage-research/{clustermax,hyperscalers,ai-labs,
+`docs/research/storage-research/{clustermax,hyperscalers,ai-labs,
 neoclouds,parallel-fs,academia,books}.md`. Every claim below carries
 its citation there. This file distills them into the rack-bench
 storage bench: what breaks, who proved it, and which check catches it.
@@ -216,7 +216,7 @@ and repeats runs, dropping best/worst as the internet bench does.
 
 ## Reading list
 
-`.lavish/storage-research/books.md` ranks eight books for the
+`docs/research/storage-research/books.md` ranks eight books for the
 certification track. The storage-bench spine: Gregg, Systems
 Performance 2e (methodology); Jain, Art of Computer Systems
 Performance Analysis (runs, variance, confidence); OSTEP ch. 42

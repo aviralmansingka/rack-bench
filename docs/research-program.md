@@ -3,7 +3,7 @@
 This index covers the sourced research base behind the rack-bench
 bench categories. Seven tracks exist: gpu, network, internet, storage,
 training, inference, and lifecycle. Six tracks follow the
-customer-facing briefing pattern of `docs/datacenter-briefing.md`.
+customer-facing briefing pattern of `docs/customer/datacenter-briefing.md`.
 The storage track is the earlier sibling effort and keeps its original
 research-memo format.
 
@@ -15,12 +15,12 @@ could not verify is declared as a dated gap, not hidden.
 
 | Track | Briefing | Concern |
 | --- | --- | --- |
-| Internet | [internet-quality-research](internet-quality-research.md) | 45 TB pulls; no provider publishes sustained numbers. |
-| GPU | [gpu-bench-research](gpu-bench-research.md) | One bit-flip kills a 30-day run; bad clocks waste paid hours. |
-| Network | [network-bench-research](network-bench-research.md) | A healthy port does not prove a healthy collective. |
-| Training | [training-bench-research](training-bench-research.md) | Llama 3 saw 419 breaks; customers commit 30-90 days. |
-| Inference | [inference-bench-research](inference-bench-research.md) | Users feel p99 latency, not average tps. |
-| Lifecycle | [lifecycle-bench-research](lifecycle-bench-research.md) | Bring-up wastes days; data must not survive decommission. |
+| Internet | [internet-bench](customer/internet-bench.md) | 45 TB pulls; no provider publishes sustained numbers. |
+| GPU | [gpu-bench-research](customer/gpu-bench-research.md) | One bit-flip kills a 30-day run; bad clocks waste paid hours. |
+| Network | [network-bench-research](customer/network-bench-research.md) | A healthy port does not prove a healthy collective. |
+| Training | [training-bench-research](customer/training-bench-research.md) | Llama 3 saw 419 breaks; customers commit 30-90 days. |
+| Inference | [inference-bench-research](customer/inference-bench-research.md) | Users feel p99 latency, not average tps. |
+| Lifecycle | [lifecycle-bench-research](customer/lifecycle-bench-research.md) | Bring-up wastes days; data must not survive decommission. |
 | Storage | [storage-bench-research](storage-bench-research.md) | A stalled checkpoint costs $200k/month; no fsync'd number exists. |
 
 ## How the research was built
@@ -58,7 +58,7 @@ protocol or operations classic named in each briefing.
 
 ## Related documents
 
-- `docs/datacenter-briefing.md` — the customer-facing briefing whose
+- `docs/customer/datacenter-briefing.md` — the customer-facing briefing whose
   pattern the six tracks follow, and the source of the Google Doc.
 - `docs/internet-performance.md` — the internet bench design document
   (definitions, provider matrix, CLI shape) that pairs with the
