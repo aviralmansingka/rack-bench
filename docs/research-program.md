@@ -13,15 +13,15 @@ could not verify is declared as a dated gap, not hidden.
 
 ## The briefings
 
-| Track | Briefing | Sources | Customer concern | What two hours cannot certify |
-| --- | --- | --- | --- | --- |
-| Internet | [internet-quality-research](internet-quality-research.md) | [.lavish/internet-research](../.lavish/internet-research) | Customers pull 45 TB datasets and push 4.5 TB checkpoints. The internet path decides whether that takes hours or days. No provider publishes a sustained number. | Loss tails below 0.1%; diurnal duty cycle; WAN failover; DDoS absorption. |
-| GPU | [gpu-bench-research](gpu-bench-research.md) | [.lavish/gpu-research](../.lavish/gpu-research) | A silent bit-flip can corrupt a 30-day training run. A degraded clock wastes every hour paid for. | Silent-data-corruption absence; long-horizon wear; lifetime certification. |
-| Network | [network-bench-research](network-bench-research.md) | [.lavish/network-research](../.lavish/network-research) | A healthy port does not prove a healthy collective. Slow GPU communication makes training runs longer. | Endurance; rare faults; scale beyond 13 nodes; switch-internal behavior; failure recovery. |
-| Training | [training-bench-research](training-bench-research.md) | [.lavish/training-research](../.lavish/training-research) | Meta's Llama 3 runs saw 419 unplanned interruptions. Customers commit 30 to 90 days. The bench proves recovery before they pay. | Multi-week reliability; duty cycle of interruptions; full-scale convergence. |
-| Inference | [inference-bench-research](inference-bench-research.md) | [.lavish/inference-research](../.lavish/inference-research) | Users feel p99 latency, not average tokens per second. Vendor rate claims are incomparable. The bench measures tail behavior under load. | Production availability; precise low-sample p99; broad quantization fidelity. |
-| Lifecycle | [lifecycle-bench-research](lifecycle-bench-research.md) | [.lavish/lifecycle-research](../.lavish/lifecycle-research) | Customers lose days to broken bring-up. Customer data must not survive decommissioning. The bench times each step and verifies the wipe. | Long recovery periods; fleet-scale drift; contract SLA enforcement. |
-| Storage | [storage-bench-research](storage-bench-research.md) | [.lavish/storage-research](../.lavish/storage-research) | A stalled checkpoint costs more than $200k per month in idle GPUs. The durability void: no neocloud publishes an fsync'd number. | Wear-out; power-cut truth; the latent-sector-error tail; fairness/QoS. |
+| Track | Briefing | Concern |
+| --- | --- | --- |
+| Internet | [internet-quality-research](internet-quality-research.md) | 45 TB pulls; no provider publishes sustained numbers. |
+| GPU | [gpu-bench-research](gpu-bench-research.md) | One bit-flip kills a 30-day run; bad clocks waste paid hours. |
+| Network | [network-bench-research](network-bench-research.md) | A healthy port does not prove a healthy collective. |
+| Training | [training-bench-research](training-bench-research.md) | Llama 3 saw 419 breaks; customers commit 30-90 days. |
+| Inference | [inference-bench-research](inference-bench-research.md) | Users feel p99 latency, not average tps. |
+| Lifecycle | [lifecycle-bench-research](lifecycle-bench-research.md) | Bring-up wastes days; data must not survive decommission. |
+| Storage | [storage-bench-research](storage-bench-research.md) | A stalled checkpoint costs $200k/month; no fsync'd number exists. |
 
 ## How the research was built
 
