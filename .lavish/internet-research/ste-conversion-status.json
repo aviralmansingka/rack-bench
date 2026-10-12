@@ -1,0 +1,27 @@
+{
+  "scope": "42 original Markdown files under .lavish/internet-research/",
+  "baseline": "ste-baseline.json",
+  "checker": "ste-check.mjs",
+  "phase": "Conversion and manual review are complete.",
+  "agents": {},
+  "remaining": [],
+  "reviewed": [
+    "README.md", "oreilly.md", "academia.md", "books.md", "ai-labs.md", "neoclouds.md", "clustermax.md", "hyperscalers.md", "large-companies.md",
+    "oreilly/research.md", "oreilly/reading-list-update.md", "oreilly/ORCHESTRATOR-REPORT.md",
+    "oreilly/tcpip.md", "oreilly/hpbn.md", "oreilly/ppa.md", "oreilly/dns-bind.md",
+    "oreilly/pro-dns.md", "oreilly/dns-ipv6.md", "oreilly/cdn.md", "oreilly/nath.md",
+    "oreilly/greer.md", "oreilly/chow.md", "oreilly/sloan.md", "oreilly/cookbook.md",
+    "oreilly/linux-pro.md", "oreilly/white.md", "oreilly/gregg.md",
+    "oreilly/nodes/N01.md", "oreilly/nodes/N02.md", "oreilly/nodes/N03.md",
+    "oreilly/nodes/N04.md", "oreilly/nodes/N05.md", "oreilly/nodes/N06.md",
+    "oreilly/nodes/N07.md", "oreilly/nodes/N08.md", "oreilly/nodes/N09.md",
+    "oreilly/nodes/N10.md", "oreilly/nodes/N11.md", "oreilly/nodes/N12.md",
+    "oreilly/nodes/N13.md", "oreilly/nodes/N14.md", "oreilly/nodes/N15.md"
+  ],
+  "completed_file_check": "The preservation checker passes for the 42 reviewed files. Manual prose checks pass for these files.",
+  "confirmation_report": "ste-confirmation.md",
+  "new_report_review": "The confirmation report also follows the prose rules.",
+  "advisory_exemptions": ["oreilly/gregg.md: technical section-title enumeration", "oreilly/nath.md: technical topic-title enumeration"],
+  "selected_model": "Configured default researcher model; no override.",
+  "ownership": "Each file has one writer. The parent confirms no other writers in this directory."
+}

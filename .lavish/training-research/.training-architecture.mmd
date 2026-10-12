@@ -1,0 +1,21 @@
+flowchart TB
+  Rack["Rack<br/>18 trays"]
+  Nodes["Nodes<br/>rank map"]
+  Canary["Short training canary<br/>MFU / throughput"]
+  Checkpoint["Save / resume cycle<br/>checkpoint / restart correctness"]
+  Sampling["Sustained sampling<br/>loss spikes / stragglers"]
+  Pipeline["Data pipeline probe<br/>loader stalls"]
+  Artifacts["Run artifacts<br/>metrics / events / state"]
+  Assertions["Assertion checks<br/>profile criteria"]
+  Envelope["Check envelope<br/>verdicts / evidence"]
+  Rack --> Nodes
+  Nodes --> Canary
+  Nodes --> Checkpoint
+  Nodes --> Sampling
+  Nodes --> Pipeline
+  Canary --> Artifacts
+  Checkpoint --> Artifacts
+  Sampling --> Artifacts
+  Pipeline --> Artifacts
+  Artifacts --> Assertions
+  Assertions --> Envelope
