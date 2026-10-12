@@ -1,8 +1,8 @@
 # rack-bench
 
 Certification CLI for GB300-class datacenter clusters. `rack-bench` runs a
-three-stage pipeline — **audit → bench → smoke** — that takes a rack from
-"hardware just racked" to "certified for fleet use."
+four-stage pipeline — **audit → bench → drills → smoke** — that takes a rack
+from "hardware just racked" to "certified for fleet use."
 
 - **`audit`** — inventory & topology. Read-only. Captures hardware configuration
   and any system specs that impact performance (power limits, firmware versions,
@@ -10,6 +10,12 @@ three-stage pipeline — **audit → bench → smoke** — that takes a rack fro
 - **`bench`** — per-component quick pass/fail. Short-duration single-component
   tests across seven categories: `gpu`, `network`, `internet`, `storage`,
   `training`, `inference`, `lifecycle`.
+- **`drills`** — controlled fault injection. Inject a named fault (killed
+  writer, EIO on a scratch device, node reboot, link down, ISP withdraw) and
+  measure detection, attribution, blast radius, recovery, and data outcome.
+  A drill FAILs only when the system lies; honest failure is a PASS. Three
+  safety tiers: software-local (self-service), node-local (operator-approved),
+  fabric/site (DC-coordinated). Design: `docs/drills.md`.
 - **`smoke`** — burn-in. Long-duration stress testing per component, plus
   combined stressors (notably GPU compute + interconnect together) to catch
   failures that only appear under sustained, concurrent load.
@@ -17,9 +23,9 @@ three-stage pipeline — **audit → bench → smoke** — that takes a rack fro
 > **Implementation status:** the `audit` stage (all eight scopes, 122 checks) is
 > implemented and merged. `bench internet` measures paths, DNS, idle/loaded
 > latency, sustained and single-stream transfers, PMTUD, and TCP retransmits.
-> Other `bench` categories, `smoke`, `report`, the certification profile
-> (`--config`), and multi-host fan-out (`--hosts`) remain unimplemented design
-> targets.
+> Other `bench` categories, `drills`, `smoke`, `report`, the certification
+> profile (`--config`), and multi-host fan-out (`--hosts`) remain unimplemented
+> design targets.
 
 ## CLI shape
 
@@ -105,6 +111,16 @@ Output verbosity |
       rack-bench bench inference          # inference server sanity
       rack-bench bench lifecycle          # power cycle timing
       rack-bench bench <category> <test>  # one test, e.g. bench gpu gemm
+
+    rack-bench drills                     # everything below
+      rack-bench drills storage           # torn save, EIO, mount flap, orphans
+      rack-bench drills process           # kill worker, resume equivalence
+      rack-bench drills inference         # server kill under load
+      rack-bench drills lifecycle         # idempotency, rollback, revoke, DNS
+      rack-bench drills host              # single-host reboot (operator-approved)
+      rack-bench drills gpu               # XID/ECC injection, PCIe reset
+      rack-bench drills fabric            # link down, storage-node kill, ISP
+      rack-bench drills power             # power-cut readiness (DC-coordinated)
 
     rack-bench smoke                      # everything below
       rack-bench smoke gpu                # sustained GPU compute burn-in
@@ -475,7 +491,29 @@ The first collection yields 26 credential SKIPs; the second yields two SKIPs
 naming the missing upload objects. Live cloud interoperability and paid transfer
 rates were not exercised here.
 
-## Stage 3 — smoke (burn-in)
+## Stage 3 — drills (controlled fault injection)
+
+Bench and smoke test a healthy rack; drills test the rack's honesty when
+something dies. Each drill injects one named fault under a consent-gated
+window and records five observables: detection, attribution, blast radius,
+recovery timeline, and data outcome. Grading follows the house contract —
+**a drill FAILs only when the system lies**: an injected fault that produces
+a clean error, a contained failure, and an honest recovery is a PASS;
+silently retried errors, misattributed failures, or lost acknowledged data
+FAIL.
+
+Safety is tiered. **Tier 1** (software-local: process kills, `dm-error` on a
+scratch device, resolver switch, teardown cycles) is self-service on
+run-owned resources. **Tier 2** (node-local: single-host reboot, PCIe reset,
+DCGM XID/ECC injection) requires a named operator approval — `--yes` never
+authorizes it. **Tier 3** (fabric and site: link/rail down, storage-node or
+MDS kill, ISP session withdraw, power cut) is scheduled with DC operations —
+the DC pulls the link, rack-bench measures. Every drill declares a recovery
+path and abort criteria before injection, and proves return to useful work
+with a post-drill canary. Full research basis and check catalog:
+`docs/drills.md`.
+
+## Stage 4 — smoke (burn-in)
 
 Long-duration (`--duration`, default 4h) sustained stress, watching for errors
 that only surface over time: ECC correctable/uncorrectable events, XIDs, thermal
@@ -503,7 +541,10 @@ the first implementation:
 
 - **Fabric fault injection** — link flap and node kill during running
   collectives, plus job-level failover, to measure how the fabric and jobs
-  behave when a component dies (ClusterMAX 3.0 fault-tolerance testing).
+  behave when a component dies. ClusterMAX 3.0 injects GPU faults (DCGM XID
+  injection, PCIe bridge resets, node reboots); public fabric-level
+  injection is not part of its published methodology. This is the Tier 3
+  `drills fabric` family (`docs/drills.md`).
 - **Observability functional validation** — DCGM exporter and NCCL inspector
   actually emitting metrics while tests run; this spec audits their versions but
   never validates emission end-to-end.
@@ -520,9 +561,12 @@ R2; the longer `smoke internet` soak remains future work.
 1. `rack-bench audit --hosts all-nodes --json audit.json` — verify spec match;
    abort certification if topology is degraded (missing NVLink lanes etc.)
 2. `rack-bench bench --hosts all-nodes` — quick pass/fail on every category;
-   investigate any FAIL before burning time in smoke
-3. `rack-bench smoke full --duration 4h --hosts all-nodes` — burn-in
-4. `rack-bench report --run-dir ./rack-bench-runs/<ts>/` — summary rollup across
+   investigate any FAIL before burning time in drills or smoke
+3. `rack-bench drills --tier 1 --hosts all-nodes` — fault-injection honesty
+   checks on run-owned resources; Tier 2/3 drills scheduled with the operator
+   and DC around operations windows
+4. `rack-bench smoke full --duration 4h --hosts all-nodes` — burn-in
+5. `rack-bench report --run-dir ./rack-bench-runs/<ts>/` — summary rollup across
    all nodes and stages, exit code reflects certification verdict
 
 Exit codes: `0` all pass · `1` test failures · `2` infrastructure error (host
