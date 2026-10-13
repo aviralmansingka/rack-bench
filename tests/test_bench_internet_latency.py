@@ -17,6 +17,9 @@ ENV = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test", "R2_ACCOUNT
 
 
 class MemoryS3:
+    def close(self):
+        pass
+
     def __init__(self):
         self.objects = {"user/important": b"untouched"}
         self.gets = 0
@@ -32,7 +35,7 @@ class MemoryS3:
         self.upload_headers = s3.checksum_headers(payload.iter_chunks())
         return s3.Response(200, {}, s3.Timing(bytes_sent=payload.size))
 
-    def get_object(self, key, *, payload):
+    def get_object(self, key, *, payload, fresh_connection=False):
         self.gets += 1
         if self.error:
             raise self.error

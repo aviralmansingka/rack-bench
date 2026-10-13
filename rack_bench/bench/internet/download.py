@@ -38,6 +38,7 @@ def download_reports(provider, options, *, client_factory=S3Client, window=trans
                                 host=upload["host"] if provider == "r2" else f'{options.buckets[provider]}.{upload["host"]}')
                 run.update(kind=kind, run=index)
                 record["runs_detail"].append(run)
+        client.close()  # this thread's pooled socket; worker sockets died with their threads
     return records
 
 

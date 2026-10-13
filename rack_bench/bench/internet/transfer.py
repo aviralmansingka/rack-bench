@@ -186,7 +186,10 @@ def transfer_window(client, *, direction, prefix, concurrency, duration, objects
             cpu_start = time.thread_time()
             try:
                 _echo(f'GET {object_url(client, loaded["key"])} (loaded latency)')
-                response = client.get_object(loaded["key"], payload=loaded["payload"])
+                # One-shot socket: every loaded sample keeps TCP+TLS inside its
+                # TTFB, matching cold-client semantics; bulk pooling is separate.
+                response = client.get_object(loaded["key"], payload=loaded["payload"],
+                                             fresh_connection=True)
                 loaded_bytes += response.timing.bytes_received
                 sample = timing_sample(response.timing)
                 sample["cpu_ms"] = (time.thread_time() - cpu_start) * 1000
@@ -332,3 +335,4 @@ def cleanup(options):
                 errors.append({"key": key, "reason": reason(exc)})
         record["cleanup"] = "failed" if errors else "deleted exact owned keys"
         record["cleanup_errors"] = errors
+        client.close()  # pooled socket teardown after the final owned-key DELETE
