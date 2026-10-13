@@ -67,7 +67,7 @@ def upload_reports(provider, options, *, client_factory=S3Client, window=transfe
                 run.update(kind=kind, run=index)
                 record["runs_detail"].append(run)
                 record["objects"].extend(objects)
-        client.close()  # this thread's pooled socket; worker sockets died with their threads
+        client.close()  # parent-side pooled socket; worker sockets died with their threads/processes
     return records
 
 

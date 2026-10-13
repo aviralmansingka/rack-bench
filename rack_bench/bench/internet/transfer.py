@@ -1,18 +1,32 @@
 """Shared transfer instrument: guards, window engine, reduction, grading and cleanup.
 Both direction policies use this engine and its options-local run state; owned
 keys survive until the collection finalizer, independently of check filtering.
+
+Worker model: bulk windows (concurrency > 1) run one worker per process via a
+ProcessPoolExecutor so the per-byte data path (chunk regeneration, digest
+pre-pass, socket send/receive, verification) escapes the GIL; each worker
+process builds its own S3Client and keeps its own pooled TLS connection. All
+single-stream windows (concurrency 1, including bulk-sweep concurrency 1) keep
+the in-process thread executor: they are the unchanged control group, their
+code path is identical to earlier fixes, and the parent-pid ss filter still
+applies to them. Both modes run the same picklable top-level worker, which
+validates every part/range and RETURNS results for the parent to merge.
 """
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from contextvars import copy_context
 import json
 import math
+import multiprocessing
+import os
+import sys
 import threading
 import time
 
-from rack_bench.common.host import _echo
+from rack_bench.common.host import _echo, operation_echo
 from rack_bench.common.models import Check
 from .latency import timing_sample
-from .s3client import S3Error, ProtocolError, SeededPayload
+from .s3client import S3Client, S3Error, ProtocolError, SeededPayload, set_chunk_cache_limit
 from .stats import describe, windows
 from .targets import reason, run_prefix, targets
 from .tcp import TCPWindow
@@ -86,10 +100,156 @@ def throughput_buckets(points, elapsed):
             for start, counts in windows(points, duration=1.0) if 0 <= start < elapsed]
 
 
+def _mp_context():
+    # Fork on Linux (the lab host): cheap, and children inherit warm module
+    # state. Everywhere else (e.g. macOS dev hosts, where forking a threaded
+    # interpreter is unsafe) use spawn; both carry the pool initargs through
+    # Process construction, so synchronization primitives stay shareable.
+    return multiprocessing.get_context("fork" if sys.platform.startswith("linux") else "spawn")
+
+
+def _process_pool_factory(concurrency, *, initializer=None, initargs=()):
+    """Bulk-window default: one worker process per stream (own GIL, own client)."""
+    return ProcessPoolExecutor(max_workers=concurrency, mp_context=_mp_context(),
+                               initializer=initializer, initargs=initargs)
+
+
+def _thread_pool_factory(concurrency, *, initializer=None, initargs=()):
+    """Single-stream default: in-process worker threads (unchanged control group)."""
+    return ThreadPoolExecutor(max_workers=concurrency, initializer=initializer, initargs=initargs)
+
+
+_POOL_STATE = {}
+"""Worker-process state (client, stop event) set by _pool_initialiser.
+
+Only worker processes populate this; the parent and in-process worker threads
+receive the client and stop event through the task spec instead, so stale
+parent-side state can never leak into a threaded window.
+"""
+
+
+def _pool_initialiser(client_config, stop, pid_slots, chunk_limit, echo):
+    """Worker-process setup: own S3Client, shared stop event, pid registration.
+
+    S3Client is not picklable (its connection pool is threading.local), so each
+    child constructs its own from plain config and thereby keeps its own warm
+    pooled TLS connection across objects. The stop event and pid slots arrive
+    through the pool initargs, which travel via Process construction rather
+    than the task queue, so synchronization primitives remain shareable.
+    chunk_limit re-caps this process's chunk cache: bulk workers each cache the
+    same run-shared payload bytes, so N processes must not each hold the
+    parent-side cap; one part's worth of chunks keeps the current part hot.
+    The operation-echo contextvar does not cross process boundaries; the
+    parent's callback is passed in and re-installed explicitly.
+    """
+    bucket, endpoint, timeout, control_retries, backoff = client_config
+    _POOL_STATE["client"] = S3Client(bucket, endpoint.region, endpoint=endpoint,
+                                     timeout=timeout, control_retries=control_retries,
+                                     backoff=backoff)
+    _POOL_STATE["stop"] = stop
+    set_chunk_cache_limit(chunk_limit)
+    operation_echo.set(echo)
+    with pid_slots.get_lock():
+        for slot in range(len(pid_slots)):
+            if pid_slots[slot] == 0:
+                pid_slots[slot] = os.getpid()
+                break
+
+
+def _transfer_worker(spec):
+    """One scheduled transfer stream; validates each part/range, returns results.
+
+    Runs as an in-process worker thread (single-stream windows) or inside a
+    worker process (bulk windows). Per-part validation -- timing shape,
+    monotonic progress, byte accounting -- happens here, before anything is
+    accepted. Nothing is shared with the scheduler: the worker returns
+    (samples, points, completed, errors, owned_keys, incomplete_objects,
+    attempted_bytes) and the parent merges. owned_keys are collected before
+    each upload attempt so ambiguous PUTs stay cleanable even when the worker
+    reports them only at completion. A failing worker sets the shared stop
+    event so sibling workers exit at their next check.
+    """
+    client = spec["client"] if spec["client"] is not None else _POOL_STATE["client"]
+    stop = spec["stop"] if spec["stop"] is not None else _POOL_STATE["stop"]
+    clock, deadline, start, active = spec["clock"], spec["deadline"], spec["start"], spec["active"]
+    samples, points, completed, errors, owned_keys = [], [], [], [], []
+    attempted_bytes = incomplete_objects = 0
+    index, iteration = spec["index"], 0
+    while not stop.is_set() and (iteration == 0 or clock() < deadline):
+        direction = spec["direction"]
+        key = f'{spec["prefix"]}{index}-{iteration}.bin' if direction == "up" else spec["objects"][index % len(spec["objects"])]["key"]
+        payload = SeededPayload(spec["seed"] if spec["seed"] is not None else key, spec["size"]) if direction == "up" else SeededPayload(**spec["objects"][index % len(spec["objects"])]["payload"])
+        pending, last, part_number = {}, 0, 0
+        cpu_start = time.thread_time()
+
+        def progress(count, _seconds):
+            nonlocal last, attempted_bytes
+            delta = count - last
+            if delta < 0:
+                raise ProtocolError("non-monotonic transfer progress")
+            last = count
+            timestamp = clock() - start
+            bucket = math.floor(timestamp)
+            pending[bucket] = pending.get(bucket, 0) + delta
+            attempted_bytes += delta
+            if delta and active is not None:
+                active.set()
+
+        def accept(response, count):
+            nonlocal last, part_number, cpu_start
+            sample = sample_timing(response.timing, count, direction)
+            if sum(pending.values()) != count:
+                raise ProtocolError("progress bytes differ from measured transfer", timing=response.timing)
+            sample.update(bytes=count, key=key, part=part_number, cpu_ms=(time.thread_time() - cpu_start) * 1000)
+            samples.append(sample)
+            points.extend(pending.items())
+            pending.clear()
+            last = 0
+            part_number += 1
+            cpu_start = time.thread_time()
+
+        try:
+            if direction == "up":
+                owned_keys.append(key)
+                _echo(f"multipart PUT {object_url(client, key)} ({payload.size} bytes)")
+                def on_part(response):
+                    accept(response, min(spec["part_size"], payload.size - part_number * spec["part_size"]))
+                    if part_number * spec["part_size"] < payload.size and (stop.is_set() or not spec["one_object"] and clock() >= deadline):
+                        raise _WindowEnded("profile window ended; abort incomplete multipart")
+                client.multipart_upload(key, payload, part_size=spec["part_size"], on_part=on_part, on_progress=progress)
+                completed.append({"key": key, "payload": {"seed": payload.seed, "size": payload.size, "chunk_size": payload.chunk_size}})
+            else:
+                # One stream reads one uploaded object in bounded, verified ranges.
+                for offset in range(0, payload.size, spec["part_size"]):
+                    count = min(spec["part_size"], payload.size - offset)
+                    _echo(f"GET {object_url(client, key)} Range: bytes={offset}-{offset + count - 1}")
+                    def consume(data, _offset):
+                        progress(last + len(data), 0)
+                    response = client.get_object(key, byte_range=(offset, offset + count - 1), payload=payload, consume=consume)
+                    accept(response, count)
+                    if offset + count < payload.size and (stop.is_set() or not spec["one_object"] and clock() >= deadline):
+                        raise _WindowEnded("profile window ended at range boundary")
+                completed.append({"key": key})
+        except _WindowEnded as exc:
+            incomplete_objects += 1
+            if exc.cleanup_error:
+                errors.append({"type": "AbortError", "reason": str(exc.cleanup_error)})
+            break
+        except ERRORS as exc:
+            errors.append({"type": type(exc).__name__, "reason": reason(exc),
+                           "cleanup_error": str(getattr(exc, "cleanup_error", None) or "")})
+            stop.set()
+            break
+        iteration += 1
+        if spec["one_object"]:
+            break
+    return samples, points, completed, errors, owned_keys, incomplete_objects, attempted_bytes
+
+
 def transfer_window(client, *, direction, prefix, concurrency, duration, objects,
                     owned, size=OBJECT_SIZE, one_object=False, loaded=None,
                     clock=time.monotonic, tcp_factory=TCPWindow, host="", loaded_interval=1.0,
-                    part_size=None, seed=None):
+                    part_size=None, seed=None, pool_factory=None):
     """Schedule until deadline, drain the current part/range; report actual wall time.
 
     No object-sized buffers. Validate each measured part/range before accepting
@@ -100,95 +260,52 @@ def transfer_window(client, *, direction, prefix, concurrency, duration, objects
     in the run derives identical bytes per offset, so the bounded chunk/digest
     caches in s3client turn the signed-digest pre-pass and chunk regeneration
     into hits. seed=None falls back to the object key, matching stored records.
+
+    Execution scoping: concurrency > 1 windows schedule one worker per process
+    (pool_factory=None picks _process_pool_factory) so the data path escapes the
+    GIL; concurrency 1 windows keep in-process threads (_thread_pool_factory).
+    pool_factory is the test seam, mirroring tcp_factory: thread-based factories
+    run the same picklable worker in-process, where mock clients and fake clocks
+    work unchanged. The loaded-latency probe always stays in this (parent)
+    process as a thread with fresh_connection=True semantics.
     """
     if part_size is None:
         part_size = PART_SIZE  # resolved per call so tests can patch the default
-    lock, stop, active = threading.Lock(), threading.Event(), threading.Event()
+    out_of_process = concurrency > 1 and pool_factory in (None, _process_pool_factory)
+    factory = pool_factory or (_process_pool_factory if out_of_process else _thread_pool_factory)
+    stop, pid_slots, initializer, initargs = threading.Event(), None, None, ()
+    if out_of_process:
+        context = _mp_context()
+        stop = context.Event()
+        # Worker pids register here; TCPWindow polls this array so child sockets
+        # stay inside the window diagnostics instead of vanishing from the
+        # parent-pid ss filter. The array and event travel via pool initargs.
+        pid_slots = context.Array("i", concurrency)
+        initializer = _pool_initialiser
+        initargs = ((client.bucket, client.endpoint, client.timeout, client.control_retries, client.backoff),
+                    stop, pid_slots, part_size, operation_echo.get())
+
+    def pids():
+        # Parent plus registered worker processes; read under the array lock.
+        with pid_slots.get_lock():
+            workers = {int(value) for value in pid_slots if value}
+        return {os.getpid()} | workers
+
     samples, points, completed, errors, loaded_samples, loaded_errors = [], [], [], [], [], []
     attempted_bytes = 0
     loaded_bytes = 0
     incomplete_objects = 0
+    active = threading.Event()
     start = clock()
     deadline = start + duration
 
-    def worker(index):
-        nonlocal attempted_bytes, incomplete_objects
-        iteration = 0
-        while not stop.is_set() and (iteration == 0 or clock() < deadline):
-            key = f"{prefix}{index}-{iteration}.bin" if direction == "up" else objects[index % len(objects)]["key"]
-            payload = SeededPayload(seed if seed is not None else key, size) if direction == "up" else SeededPayload(**objects[index % len(objects)]["payload"])
-            pending, last, part_number = {}, 0, 0
-            cpu_start = time.thread_time()
-
-            def progress(count, _seconds):
-                nonlocal last, attempted_bytes
-                delta = count - last
-                if delta < 0:
-                    raise ProtocolError("non-monotonic transfer progress")
-                last = count
-                timestamp = clock() - start
-                bucket = math.floor(timestamp)
-                pending[bucket] = pending.get(bucket, 0) + delta
-                with lock:
-                    attempted_bytes += delta
-                if delta:
-                    active.set()
-
-            def accept(response, count):
-                nonlocal last, part_number, cpu_start
-                sample = sample_timing(response.timing, count, direction)
-                if sum(pending.values()) != count:
-                    raise ProtocolError("progress bytes differ from measured transfer", timing=response.timing)
-                sample.update(bytes=count, key=key, part=part_number, cpu_ms=(time.thread_time() - cpu_start) * 1000)
-                with lock:
-                    samples.append(sample)
-                    points.extend(pending.items())
-                pending.clear()
-                last = 0
-                part_number += 1
-                cpu_start = time.thread_time()
-
-            try:
-                if direction == "up":
-                    with lock:
-                        owned.append(key)
-                    _echo(f"multipart PUT {object_url(client, key)} ({payload.size} bytes)")
-                    def on_part(response):
-                        accept(response, min(part_size, payload.size - part_number * part_size))
-                        if part_number * part_size < payload.size and (stop.is_set() or not one_object and clock() >= deadline):
-                            raise _WindowEnded("profile window ended; abort incomplete multipart")
-                    client.multipart_upload(key, payload, part_size=part_size, on_part=on_part, on_progress=progress)
-                    obj = {"key": key, "payload": {"seed": payload.seed, "size": payload.size, "chunk_size": payload.chunk_size}}
-                    with lock:
-                        completed.append(obj)
-                else:
-                    # One stream reads one uploaded object in bounded, verified ranges.
-                    for offset in range(0, payload.size, part_size):
-                        count = min(part_size, payload.size - offset)
-                        _echo(f"GET {object_url(client, key)} Range: bytes={offset}-{offset + count - 1}")
-                        def consume(data, _offset):
-                            progress(last + len(data), 0)
-                        response = client.get_object(key, byte_range=(offset, offset + count - 1), payload=payload, consume=consume)
-                        accept(response, count)
-                        if offset + count < payload.size and (stop.is_set() or not one_object and clock() >= deadline):
-                            raise _WindowEnded("profile window ended at range boundary")
-                    with lock:
-                        completed.append({"key": key})
-            except _WindowEnded as exc:
-                with lock:
-                    incomplete_objects += 1
-                    if exc.cleanup_error:
-                        errors.append({"type": "AbortError", "reason": str(exc.cleanup_error)})
-                break
-            except ERRORS as exc:
-                with lock:
-                    errors.append({"type": type(exc).__name__, "reason": reason(exc),
-                                   "cleanup_error": str(getattr(exc, "cleanup_error", None) or "")})
-                stop.set()
-                break
-            iteration += 1
-            if one_object:
-                break
+    def task(index):
+        return {"direction": direction, "prefix": prefix, "index": index, "objects": objects,
+                "size": size, "one_object": one_object, "deadline": deadline, "start": start,
+                "part_size": part_size, "seed": seed, "clock": clock,
+                "client": None if out_of_process else client,
+                "stop": None if out_of_process else stop,
+                "active": None if out_of_process else active}
 
     def latency_worker():
         nonlocal loaded_bytes
@@ -214,16 +331,40 @@ def transfer_window(client, *, direction, prefix, concurrency, duration, objects
             if stop.wait(loaded_interval):
                 break
 
-    with tcp_factory(host) as tcp:
+    with tcp_factory(host, pids=pids if out_of_process else None) as tcp:
         # Window includes TCP snapshots/setup overhead, but never a hidden retry.
-        thread = threading.Thread(target=copy_context().run, args=(latency_worker,), daemon=True) if loaded else None
-        if thread:
-            thread.start()
+        thread = None
         try:
-            with ThreadPoolExecutor(max_workers=concurrency) as pool:
-                futures = [pool.submit(copy_context().run, worker, index) for index in range(concurrency)]
+            with factory(concurrency, initializer=initializer, initargs=initargs) as pool:
+                futures = [pool.submit(_transfer_worker, task(index)) if out_of_process else
+                           pool.submit(copy_context().run, _transfer_worker, task(index))
+                           for index in range(concurrency)]
+                # Worker processes spawn on first submit: the loaded-latency
+                # thread starts only now, so every fork happens before it exists
+                # and its one-shot connections are always made post-spawn. Child
+                # processes cannot set a parent-side threading event, so the
+                # parent approximates first-transfer activity at submit time.
+                if out_of_process:
+                    active.set()
+                if loaded:
+                    thread = threading.Thread(target=copy_context().run, args=(latency_worker,), daemon=True)
+                    thread.start()
                 for future in futures:
-                    future.result()
+                    try:
+                        result = future.result()
+                    except (ERRORS, BrokenProcessPool) as exc:
+                        # Unpicklable task/return or a dead worker: explicit skip.
+                        errors.append({"type": type(exc).__name__, "reason": reason(exc)})
+                        stop.set()
+                        continue
+                    worker_samples, worker_points, worker_completed, worker_errors, worker_owned, worker_incomplete, worker_attempted = result
+                    samples.extend(worker_samples)
+                    points.extend(worker_points)
+                    completed.extend(worker_completed)
+                    owned.extend(worker_owned)
+                    errors.extend(worker_errors)
+                    incomplete_objects += worker_incomplete
+                    attempted_bytes += worker_attempted
         finally:
             end = clock()
             stop.set()

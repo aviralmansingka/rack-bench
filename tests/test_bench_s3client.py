@@ -161,6 +161,24 @@ class PayloadTests(unittest.TestCase):
         cache.clear()
         self.assertEqual(cache.total, 0)
         self.assertIsNone(cache.get("oversized"))
+        cache.resize(5)                                    # re-cap keeps one entry
+        self.assertLessEqual(cache.total, 5)
+        cache.put("z", b"1")
+        self.assertLessEqual(cache.total, 5)
+
+    def test_chunk_cache_limit_recaps_module_cache_for_worker_processes(self):
+        # Worker processes call this with a smaller cap: a process-pool bulk
+        # window caches the same run-shared bytes once per process, so N
+        # workers must not each hold the full parent-side cap.
+        s3.clear_payload_caches()
+        self.addCleanup(s3.clear_payload_caches)
+        self.addCleanup(lambda: s3.set_chunk_cache_limit(s3.CHUNK_CACHE_LIMIT))
+        s3.set_chunk_cache_limit(2 * 1024 * 1024)
+        payload = s3.SeededPayload("recap", 6 * 1024 * 1024)
+        for chunk_index in range(3):
+            payload.chunk(chunk_index)
+        self.assertEqual(s3._CHUNK_CACHE.total, 2 * 1024 * 1024)
+        self.assertIsNone(s3._CHUNK_CACHE.get(("recap", 1024 * 1024, 0)))  # evicted
 
     def test_shared_seed_parts_share_digests_across_objects(self):
         # One run-wide seed: sibling objects derive identical bytes per offset,
