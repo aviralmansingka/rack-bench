@@ -180,8 +180,16 @@ class MockS3(BaseHTTPRequestHandler):
     def reply(self, status=200, body=b"", headers=None):
         self.send_response(status)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Connection", "close")
-        self.close_connection = True
+        if self.server.state.get("keep_alive"):
+            # HTTP/1.1 plus Content-Length: the connection stays reusable.
+            pass
+        else:
+            self.send_header("Connection", "close")
+            self.close_connection = True
+        if (self.server.state.get("server_close_after") is not None and
+                self.server.state["counts"][self.command] >= self.server.state["server_close_after"]):
+            # Server-side idle close: the reply advertises keep-alive, the socket dies.
+            self.close_connection = True
         for key, value in (headers or {}).items():
             self.send_header(key, value)
         self.end_headers()
@@ -191,6 +199,7 @@ class MockS3(BaseHTTPRequestHandler):
     def handle_request(self):
         state = self.server.state
         state["counts"][self.command] += 1
+        state.setdefault("connections", set()).add(self.client_address)
         headers = dict((k.lower(), v) for k, v in self.headers.items())
         record = {"method": self.command, "path": self.path, "headers": headers}
         state["requests"].append(record)
@@ -307,6 +316,7 @@ class TransportTests(unittest.TestCase):
         self.client = s3.S3Client("bucket", "auto", timeout=2, backoff=0,
                                   endpoint=s3.Endpoint("127.0.0.1", "auto", True,
                                                        self.server.server_port, False))
+        self.addCleanup(self.client.close)
 
     def test_put_shapes_auth_and_checksums(self):
         progress = []
@@ -495,6 +505,44 @@ class TransportTests(unittest.TestCase):
             self.client.head_object("key")
         self.assertEqual(caught.exception.timing.attempts, 3)
         self.assertEqual(self.state["counts"]["HEAD"], 3)
+
+    def test_pooled_keep_alive_reuses_one_socket(self):
+        self.state["keep_alive"] = True
+        payload = self.state["payload"]
+        timings = [self.client.get_object("key", byte_range=(0, 99), payload=payload).timing
+                   for _ in range(3)]
+        self.assertEqual(self.state["counts"]["GET"], 3)
+        self.assertEqual(len(self.state["connections"]), 1)
+        self.assertTrue(all(timing.attempts == 1 for timing in timings))
+        self.assertGreater(timings[0].connect_seconds, 0)
+        self.assertEqual(timings[1].connect_seconds, 0.0)
+        self.assertEqual(timings[2].connect_seconds, 0.0)
+        self.client.close()
+        timing = self.client.get_object("key", byte_range=(0, 99), payload=payload).timing
+        self.assertGreater(timing.connect_seconds, 0)
+        self.assertEqual(len(self.state["connections"]), 2)
+
+    def test_stale_pooled_socket_reconnects_once_without_retry(self):
+        self.state.update(keep_alive=True, server_close_after=1)
+        payload = self.state["payload"]
+        self.client.get_object("key", byte_range=(0, 99), payload=payload)
+        self.assertEqual(len(self.state["connections"]), 1)
+        second = self.client.get_object("key", byte_range=(0, 99), payload=payload)
+        self.assertEqual(self.state["counts"]["GET"], 2)  # one resend, never a retry
+        self.assertEqual(len(self.state["connections"]), 2)
+        self.assertEqual(second.timing.attempts, 1)
+        self.assertGreater(second.timing.connect_seconds, 0)  # resent on a fresh socket
+
+    def test_fresh_connection_opt_out_leaves_pool_intact(self):
+        self.state["keep_alive"] = True
+        payload = self.state["payload"]
+        self.client.get_object("key", byte_range=(0, 99), payload=payload)
+        one_shot = self.client.get_object("key", byte_range=(0, 99), payload=payload,
+                                          fresh_connection=True)
+        self.assertGreater(one_shot.timing.connect_seconds, 0)
+        pooled = self.client.get_object("key", byte_range=(0, 99), payload=payload)
+        self.assertEqual(pooled.timing.connect_seconds, 0.0)
+        self.assertEqual(len(self.state["connections"]), 2)
 
     def test_paginated_list_cleanup_is_prefix_scoped(self):
         self.client.cleanup_prefix("bench/")

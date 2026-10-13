@@ -16,6 +16,7 @@ import http.client
 import os
 import re
 import socket
+import threading
 import time
 from typing import Callable, Iterable, Mapping
 import xml.etree.ElementTree as ET
@@ -297,7 +298,7 @@ class Response:
 
 
 class S3Client:
-    """Env-only credentials. One socket per request, explicit per-socket timeout.
+    """Env-only credentials. One pooled keep-alive socket per thread; per-socket timeout.
 
     All PUTs and GET object operations are measurement ops and never retry.
     Initiate/complete/abort/list/HEAD/DELETE retry bounded 5xx/connection errors.
@@ -320,12 +321,33 @@ class S3Client:
         self.timeout = timeout
         self.control_retries = control_retries
         self.backoff = backoff
+        self._connections = threading.local()
+
+    def _pooled(self, host, port, cls):
+        """Live keep-alive connection for this thread and endpoint, or None."""
+        entry = getattr(self._connections, "entry", None)
+        if entry is None:
+            return None
+        if (entry[0] == host and entry[1] == port and entry[2] is cls
+                and entry[3].sock is not None):
+            return entry[3]
+        entry[3].close()
+        self._connections.entry = None
+        return None
+
+    def close(self) -> None:
+        """Close the calling thread's pooled connection. Threads own sockets."""
+        entry = getattr(self._connections, "entry", None)
+        if entry is not None:
+            self._connections.entry = None
+            entry[3].close()
 
     def _request(self, method: str, key: str = "", *, query=(), headers=None,
                  body: Callable[[], Iterable[bytes]] = lambda: (), size: int = 0,
                  measurement: bool = False,
                  consume: Callable[[bytes, int], None] | None = None,
-                 on_progress: Callable[[int, float], None] | None = None) -> Response:
+                 on_progress: Callable[[int, float], None] | None = None,
+                 fresh_connection: bool = False) -> Response:
         endpoint = self.endpoint
         host = endpoint.host if endpoint.path_style else f"{self.bucket}.{endpoint.host}"
         authority = host if endpoint.port is None else f"{host}:{endpoint.port}"
@@ -342,88 +364,116 @@ class S3Client:
         transport_only = {"content-length": str(size)}
         digest = request_headers.get("x-amz-content-sha256", hashlib.sha256(b"").hexdigest())
         attempts = 1 if measurement else self.control_retries + 1
+        cls = http.client.HTTPSConnection if endpoint.tls else http.client.HTTPConnection
+        conn = None if fresh_connection else self._pooled(host, endpoint.port, cls)
         for attempt in range(1, attempts + 1):
-            timing = Timing(attempts=attempt)
-            start = time.perf_counter()
-            cls = http.client.HTTPSConnection if endpoint.tls else http.client.HTTPConnection
-            conn = cls(host, endpoint.port, timeout=self.timeout)
-            conn._create_connection = connect_ipv4
+            error = None
+            # One resend when an idle pooled socket died before any measured
+            # byte existed. That is connection setup, never a hidden retry:
+            # timing restarts and the recorded attempt count stays unchanged.
+            for stale_attempt in (1, 2):
+                timing = Timing(attempts=attempt)
+                start = time.perf_counter()
+                reused = conn is not None and conn.sock is not None
+                if reused:
+                    timing.connect_seconds = 0.0
+                else:
+                    conn = cls(host, endpoint.port, timeout=self.timeout)
+                    conn._create_connection = connect_ipv4
+                    connect_start = time.perf_counter()
+                    conn.connect()
+                    timing.connect_seconds = time.perf_counter() - connect_start
+                    if not fresh_connection:
+                        self._connections.entry = (host, endpoint.port, cls, conn)
 
-            def response_class(*args, **kwargs):
-                response = _TimedHTTPResponse(*args, **kwargs)
+                def response_class(*args, **kwargs):
+                    response = _TimedHTTPResponse(*args, **kwargs)
 
-                def first_byte():
-                    if timing.response_first_byte_seconds is None:
-                        timing.response_first_byte_seconds = time.perf_counter() - start
+                    def first_byte():
+                        if timing.response_first_byte_seconds is None:
+                            timing.response_first_byte_seconds = time.perf_counter() - start
 
-                response.on_first_byte = first_byte
-                return response
+                    response.on_first_byte = first_byte
+                    return response
 
-            conn.response_class = response_class
-            try:
-                signed = sign_headers(self.credentials, method, path, query,
-                                      request_headers, digest, endpoint.region)
-                conn.putrequest(method, target, skip_host=True, skip_accept_encoding=True)
-                for name, value in {**signed, **transport_only}.items():
-                    conn.putheader(name, value)
-                connect_start = time.perf_counter()
-                conn.connect()
-                timing.connect_seconds = time.perf_counter() - connect_start
-                conn.endheaders()
-                for chunk in body():
-                    conn.send(chunk)
-                    timing.bytes_sent += len(chunk)
-                    if on_progress:
-                        on_progress(timing.bytes_sent, time.perf_counter() - start)
-                if timing.bytes_sent != size:
-                    raise ProtocolError("upload source length differs from Content-Length")
-                response = conn.getresponse()
-                timing.headers_seconds = time.perf_counter() - start
-                result = Response(response.status, dict((k.lower(), v)
-                                  for k, v in response.getheaders()), timing)
-                collect = consume is None or not 200 <= response.status < 300
-                collected = bytearray()
-                # read(1) exposes body TTFB, unlike a blocking full-chunk read.
-                block = response.read(1)
-                if block:
-                    timing.first_byte_seconds = time.perf_counter() - start
-                while block:
-                    offset = timing.bytes_received
-                    timing.bytes_received += len(block)
-                    if collect:
-                        if len(collected) + len(block) > 4 * 1024 * 1024:
-                            raise ProtocolError("control/error response exceeds 4 MiB")
-                        collected.extend(block)
-                    else:
-                        consume(block, offset)
-                    block = response.read(64 * 1024)
-                result.body = bytes(collected)
-                content_length = result.headers.get("content-length")
-                if method != "HEAD" and content_length is not None:
-                    if not content_length.isdigit() or int(content_length) != timing.bytes_received:
-                        raise ProtocolError("truncated or invalid Content-Length")
-                if not 200 <= result.status < 300:
-                    self._raise_service(result)
-                # Multipart completion may report an Error inside HTTP 200.
-                if result.body and method == "POST":
-                    root = self._xml(result)
-                    if root.tag.rsplit("}", 1)[-1] == "Error":
+                conn.response_class = response_class
+                keep = False
+                try:
+                    signed = sign_headers(self.credentials, method, path, query,
+                                          request_headers, digest, endpoint.region)
+                    conn.putrequest(method, target, skip_host=True, skip_accept_encoding=True)
+                    for name, value in {**signed, **transport_only}.items():
+                        conn.putheader(name, value)
+                    conn.endheaders()
+                    for chunk in body():
+                        conn.send(chunk)
+                        timing.bytes_sent += len(chunk)
+                        if on_progress:
+                            on_progress(timing.bytes_sent, time.perf_counter() - start)
+                    if timing.bytes_sent != size:
+                        raise ProtocolError("upload source length differs from Content-Length")
+                    response = conn.getresponse()
+                    timing.headers_seconds = time.perf_counter() - start
+                    result = Response(response.status, dict((k.lower(), v)
+                                      for k, v in response.getheaders()), timing)
+                    collect = consume is None or not 200 <= response.status < 300
+                    collected = bytearray()
+                    # read(1) exposes body TTFB, unlike a blocking full-chunk read.
+                    block = response.read(1)
+                    if block:
+                        timing.first_byte_seconds = time.perf_counter() - start
+                    while block:
+                        offset = timing.bytes_received
+                        timing.bytes_received += len(block)
+                        if collect:
+                            if len(collected) + len(block) > 4 * 1024 * 1024:
+                                raise ProtocolError("control/error response exceeds 4 MiB")
+                            collected.extend(block)
+                        else:
+                            consume(block, offset)
+                        block = response.read(64 * 1024)
+                    result.body = bytes(collected)
+                    content_length = result.headers.get("content-length")
+                    if method != "HEAD" and content_length is not None:
+                        if not content_length.isdigit() or int(content_length) != timing.bytes_received:
+                            raise ProtocolError("truncated or invalid Content-Length")
+                    if not 200 <= result.status < 300:
                         self._raise_service(result)
-                return result
-            except (OSError, http.client.HTTPException) as exc:
-                error = TransportError(f"{method} transport failed: {type(exc).__name__}", timing=timing)
-                error.__cause__ = exc
-            except S3Error as exc:
-                error = exc
-                error.timing = timing
-            finally:
-                timing.elapsed_seconds = time.perf_counter() - start
-                conn.close()
-            if attempt == attempts or not (
+                    # Multipart completion may report an Error inside HTTP 200.
+                    if result.body and method == "POST":
+                        root = self._xml(result)
+                        if root.tag.rsplit("}", 1)[-1] == "Error":
+                            self._raise_service(result)
+                    keep = True
+                    return result
+                except (OSError, http.client.HTTPException) as exc:
+                    if (stale_attempt == 1 and reused
+                            and timing.bytes_sent == 0 and timing.bytes_received == 0):
+                        # The peer closed its idle keep-alive socket. No measured
+                        # byte ever existed; the finally block closes it and the
+                        # next pass reconnects with fresh timing.
+                        continue
+                    error = TransportError(f"{method} transport failed: {type(exc).__name__}", timing=timing)
+                    error.__cause__ = exc
+                except S3Error as exc:
+                    error = exc
+                    error.timing = timing
+                finally:
+                    timing.elapsed_seconds = time.perf_counter() - start
+                    if not keep:
+                        conn.close()
+                        entry = getattr(self._connections, "entry", None)
+                        if not fresh_connection and entry is not None and entry[3] is conn:
+                            self._connections.entry = None
+                if error is not None:
+                    break
+            if error is not None and (attempt == attempts or not (
                     isinstance(error, TransportError) or
-                    isinstance(error, ServiceError) and error.status is not None and error.status >= 500):
+                    isinstance(error, ServiceError) and error.status is not None and error.status >= 500)):
                 raise error
-            time.sleep(self.backoff * 2 ** (attempt - 1))
+            if error is not None:
+                time.sleep(self.backoff * 2 ** (attempt - 1))
+            conn = None
         raise AssertionError("unreachable")
 
     @staticmethod
@@ -563,11 +613,14 @@ class S3Client:
 
     def get_object(self, key: str, *, byte_range: tuple[int, int] | None = None,
                    payload: SeededPayload | None = None,
-                   consume: Callable[[bytes, int], None] | None = None) -> Response:
+                   consume: Callable[[bytes, int], None] | None = None,
+                   fresh_connection: bool = False) -> Response:
         """Stream/discard body; optional verify then consume(data, absolute_offset).
 
         Range ends are inclusive. Supplying payload verifies size as well as bytes.
         Neither range nor full-object GET retries, including callback failures.
+        fresh_connection bypasses the pooled socket so latency samples keep
+        TCP+TLS setup inside their timing, as on a cold client.
         """
         start = 0
         headers = {}
@@ -585,7 +638,8 @@ class S3Client:
             if consume:
                 consume(data, start + offset)
 
-        response = self._request("GET", key, headers=headers, measurement=True, consume=receive)
+        response = self._request("GET", key, headers=headers, measurement=True,
+                                 consume=receive, fresh_connection=fresh_connection)
         if byte_range is not None:
             expected_size = end - start + 1
             content_range = response.headers.get("content-range", "")

@@ -74,7 +74,8 @@ def latency_probe(provider, options, *, client_factory=S3Client, cpu_clock=time.
                 for _ in range(SAMPLES):
                     cpu_start = cpu_clock()
                     _echo(f"GET {url}")
-                    response = client.get_object(key, payload=payload)
+                    # One-shot socket keeps TCP+TLS setup inside every baseline sample.
+                    response = client.get_object(key, payload=payload, fresh_connection=True)
                     record["bytes_downloaded"] += response.timing.bytes_received
                     sample = timing_sample(response.timing)
                     sample["cpu_ms"] = (cpu_clock() - cpu_start) * 1000
@@ -87,16 +88,20 @@ def latency_probe(provider, options, *, client_factory=S3Client, cpu_clock=time.
         except (S3Error, CredentialError, ValueError, OSError) as exc:
             record.update(status="skip", reason=f"{type(exc).__name__}: {reason(exc)}")
         finally:
-            if client is not None and not options.keep_data:
-                try:
-                    # Delete only our exact key, including after an ambiguous failed PUT.
-                    # Never list the bucket root or delete someone else's prefix.
-                    _echo(f"DELETE {url}")
-                    client.delete_object(key)
-                    record["cleanup"] = "deleted owned key"
-                except (S3Error, OSError) as exc:
-                    record.update(status="skip", cleanup_error=f"{type(exc).__name__}: {exc}")
-                    record["reason"] = record.get("reason") or "owned-key cleanup failed"
+            if client is not None:
+                client.close()
+                if not options.keep_data:
+                    try:
+                        # Delete only our exact key, including after an ambiguous failed PUT.
+                        # Never list the bucket root or delete someone else's prefix.
+                        _echo(f"DELETE {url}")
+                        client.delete_object(key)
+                        record["cleanup"] = "deleted owned key"
+                    except (S3Error, OSError) as exc:
+                        record.update(status="skip", cleanup_error=f"{type(exc).__name__}: {exc}")
+                        record["reason"] = record.get("reason") or "owned-key cleanup failed"
+                else:
+                    record["cleanup"] = "retained (--keep-data)"
             elif options.keep_data:
                 record["cleanup"] = "retained (--keep-data)"
     primary = records[0]

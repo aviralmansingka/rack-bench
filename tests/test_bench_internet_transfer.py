@@ -64,6 +64,9 @@ class FakeTCP:
 
 
 class FakeClient:
+    def close(self):
+        pass
+
     def __init__(self, *args, invalid=None):
         self.endpoint = SimpleNamespace(host="example.invalid", path_style=False)
         self.bucket = "bench-test"
@@ -84,7 +87,7 @@ class FakeClient:
         self.objects[key] = payload
         return response(0)  # Completion timing MUST NOT become a payload sample.
 
-    def get_object(self, key, payload, byte_range=None, consume=None):
+    def get_object(self, key, payload, byte_range=None, consume=None, fresh_connection=False):
         self.calls.append(("down", key))
         self.assert_owned(key)
         start, end = byte_range or (0, payload.size - 1)
