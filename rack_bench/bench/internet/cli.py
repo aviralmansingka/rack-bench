@@ -20,6 +20,7 @@ class Options:
     concurrent: int | None = None
     duration: int | None = None  # seconds per test; defaults depend on profile
     object_size: int | None = None  # MiB per uploaded object; default depends on profile
+    part_size: int | None = None  # MiB per multipart part / range GET; default 64
     tool: str = "stdlib"
     keep_data: bool = False
     yes: bool = False
@@ -30,6 +31,8 @@ class Options:
             self.concurrent = 32
         if self.duration is None:
             self.duration = 300 if self.profile == "certify" else 60
+        if self.part_size is None:
+            self.part_size = 64  # MiB; see transfer.PART_SIZE for the timeout rationale
 
 
 def csv_choices(value, *, choices):
@@ -79,6 +82,16 @@ def positive_int(value):
     return number
 
 
+def part_size_mib(value):
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected a positive integer") from None
+    if not 8 <= number <= 512:
+        raise argparse.ArgumentTypeError("expected 8..512 (MiB); every non-final part must stay above S3's 5 MiB minimum")
+    return number
+
+
 def duration_seconds(value):
     match = re.fullmatch(r"([0-9]+)([smh]?)", value)
     if not match or int(match[1]) <= 0:
@@ -102,6 +115,8 @@ def add_arguments(parser):
                         help="per-test duration: seconds, Ns, Nm, Nh (default: quick 60s, certify 5m)")
     parser.add_argument("--object-size", type=positive_int, metavar="MIB",
                         help="uploaded object size in MiB (default: quick 32, certify 1024)")
+    parser.add_argument("--part-size", type=part_size_mib, metavar="MIB",
+                        help="multipart part / range GET size in MiB (default: 64; 8..512)")
     parser.add_argument("--tool", choices=("stdlib", "warp"), default="stdlib")
     parser.add_argument("--keep-data", action="store_true", help="retain objects under this run's rack-bench/ prefix")
     parser.add_argument("--yes", action="store_true", help="accept the certify reference cost estimate")

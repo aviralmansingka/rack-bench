@@ -7,6 +7,7 @@ Fixture provenance (captured on the development host, 2026-10-08):
 Timeout, PID ownership and counter-delta mutations below are synthetic, not
 represented as captures. No capture command executes during these tests.
 """
+import argparse
 from contextlib import redirect_stdout
 from copy import deepcopy
 from io import StringIO
@@ -21,7 +22,7 @@ from unittest.mock import Mock, patch
 
 from rack_bench.bench import internet, runner
 from rack_bench.bench.internet import download, tcp, transfer, upload
-from rack_bench.bench.internet.cli import Options, before_run
+from rack_bench.bench.internet.cli import Options, before_run, part_size_mib
 from rack_bench.bench.internet.s3client import S3Client, Timing, TransportError
 from rack_bench.common.models import Check
 
@@ -189,9 +190,10 @@ class TransferTests(unittest.TestCase):
             return result
         client.upload_part = part
         def run():
+            # 8 MiB parts split the 16 MiB object so the deadline lands mid-object.
             return transfer.transfer_window(client, direction="up", prefix="rack-bench/test/", concurrency=1,
                                           duration=.1, objects=[], owned=[], size=16 * transfer.MIB,
-                                          clock=Clock(), tcp_factory=FakeTCP)[0]
+                                          clock=Clock(), tcp_factory=FakeTCP, part_size=8 * transfer.MIB)[0]
         self.assertEqual(run()["status"], "pass")
         client.abort_multipart.assert_called_once_with("rack-bench/test/0-0.bin", "owned-upload-id")
         client.complete_multipart.assert_not_called()
@@ -199,6 +201,81 @@ class TransferTests(unittest.TestCase):
         failed = run()
         self.assertEqual(failed["status"], "skip")
         self.assertIn("abort denied", failed["errors"][0]["reason"])
+
+    def test_quick_object_smaller_than_part_is_valid_single_part_upload(self):
+        # Default 64 MiB parts against a 32 MiB quick-profile object: one part,
+        # still legal S3 (only non-final parts must reach 5 MiB).
+        client = S3Client("bench-test", "us-east-1")
+        client.initiate_multipart = Mock(return_value="single-upload-id")
+        client.complete_multipart = Mock(return_value=response(0))
+        client.abort_multipart = Mock()
+        def part(key, upload_id, number, payload, offset, size, on_progress):
+            on_progress(size, .01)
+            result = response(size)
+            result.headers = {"etag": "part-tag"}
+            result.upload_crc32 = "AAAAAA=="
+            return result
+        client.upload_part = part
+        run = transfer.transfer_window(client, direction="up", prefix="rack-bench/test/", concurrency=1,
+                                       duration=.1, objects=[], owned=[], size=transfer.LIGHT_SIZE,
+                                       clock=Clock(), tcp_factory=FakeTCP)[0]
+        self.assertEqual(run["status"], "pass")
+        self.assertEqual(run["bytes"], transfer.LIGHT_SIZE)
+        self.assertEqual([s["part"] for s in run["samples"]], [0])
+        client.complete_multipart.assert_called_once()
+        self.assertEqual(client.complete_multipart.call_args.args[2], [(1, "part-tag", "AAAAAA==")])
+        client.abort_multipart.assert_not_called()
+
+    def test_part_size_kwarg_sizes_multipart_and_range_gets(self):
+        seen = {}
+        def multipart(key, payload, part_size, on_part, on_progress):
+            seen["upload"] = part_size
+            for offset in range(0, payload.size, part_size):
+                size = min(part_size, payload.size - offset)
+                on_progress(size, .001)
+                on_part(response(size))
+            return response(0)
+        def get(key, payload, byte_range=None, consume=None, fresh_connection=False):
+            seen.setdefault("ranges", []).append(byte_range)
+            if consume:
+                consume(b"x" * (byte_range[1] - byte_range[0] + 1), byte_range[0])
+            return response(byte_range[1] - byte_range[0] + 1, "down")
+        self.client.multipart_upload, self.client.get_object = multipart, get
+        run, objects = self.window(part_size=16)
+        self.assertEqual(run["status"], "pass")
+        self.assertEqual(run["bytes"], 32)
+        self.assertEqual([s["part"] for s in run["samples"]], [0, 0])  # one part per 16-byte object
+        self.assertEqual(seen["upload"], 16)
+        with patch.object(transfer, "PART_SIZE", 8):
+            run, _ = transfer.transfer_window(self.client, direction="down", prefix="unused/", concurrency=1,
+                                              duration=.1, objects=objects, owned=[], one_object=True,
+                                              clock=self.clock, tcp_factory=FakeTCP, part_size=16)
+        self.assertEqual(run["bytes"], 16)
+        self.assertEqual([s["part"] for s in run["samples"]], [0])
+        self.assertEqual(seen["ranges"], [(0, 15)])  # explicit kwarg beats the patched module default
+
+    def test_default_part_size_is_64_mib_and_module_constant_matches(self):
+        self.assertEqual(transfer.PART_SIZE, 64 * transfer.MIB)
+        self.assertEqual(Options().part_size, 64)
+        self.assertEqual(Options(part_size=8).part_size, 8)
+
+    def test_part_size_flag_reaches_transfer_windows_both_directions(self):
+        records = self.reports()
+        self.assertTrue(all(c["part_size"] == 64 * transfer.MIB for c in self.calls))
+        self.client.deleted.clear()
+        self.options = Options(providers=("s3",), buckets={"s3": "bench-test"}, duration=1, part_size=16)
+        self.reports()
+        download.download_reports("s3", self.options, client_factory=lambda *a, **k: self.client, window=self.fake_window)
+        self.assertTrue(all(c["part_size"] == 16 * transfer.MIB for c in self.calls))
+        self.assertEqual([c["direction"] for c in self.calls], ["up", "up", "down", "down"])
+
+    def test_part_size_cli_type_bounds(self):
+        for value in (8, 64, 512):
+            self.assertEqual(part_size_mib(str(value)), value)
+        for value in ("7", "513", "0", "-8", "x", "8.5"):
+            with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
+                part_size_mib(value)
+
 
     def test_buckets_idle_seconds_boundary_and_partial_tail(self):
         buckets = transfer.throughput_buckets([(0.1, transfer.MIB), (2., transfer.MIB)], 2.5)

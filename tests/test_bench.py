@@ -58,14 +58,15 @@ class BenchTests(unittest.TestCase):
                 "bench", "internet", "--providers", "gcs,s3", "--directions", "down",
                 "--profile", "certify", "--regions", "s3=us-east-1,gcs=us-central1",
                 "--buckets", "s3=bench-s3,gcs=bench-gcs",
-                "--concurrent", "8", "--duration", "2m", "--tool", "warp", "--keep-data", "--yes",
+                "--concurrent", "8", "--duration", "2m", "--object-size", "256",
+                "--part-size", "16", "--tool", "warp", "--keep-data", "--yes",
                 "--json", "export.json", "--run-dir", "artifacts", "--show-command", "--quiet",
             ]), 0)
         self.assertEqual(run.call_args.kwargs["options"], internet.Options(
             providers=("gcs", "s3"), directions=("down",), profile="certify",
             regions={"s3": "us-east-1", "gcs": "us-central1"},
             buckets={"s3": "bench-s3", "gcs": "bench-gcs"}, concurrent=8, duration=120,
-            tool="warp", keep_data=True, yes=True))
+            object_size=256, part_size=16, tool="warp", keep_data=True, yes=True))
         self.assertEqual(run.call_args.kwargs["json_target"], "export.json")
         self.assertEqual(run.call_args.kwargs["run_dir"], "artifacts")
         self.assertTrue(run.call_args.kwargs["show_command"])

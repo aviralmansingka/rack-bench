@@ -19,7 +19,11 @@ from .tcp import TCPWindow
 
 MIB = 1024 ** 2
 OBJECT_SIZE = 1024 * MIB
-PART_SIZE = 8 * MIB
+# Larger parts amortize per-request S3 server processing (TTFB ~110 ms is paid
+# once per part/range, not per byte). 64 MiB keeps a single part comfortably
+# inside the 30 s client socket timeout even at ~5 MiB/s single-stream rates;
+# do not raise the default past 128 MiB without re-checking that interaction.
+PART_SIZE = 64 * MIB
 LIGHT_SIZE = 32 * MIB
 ERRORS = (S3Error, ValueError, OSError)
 
@@ -84,13 +88,17 @@ def throughput_buckets(points, elapsed):
 
 def transfer_window(client, *, direction, prefix, concurrency, duration, objects,
                     owned, size=OBJECT_SIZE, one_object=False, loaded=None,
-                    clock=time.monotonic, tcp_factory=TCPWindow, host="", loaded_interval=1.0):
+                    clock=time.monotonic, tcp_factory=TCPWindow, host="", loaded_interval=1.0,
+                    part_size=None):
     """Schedule until deadline, drain the current part/range; report actual wall time.
 
     No object-sized buffers. Validate each measured part/range before accepting
     its progress. Any invalid operation makes this window ungradable, while byte
     lower bounds and completed object manifests remain available for diagnosis.
+    part_size=None means the module PART_SIZE; policies plumb the CLI value in.
     """
+    if part_size is None:
+        part_size = PART_SIZE  # resolved per call so tests can patch the default
     lock, stop, active = threading.Lock(), threading.Event(), threading.Event()
     samples, points, completed, errors, loaded_samples, loaded_errors = [], [], [], [], [], []
     attempted_bytes = 0
@@ -142,17 +150,17 @@ def transfer_window(client, *, direction, prefix, concurrency, duration, objects
                         owned.append(key)
                     _echo(f"multipart PUT {object_url(client, key)} ({payload.size} bytes)")
                     def on_part(response):
-                        accept(response, min(PART_SIZE, payload.size - part_number * PART_SIZE))
-                        if part_number * PART_SIZE < payload.size and (stop.is_set() or not one_object and clock() >= deadline):
+                        accept(response, min(part_size, payload.size - part_number * part_size))
+                        if part_number * part_size < payload.size and (stop.is_set() or not one_object and clock() >= deadline):
                             raise _WindowEnded("profile window ended; abort incomplete multipart")
-                    client.multipart_upload(key, payload, part_size=PART_SIZE, on_part=on_part, on_progress=progress)
+                    client.multipart_upload(key, payload, part_size=part_size, on_part=on_part, on_progress=progress)
                     obj = {"key": key, "payload": {"seed": payload.seed, "size": payload.size, "chunk_size": payload.chunk_size}}
                     with lock:
                         completed.append(obj)
                 else:
                     # One stream reads one uploaded object in bounded, verified ranges.
-                    for offset in range(0, payload.size, PART_SIZE):
-                        count = min(PART_SIZE, payload.size - offset)
+                    for offset in range(0, payload.size, part_size):
+                        count = min(part_size, payload.size - offset)
                         _echo(f"GET {object_url(client, key)} Range: bytes={offset}-{offset + count - 1}")
                         def consume(data, _offset):
                             progress(last + len(data), 0)

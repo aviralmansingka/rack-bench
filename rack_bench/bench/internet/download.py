@@ -5,7 +5,7 @@ reads only the options-local manifest and never manufactures a setup upload.
 from rack_bench.common.models import Check
 from .s3client import S3Client
 from .targets import reason, run_prefix
-from .transfer import ERRORS, plan, prerequisites, transfer_check, transfer_window
+from .transfer import ERRORS, MIB, plan, prerequisites, transfer_check, transfer_window
 
 
 def download_reports(provider, options, *, client_factory=S3Client, window=transfer_window):
@@ -35,6 +35,7 @@ def download_reports(provider, options, *, client_factory=S3Client, window=trans
                 run, _ = window(client, direction="down", prefix=run_prefix(options),
                                 concurrency=concurrency, duration=options.duration,
                                 objects=upload["objects"], owned=[], one_object=upload["band"] == "light",
+                                part_size=options.part_size * MIB,
                                 host=upload["host"] if provider == "r2" else f'{options.buckets[provider]}.{upload["host"]}')
                 run.update(kind=kind, run=index)
                 record["runs_detail"].append(run)
