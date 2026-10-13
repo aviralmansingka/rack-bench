@@ -17,13 +17,16 @@ def parse_ss(text, pid=None):
 
     ss omits retrans when zero; data_segs_out is mandatory. snd_wnd is the
     peer's advertised window; rcv_space is NOT an advertised receive window.
+    pid scopes ownership: an int, any iterable of ints (e.g. the benchmark
+    process plus worker-process pids), or None for no pid filter.
     """
     result, identity, owned = {}, None, False
+    wanted = None if pid is None else ({pid} if isinstance(pid, int) else {int(value) for value in pid})
     for line in text.splitlines():
         fields = line.split()
         if fields and fields[0] in {"ESTAB", "CLOSE-WAIT", "FIN-WAIT-1", "FIN-WAIT-2"}:
             identity = " ".join(fields[3:5]) if len(fields) >= 5 else None
-            owned = pid is None or f"pid={pid}," in line
+            owned = wanted is None or any(f"pid={candidate}," in line for candidate in wanted)
         elif identity and owned:
             segments = re.search(r"\bdata_segs_out:(\d+)", line)
             if not segments:
@@ -64,9 +67,13 @@ class TCPWindow:
 
     Only deltas between two sightings of an owned socket count. Short-lived
     sockets may escape polling; this is an observed subset, never host counters.
+    pids is an optional callable returning the pids whose sockets are owned
+    (the benchmark process plus any worker processes); by default only this
+    process's sockets are owned.
     """
-    def __init__(self, host, *, command=run_command, interval=0.2):
+    def __init__(self, host, *, command=run_command, interval=0.2, pids=None):
         self.host, self.command, self.interval = host, command, interval
+        self._pids = pids or (lambda: {os.getpid()})
         self.stop = threading.Event()
         self.snapshots, self.sources, self.errors = [], [], []
         self.thread = None
@@ -74,7 +81,7 @@ class TCPWindow:
     def sample(self):
         try:
             text = self.command(self.args, timeout=2)
-            self.snapshots.append(parse_ss(text, os.getpid()))
+            self.snapshots.append(parse_ss(text, self._pids()))
         except Unavailable as exc:
             self.errors.append(exc.detail)
             self.stop.set()
@@ -103,7 +110,7 @@ class TCPWindow:
             self.sample()
         self.detail = tcp_deltas(self.snapshots)
         self.detail.update(sources=self.sources, errors=self.errors,
-                           snapshot_count=len(self.snapshots),
+                           snapshot_count=len(self.snapshots), owned_pids=sorted(self._pids()),
                            coverage="deltas only for owned IPv4 endpoint sockets seen twice; short-lived sockets may be missed")
 
 

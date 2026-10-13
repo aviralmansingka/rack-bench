@@ -221,6 +221,14 @@ class _LRUCache:
             self._items.clear()
             self.total = 0
 
+    def resize(self, max_cost: int) -> None:
+        """Re-cap immediately: evict down to the new bound, keeping one entry."""
+        with self._lock:
+            self._max_cost = max_cost
+            while self.total > self._max_cost and len(self._items) > 1:
+                _, evicted = self._items.popitem(last=False)
+                self.total -= self._cost(evicted)
+
 
 # Data-path caches, shared process-wide across the transfer thread pool.
 # CHUNK_CACHE holds full payload chunks (<= 1 MiB each) and is capped at
@@ -242,6 +250,13 @@ def clear_payload_caches() -> None:
     """Empty the data-path caches (test seam; determinism makes this optional)."""
     _CHUNK_CACHE.clear()
     _DIGEST_CACHE.clear()
+
+
+def set_chunk_cache_limit(limit: int) -> None:
+    """Re-cap the chunk cache. Worker processes call this with a smaller cap:
+    a process-pool bulk window caches the same run-shared payload bytes once
+    per process, so N workers must not each hold the full parent-side cap."""
+    _CHUNK_CACHE.resize(limit)
 
 
 @dataclass(frozen=True)
@@ -552,7 +567,9 @@ class S3Client:
                     error.timing = timing
                 finally:
                     timing.elapsed_seconds = time.perf_counter() - start
-                    if not keep:
+                    if not keep or fresh_connection:
+                        # One-shot connections are closed as soon as their body is
+                        # consumed; they never enter the pool, so rely on nothing.
                         conn.close()
                         entry = getattr(self._connections, "entry", None)
                         if not fresh_connection and entry is not None and entry[3] is conn:

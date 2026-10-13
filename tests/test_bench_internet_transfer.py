@@ -6,22 +6,32 @@ Fixture provenance (captured on the development host, 2026-10-08):
   127.0.0.1`, SIZE=1472/65508, stdout + stderr (verbatim).
 Timeout, PID ownership and counter-delta mutations below are synthetic, not
 represented as captures. No capture command executes during these tests.
+
+The process-pool tests are the exception: they drive the real worker-process
+path against a loopback HTTP server, with the real monotonic clock. No cloud
+data and no capture commands there either.
 """
 import argparse
+import base64
 from contextlib import redirect_stdout
 from copy import deepcopy
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import StringIO
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import tempfile
 import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
+import zlib
 
 from rack_bench.bench import internet, runner
 from rack_bench.bench.internet import download, s3client as s3, targets, tcp, transfer, upload
+from rack_bench.bench.internet.latency import OBJECT_SIZE as LATENCY_SIZE
 from rack_bench.bench.internet.cli import Options, before_run, part_size_mib
 from rack_bench.bench.internet.s3client import S3Client, Timing, TransportError
 from rack_bench.common.models import Check
@@ -51,8 +61,9 @@ class Clock:
 
 
 class FakeTCP:
-    def __init__(self, host):
+    def __init__(self, host, pids=None):
         self.host = host
+        self.pids = pids  # bulk windows pass a parent+worker-process provider
         self.detail = {"segments": 1000, "retransmits": 2, "ratio_pct": .2,
                        "observations": [{"window_bytes": 1024 * 1024, "rtt_ms": 10}],
                        "sources": ["ss -4tinpH ( dst 192.0.2.1 )"], "errors": []}
@@ -119,7 +130,8 @@ class TransferTests(unittest.TestCase):
         with patch.object(transfer, "PART_SIZE", 8):
             return transfer.transfer_window(self.client, direction="up", prefix="rack-bench/test/", concurrency=2,
                                           duration=.1, objects=[], owned=[], size=16, one_object=True,
-                                          clock=self.clock, tcp_factory=FakeTCP, **kwargs)
+                                          clock=self.clock, tcp_factory=FakeTCP,
+                                          pool_factory=transfer._thread_pool_factory, **kwargs)
 
     def test_parallel_multipart_samples_buckets_and_completion_not_counted(self):
         run, objects = self.window()
@@ -526,6 +538,180 @@ class TransferTests(unittest.TestCase):
             self.assertIn("upload=100.00 MiB/s", Path(tmp, "bench.out").read_text())
 
 
+class WorkerProcessS3(BaseHTTPRequestHandler):
+    """Loopback S3 for the real worker-process path: multipart PUT, range GET,
+    abort DELETE, and a loadable failure hook. Serves seeded bytes only."""
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass
+
+    def _drain(self):
+        remaining = int(self.headers.get("Content-Length", "0"))
+        data = bytearray()
+        while remaining:
+            block = self.rfile.read(min(1 << 16, remaining))
+            if not block:
+                break
+            data.extend(block)
+            remaining -= len(block)
+        return bytes(data)
+
+    def _reply(self, status=200, body=b"", headers=None):
+        self.send_response(status)
+        self.send_header("Content-Length", str(len(body)))
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _record(self):
+        self.server.state.setdefault("requests", []).append((self.command, self.path))
+
+    def do_POST(self):
+        self._record()
+        self._drain()
+        if "uploads" in self.path:
+            self._reply(body=b"<InitiateMultipartUploadResult><UploadId>proc-1</UploadId></InitiateMultipartUploadResult>")
+        else:
+            self._reply(body=b"<CompleteMultipartUploadResult><ETag>done</ETag></CompleteMultipartUploadResult>")
+
+    def do_PUT(self):
+        self._record()
+        body = self._drain()
+        if self.server.state.get("fail_prefix") and self.server.state["fail_prefix"] in self.path:
+            self._reply(503, b"<Error><Code>SlowDown</Code></Error>")
+            return
+        crc = base64.b64encode(zlib.crc32(body).to_bytes(4, "big")).decode()
+        self._reply(headers={"ETag": '"part"', "x-amz-checksum-crc32": crc})
+
+    def do_GET(self):
+        self._record()
+        spec = self.headers.get("Range")
+        if spec:  # verified range GETs from worker processes
+            payload = self.server.state["payload"]
+            start, end = map(int, spec.removeprefix("bytes=").split("-"))
+            self._reply(206, b"".join(payload.iter_chunks(start, end - start + 1)),
+                        {"Content-Range": f"bytes {start}-{end}/{payload.size}"})
+        else:  # parent-side loaded-latency probe: one cold full-object GET
+            payload = self.server.state["loaded_payload"]
+            self._reply(200, b"".join(payload.iter_chunks()))
+
+    def do_DELETE(self):
+        self._record()
+        self._drain()
+        self._reply(204)
+
+
+class ProcessPoolTransferTests(unittest.TestCase):
+    """The real process-pool path: worker processes build their own S3Client
+    from plain config, validate parts in-process, and return picklable results
+    the parent merges. The loaded-latency probe stays parent-side. FakeTCP
+    stands in for ss diagnostics; the clock is the real monotonic clock."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), WorkerProcessS3)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join()
+
+    def setUp(self):
+        env = patch.dict(os.environ, {"AWS_ACCESS_KEY_ID": "fake", "AWS_SECRET_ACCESS_KEY": "fake", "R2_ACCOUNT_ID": "fake"}, clear=True)
+        env.start()
+        self.addCleanup(env.stop)
+        self.addCleanup(s3.clear_payload_caches)
+        self.addCleanup(lambda: s3.set_chunk_cache_limit(s3.CHUNK_CACHE_LIMIT))
+        self.addCleanup(transfer._POOL_STATE.clear)
+        self.endpoint = s3.Endpoint("127.0.0.1", "auto", True, self.server.server_port, False)
+        self.client = S3Client("bucket", "auto", timeout=10, backoff=0, endpoint=self.endpoint)
+        self.addCleanup(self.client.close)
+        self.size, self.part = 16 * transfer.MIB, 8 * transfer.MIB
+
+    def test_upload_worker_processes_build_clients_validate_and_merge(self):
+        loaded = {"key": "proc/loaded.bin", "payload": s3.SeededPayload("proc-seed", LATENCY_SIZE)}
+        self.server.state = {"payload": s3.SeededPayload("proc-seed", self.size),
+                             "loaded_payload": s3.SeededPayload("proc-seed", LATENCY_SIZE),
+                             "requests": []}
+        owned = []
+        run, objects = transfer.transfer_window(self.client, direction="up", prefix="proc/", concurrency=2,
+                                                 duration=.05, objects=[], owned=owned, size=self.size,
+                                                 one_object=True, part_size=self.part, seed="proc-seed",
+                                                 loaded=loaded, loaded_interval=.05,
+                                                 tcp_factory=FakeTCP, host="127.0.0.1")
+        self.assertEqual(run["status"], "pass")
+        self.assertEqual(run["bytes"], 2 * self.size)
+        self.assertEqual(run["objects"], 2)
+        self.assertEqual([sample["part"] for sample in run["samples"]], [0, 1, 0, 1])  # two parts per process
+        self.assertEqual([obj["key"] for obj in objects], ["proc/0-0.bin", "proc/1-0.bin"])
+        self.assertEqual(owned, ["proc/0-0.bin", "proc/1-0.bin"])  # ambiguous PUTs stay cleanable
+        self.assertEqual(run["progress_bytes_lower_bound"], 2 * self.size)
+        self.assertEqual(run["errors"], [])
+        self.assertTrue(all(obj["payload"]["seed"] == "proc-seed" for obj in objects))
+        # Loaded-latency stays a parent-side probe with fresh-connection semantics.
+        self.assertTrue(run["loaded_samples"])
+        self.assertTrue(all(0 <= sample["at_seconds"] <= run["elapsed_seconds"] for sample in run["loaded_samples"]))
+        self.assertGreaterEqual(run["loaded_bytes"], LATENCY_SIZE)
+
+    def test_download_worker_processes_stream_verified_ranges(self):
+        self.server.state = {"payload": s3.SeededPayload("proc-seed", self.size), "requests": []}
+        objects = [{"key": f"proc/{index}-0.bin",
+                    "payload": {"seed": "proc-seed", "size": self.size, "chunk_size": 1024 * 1024}}
+                   for index in range(2)]
+        run, completed = transfer.transfer_window(self.client, direction="down", prefix="unused/", concurrency=2,
+                                                   duration=.05, objects=objects, owned=[], one_object=True,
+                                                   part_size=self.part, tcp_factory=FakeTCP, host="127.0.0.1")
+        self.assertEqual(run["status"], "pass")
+        self.assertEqual(run["bytes"], 2 * self.size)
+        self.assertEqual([obj["key"] for obj in completed], ["proc/0-0.bin", "proc/1-0.bin"])
+        self.assertEqual(len(run["samples"]), 4)
+        self.assertEqual(run["errors"], [])
+
+    def test_worker_error_sets_cross_process_stop_and_siblings_drain_out(self):
+        self.server.state = {"payload": s3.SeededPayload("proc-seed", self.size),
+                             "fail_prefix": "0-0", "requests": []}
+        owned = []
+        run, _ = transfer.transfer_window(self.client, direction="up", prefix="proc/", concurrency=2,
+                                           duration=10, objects=[], owned=owned, size=self.size,
+                                           part_size=self.part, seed="proc-seed",
+                                           tcp_factory=FakeTCP, host="127.0.0.1")
+        self.assertEqual(run["status"], "skip")
+        self.assertEqual(run["errors"][0]["type"], "ServiceError")
+        self.assertIn("proc/0-0.bin", owned)
+        # The multiprocessing stop event reaches sibling processes: no worker
+        # streams for the full scheduled window after the first failure.
+        self.assertLess(run["elapsed_seconds"], 10)
+        self.assertTrue(any(method == "DELETE" and "uploadId" in path
+                            for method, path in self.server.state["requests"]))  # aborted upload IDs
+
+    def test_pool_initialiser_state_and_picklable_worker_task(self):
+        import pickle
+        slots = multiprocessing.Array("i", 2)
+        stop = multiprocessing.Event()
+        transfer._pool_initialiser(("bucket", self.endpoint, 10, 2, 0), stop, slots,
+                                   2 * 1024 * 1024, None)
+        self.assertIsInstance(transfer._POOL_STATE["client"], S3Client)
+        self.assertIs(transfer._POOL_STATE["stop"], stop)
+        self.assertIn(os.getpid(), list(slots))
+        s3.clear_payload_caches()
+        payload = s3.SeededPayload("cap-seed", 6 * 1024 * 1024)
+        for chunk_index in range(3):
+            payload.chunk(chunk_index)
+        self.assertEqual(s3._CHUNK_CACHE.total, 2 * 1024 * 1024)  # re-capped per process
+        self.assertIs(pickle.loads(pickle.dumps(transfer._transfer_worker)), transfer._transfer_worker)
+        task = {"direction": "up", "prefix": "p/", "index": 3, "objects": [], "size": 8,
+                "one_object": True, "deadline": 1.5, "start": .5, "part_size": 8, "seed": None,
+                "clock": time.monotonic, "client": None, "stop": None, "active": None}
+        self.assertEqual(pickle.loads(pickle.dumps(task)), task)  # the process-mode task payload
+
+
 class TCPTests(unittest.TestCase):
     def test_ss_captured_positive_negative_and_process_filter(self):
         text = (FIXTURES / "internet-ss.txt").read_text()
@@ -555,6 +741,28 @@ class TCPTests(unittest.TestCase):
         self.assertEqual(tcp.parse_ping((FIXTURES / "internet-ping-mtu.txt").read_text()), "too_large")
         self.assertEqual(tcp.parse_ping("2 packets transmitted, 0 received, 100% packet loss, time 1001ms"), "timeout")
         self.assertEqual(tcp.parse_ping("ping: socket: Operation not permitted"), "unavailable")
+
+    def test_ss_pid_iterable_scopes_parent_and_worker_processes(self):
+        text = (FIXTURES / "internet-ss.txt").read_text()
+        tagged = text.replace("127.0.0.1:35823", '127.0.0.1:35823 users:(("python",pid=123,fd=4))') \
+                     .replace("127.0.0.1:59364", '127.0.0.1:59364 users:(("python",pid=456,fd=5))')
+        self.assertEqual(len(tcp.parse_ss(tagged, {123, 456})), 2)  # parent + worker pids
+        self.assertEqual(len(tcp.parse_ss(tagged, (456,))), 1)  # any int iterable
+        self.assertEqual(tcp.parse_ss(tagged, {9999}), {})
+
+    def test_tcp_window_pid_provider_covers_worker_processes(self):
+        text = (FIXTURES / "internet-ss.txt").read_text()
+        both = text.replace("127.0.0.1:35823", '127.0.0.1:35823 users:(("python",pid=123,fd=4))') \
+                   .replace("127.0.0.1:59364", '127.0.0.1:59364 users:(("python",pid=456,fd=5))')
+        grown = both.replace("data_segs_out:126952", "data_segs_out:127952")
+        command = Mock(side_effect=[both, grown])
+        with patch.object(tcp.socket, "getaddrinfo", return_value=[(2, 1, 6, "", ("192.0.2.1", 443))]):
+            with tcp.TCPWindow("example.invalid", command=command, interval=1000, pids=lambda: {123, 456}) as window:
+                self.assertEqual(command.call_count, 1)
+        self.assertEqual(command.call_count, 2)
+        self.assertEqual(window.detail["segments"], 1000)
+        self.assertEqual(window.detail["ratio_pct"], 0)
+        self.assertEqual(window.detail["owned_pids"], [123, 456])
 
     def test_pmtud_clean_blackhole_and_all_filtered_are_not_warn(self):
         options = Options(providers=("s3",))
