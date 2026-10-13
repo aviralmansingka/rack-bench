@@ -8,6 +8,7 @@ in errors. Payload preparation (hashing) is outside request timing.
 from __future__ import annotations
 
 import base64
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -182,6 +183,67 @@ class ProtocolError(S3Error):
     """A success response had missing/invalid metadata or incomplete content."""
 
 
+class _LRUCache:
+    """Thread-safe LRU bounded by total value cost (bytes or entries).
+
+    Cached values are deterministic functions of their keys, so two workers
+    racing to generate the same entry produce identical bytes and the second
+    put is a no-op; the lock is held only for dict moves, never generation.
+    """
+
+    def __init__(self, max_cost: int, cost: Callable[[object], int]):
+        self._items: OrderedDict = OrderedDict()
+        self._lock = threading.Lock()
+        self._cost = cost
+        self._max_cost = max_cost
+        self.total = 0
+
+    def get(self, key):
+        with self._lock:
+            value = self._items.get(key)
+            if value is None:
+                return None
+            self._items.move_to_end(key)
+            return value
+
+    def put(self, key, value) -> None:
+        with self._lock:
+            if key in self._items:
+                return
+            self._items[key] = value
+            self.total += self._cost(value)
+            while self.total > self._max_cost and len(self._items) > 1:
+                _, evicted = self._items.popitem(last=False)
+                self.total -= self._cost(evicted)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._items.clear()
+            self.total = 0
+
+
+# Data-path caches, shared process-wide across the transfer thread pool.
+# CHUNK_CACHE holds full payload chunks (<= 1 MiB each) and is capped at
+# 256 MiB of chunk bytes: 64 MiB parts at a 1 MiB chunk granularity touch
+# only 64 distinct chunks, so one 1 GiB-object run stays far inside the cap,
+# and the cap is the hard memory bound however large the objects are.
+# DIGEST_CACHE holds one (sha256 hex, crc32 base64) pair per distinct
+# (seed, chunk_size, offset, size) part and is capped by entry count; each
+# entry is well under 200 bytes, so 4096 entries stay near 1 MiB.
+CHUNK_CACHE_LIMIT = 256 * 1024 * 1024
+DIGEST_CACHE_LIMIT = 4096
+READ_BLOCK = 1024 * 1024        # measured transfer bodies: one callback per MiB
+CONTROL_READ_BLOCK = 64 * 1024  # control/error bodies stay under the 4 MiB cap
+_CHUNK_CACHE = _LRUCache(CHUNK_CACHE_LIMIT, len)
+_DIGEST_CACHE = _LRUCache(DIGEST_CACHE_LIMIT, lambda value: 1)
+
+
+def clear_payload_caches() -> None:
+    """Empty the data-path caches (test seam; determinism makes this optional)."""
+    _CHUNK_CACHE.clear()
+    _DIGEST_CACHE.clear()
+
+
 @dataclass(frozen=True)
 class SeededPayload:
     """Seekable, bounded pseudorandom source (no object-sized allocation).
@@ -190,11 +252,14 @@ class SeededPayload:
     is reproducible; iter_chunks(offset, size) supports arbitrary byte ranges.
     verify(data, offset) raises VerificationError on a regen/compare mismatch.
     SHAKE256 output is cryptographically pseudorandom, not compressible filler.
+    Default 1 MiB chunks cut generator iterations 16x versus 64 KiB and match
+    the socket read/send block size; chunks are served from a bounded LRU
+    (CHUNK_CACHE_LIMIT), so repeated generation after warm-up is ~free.
     """
 
     seed: str
     size: int
-    chunk_size: int = 64 * 1024
+    chunk_size: int = 1024 * 1024
 
     def __post_init__(self):
         if self.size < 0 or not 1 <= self.chunk_size <= 1024 * 1024:
@@ -204,9 +269,14 @@ class SeededPayload:
         size = self.chunk_size if size is None else size
         if chunk_index < 0 or not 0 <= size <= self.chunk_size:
             raise ValueError("invalid chunk index or size")
-        seed = self.seed.encode("utf-8")
-        domain = b"rack-bench-v1\0" + len(seed).to_bytes(8, "big") + seed
-        return hashlib.shake_256(domain + chunk_index.to_bytes(8, "big")).digest(size)
+        key = (self.seed, self.chunk_size, chunk_index)
+        data = _CHUNK_CACHE.get(key)
+        if data is None:
+            seed = self.seed.encode("utf-8")
+            domain = b"rack-bench-v1\0" + len(seed).to_bytes(8, "big") + seed
+            data = hashlib.shake_256(domain + chunk_index.to_bytes(8, "big")).digest(self.chunk_size)
+            _CHUNK_CACHE.put(key, data)
+        return data if len(data) == size else data[:size]
 
     def iter_chunks(self, offset: int = 0, size: int | None = None) -> Iterable[bytes]:
         size = self.size - offset if size is None else size
@@ -241,6 +311,24 @@ def checksum_headers(chunks: Iterable[bytes]) -> dict[str, str]:
         crc = zlib.crc32(chunk, crc)
     return {"x-amz-content-sha256": sha.hexdigest(),
             "x-amz-checksum-crc32": base64.b64encode(crc.to_bytes(4, "big")).decode()}
+
+
+def part_checksum_headers(payload: SeededPayload, offset: int, size: int) -> dict[str, str]:
+    """Signed digests (SHA256+CRC32) for one payload part, via a bounded LRU.
+
+    Both digests are signed headers, so a pre-pass over the part body is
+    protocol-required; caching it keyed (seed, chunk_size, offset, size) makes
+    the pre-pass a hit whenever the same part shape repeats. A run-shared
+    payload seed makes the part at any given offset byte-identical across all
+    sibling objects, so after the first object the pre-pass is ~free.
+    """
+    key = (payload.seed, payload.chunk_size, offset, size)
+    cached = _DIGEST_CACHE.get(key)
+    if cached is None:
+        headers = checksum_headers(payload.iter_chunks(offset, size))
+        cached = (headers["x-amz-content-sha256"], headers["x-amz-checksum-crc32"])
+        _DIGEST_CACHE.put(key, cached)
+    return {"x-amz-content-sha256": cached[0], "x-amz-checksum-crc32": cached[1]}
 
 
 @dataclass(frozen=True)
@@ -419,6 +507,10 @@ class S3Client:
                     collect = consume is None or not 200 <= response.status < 300
                     collected = bytearray()
                     # read(1) exposes body TTFB, unlike a blocking full-chunk read.
+                    # Measured transfer bodies then read in 1 MiB blocks (one
+                    # Python callback per MiB, matching the payload chunk size);
+                    # control/error bodies keep small reads under the 4 MiB cap.
+                    read_size = CONTROL_READ_BLOCK if collect else READ_BLOCK
                     block = response.read(1)
                     if block:
                         timing.first_byte_seconds = time.perf_counter() - start
@@ -431,7 +523,7 @@ class S3Client:
                             collected.extend(block)
                         else:
                             consume(block, offset)
-                        block = response.read(64 * 1024)
+                        block = response.read(read_size)
                     result.body = bytes(collected)
                     content_length = result.headers.get("content-length")
                     if method != "HEAD" and content_length is not None:
@@ -505,7 +597,7 @@ class S3Client:
     def _upload(self, key: str, payload: SeededPayload, offset: int, size: int,
                 query=(), on_progress=None) -> Response:
         body = lambda: payload.iter_chunks(offset, size)
-        headers = checksum_headers(body())
+        headers = part_checksum_headers(payload, offset, size)
         result = self._request("PUT", key, query=query, headers=headers,
                                body=body, size=size, measurement=True, on_progress=on_progress)
         result.upload_crc32 = headers["x-amz-checksum-crc32"]
