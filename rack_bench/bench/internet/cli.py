@@ -128,7 +128,7 @@ def options_from_args(args):
 
 def before_run(options):
     # Options may be reused by library callers; measurements/prefixes are run-local.
-    for cache in ("_path_reports", "_internet_prefix", "_transfer_reports", "_transfer_owners", "_internet_checks"):
+    for cache in ("_path_reports", "_internet_prefix", "_internet_seed", "_transfer_reports", "_transfer_owners", "_internet_checks"):
         options.__dict__.pop(cache, None)
     if options.profile == "certify":
         show_cost_estimate(cost_estimate(options))

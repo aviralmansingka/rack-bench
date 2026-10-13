@@ -21,7 +21,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from rack_bench.bench import internet, runner
-from rack_bench.bench.internet import download, tcp, transfer, upload
+from rack_bench.bench.internet import download, s3client as s3, targets, tcp, transfer, upload
 from rack_bench.bench.internet.cli import Options, before_run, part_size_mib
 from rack_bench.bench.internet.s3client import S3Client, Timing, TransportError
 from rack_bench.common.models import Check
@@ -364,6 +364,29 @@ class TransferTests(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual([c["concurrency"] for c in self.calls], [8, 8, 8, 1, 1, 1])
 
+    def test_run_shared_seed_records_reproduce_bytes_and_share_digests(self):
+        # A run-shared seed keeps keys unique while every object derives the
+        # same bytes per offset: stored per-object records reproduce the exact
+        # uploaded bytes and sibling parts hit the digest cache.
+        uploads = {}
+        original = self.client.multipart_upload
+        def recording(key, payload, part_size, on_part, on_progress):
+            uploads[key] = payload
+            return original(key, payload, part_size, on_part, on_progress)
+        self.client.multipart_upload = recording
+        run, objects = self.window(seed="run-token")
+        self.assertEqual(run["status"], "pass")
+        self.assertEqual(len(objects), 2)
+        self.assertEqual(len(uploads), 2)  # keys stay unique; only the seed is shared
+        for obj in objects:
+            self.assertEqual(obj["payload"]["seed"], "run-token")
+            self.assertEqual(obj["payload"]["chunk_size"], 1024 * 1024)
+            record = transfer.SeededPayload(**obj["payload"])
+            record.verify(b"".join(uploads[obj["key"]].iter_chunks()))
+        one, two = list(uploads.values())
+        self.assertEqual(s3.part_checksum_headers(one, 0, 8),
+                         s3.part_checksum_headers(two, 0, 8))
+
     def test_three_run_reduction_drops_best_worst_and_rejects_failures(self):
         runs = [{"status": "pass", "mib_per_sec": n} for n in (10, 100, 20)]
         self.assertEqual(transfer.reduce_runs(runs)["mib_per_sec"], 20)
@@ -482,8 +505,9 @@ class TransferTests(unittest.TestCase):
     def test_new_collection_resets_all_state(self):
         self.reports()
         self.baseline()
+        self.assertEqual(targets.run_seed(self.options), targets.run_seed(self.options))
         before_run(self.options)
-        for key in ("_internet_prefix", "_transfer_reports", "_transfer_owners", "_internet_checks"):
+        for key in ("_internet_prefix", "_internet_seed", "_transfer_reports", "_transfer_owners", "_internet_checks"):
             self.assertNotIn(key, vars(self.options))
 
     def test_summary_artifacts_json_and_human_rendering(self):

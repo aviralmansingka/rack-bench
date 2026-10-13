@@ -89,13 +89,17 @@ def throughput_buckets(points, elapsed):
 def transfer_window(client, *, direction, prefix, concurrency, duration, objects,
                     owned, size=OBJECT_SIZE, one_object=False, loaded=None,
                     clock=time.monotonic, tcp_factory=TCPWindow, host="", loaded_interval=1.0,
-                    part_size=None):
+                    part_size=None, seed=None):
     """Schedule until deadline, drain the current part/range; report actual wall time.
 
     No object-sized buffers. Validate each measured part/range before accepting
     its progress. Any invalid operation makes this window ungradable, while byte
     lower bounds and completed object manifests remain available for diagnosis.
     part_size=None means the module PART_SIZE; policies plumb the CLI value in.
+    seed is the run-shared payload seed (targets.run_seed): every upload object
+    in the run derives identical bytes per offset, so the bounded chunk/digest
+    caches in s3client turn the signed-digest pre-pass and chunk regeneration
+    into hits. seed=None falls back to the object key, matching stored records.
     """
     if part_size is None:
         part_size = PART_SIZE  # resolved per call so tests can patch the default
@@ -112,7 +116,7 @@ def transfer_window(client, *, direction, prefix, concurrency, duration, objects
         iteration = 0
         while not stop.is_set() and (iteration == 0 or clock() < deadline):
             key = f"{prefix}{index}-{iteration}.bin" if direction == "up" else objects[index % len(objects)]["key"]
-            payload = SeededPayload(key, size) if direction == "up" else SeededPayload(**objects[index % len(objects)]["payload"])
+            payload = SeededPayload(seed if seed is not None else key, size) if direction == "up" else SeededPayload(**objects[index % len(objects)]["payload"])
             pending, last, part_number = {}, 0, 0
             cpu_start = time.thread_time()
 

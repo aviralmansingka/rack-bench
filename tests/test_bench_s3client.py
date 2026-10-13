@@ -128,6 +128,59 @@ class PayloadTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             s3.SeededPayload("x", 1, 0)
 
+    def test_default_one_mib_chunks_and_cache_roundtrip(self):
+        # Default chunk granularity is 1 MiB: 16x fewer generator iterations
+        # per GiB than 64 KiB, matching the transport read/send block size.
+        self.assertEqual(s3.SeededPayload("d", 10).chunk_size, 1024 * 1024)
+        s3.clear_payload_caches()
+        source = s3.SeededPayload("cache-check", 3 * 1024**2 + 7)
+        seed = source.seed.encode("utf-8")
+        domain = b"rack-bench-v1\0" + len(seed).to_bytes(8, "big") + seed
+        fresh = hashlib.shake_256(domain + (2).to_bytes(8, "big")).digest(1024 * 1024)
+        self.assertEqual(source.chunk(2), fresh)          # populates the LRU
+        self.assertEqual(source.chunk(2), fresh)          # served from the LRU
+        self.assertEqual(source.chunk(2, 12345), fresh[:12345])  # cached slices stay exact
+        data = b"".join(source.iter_chunks(1000, 2 * 1024**2))  # spans 1 MiB boundaries
+        source.verify(data, 1000)
+
+    def test_lru_cache_bounds_total_cost_and_evicts_oldest(self):
+        cache = s3._LRUCache(10, len)
+        cache.put("a", b"12345")
+        cache.put("b", b"12345")
+        self.assertEqual(cache.get("a"), b"12345")  # a becomes most recent
+        cache.put("c", b"12345")                     # evicts b, not a
+        self.assertIsNone(cache.get("b"))
+        self.assertEqual(cache.get("a"), b"12345")
+        self.assertEqual(cache.get("c"), b"12345")
+        self.assertEqual(cache.total, 10)
+        cache.put("same", b"12345")                  # existing key: no double cost
+        self.assertEqual(cache.total, 10)
+        cache.put("oversized", b"1" * 12)            # one value over the cap stays
+        self.assertEqual(cache.get("oversized"), b"1" * 12)
+        self.assertIsNone(cache.get("a"))
+        cache.clear()
+        self.assertEqual(cache.total, 0)
+        self.assertIsNone(cache.get("oversized"))
+
+    def test_shared_seed_parts_share_digests_across_objects(self):
+        # One run-wide seed: sibling objects derive identical bytes per offset,
+        # so the protocol-required signed-digest pre-pass is computed once and
+        # replayed from the bounded LRU for every later object.
+        s3.clear_payload_caches()
+        one = s3.SeededPayload("run-token", 2 * 1024**2)
+        two = s3.SeededPayload("run-token", 2 * 1024**2)  # different key, same run seed
+        other = s3.SeededPayload("different-seed", 2 * 1024**2)
+        part = 1024 * 1024
+        expected = s3.checksum_headers(one.iter_chunks(0, part))
+        self.assertEqual(s3.part_checksum_headers(one, 0, part), expected)
+        self.assertEqual(s3.part_checksum_headers(two, 0, part), expected)
+        self.assertEqual(s3.part_checksum_headers(two, part, part),
+                         s3.checksum_headers(two.iter_chunks(part, part)))
+        self.assertNotEqual(s3.part_checksum_headers(other, 0, part), expected)
+        cached = s3.part_checksum_headers(one, part, part)
+        s3.clear_payload_caches()
+        self.assertEqual(cached, s3.part_checksum_headers(one, part, part))  # cache == fresh
+
     def test_checksum_headers_known_crc32_sha256(self):
         headers = s3.checksum_headers((b"123", b"456789"))
         self.assertEqual(headers["x-amz-checksum-crc32"], "y/Q5Jg==")
@@ -320,7 +373,9 @@ class TransportTests(unittest.TestCase):
 
     def test_put_shapes_auth_and_checksums(self):
         progress = []
-        response = self.client.put_object("a//../% +/ሴ", s3.SeededPayload("put", 200000),
+        # Explicit 64 KiB chunks keep this asserting one callback per bounded
+        # socket send; the default is now 1 MiB (see the chunk-size test below).
+        response = self.client.put_object("a//../% +/ሴ", s3.SeededPayload("put", 200000, chunk_size=64 * 1024),
                                           on_progress=lambda count, seconds: progress.append((count, seconds)))
         self.assertEqual([count for count, _ in progress], [65536, 131072, 196608, 200000])
         self.assertTrue(all(seconds >= 0 for _, seconds in progress))
@@ -432,12 +487,38 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(response.status, 206)
         self.assertEqual(response.body, b"")
         self.assertEqual(chunks[0][1], 65000)
-        self.assertTrue(all(len(data) <= 65536 for data, _ in chunks))
+        # read(1) exposes body TTFB; the remaining body arrives in 1 MiB blocks.
+        self.assertTrue(all(len(data) <= s3.READ_BLOCK for data, _ in chunks))
+        self.assertEqual(len(chunks[-1][0]), 75000)
         self.assertEqual(b"".join(data for data, _ in chunks),
                          b"".join(self.state["payload"].iter_chunks(65000, 75001)))
         self.assertEqual(response.timing.bytes_received, 75001)
         self.assertLessEqual(response.timing.headers_seconds, response.timing.first_byte_seconds)
         self.assertLessEqual(response.timing.first_byte_seconds, response.timing.elapsed_seconds)
+
+    def test_same_seed_uploads_sign_identical_part_digests(self):
+        # Different object keys, one run seed: signed digests (and therefore
+        # the cacheable pre-pass) are identical across sibling objects.
+        seed = "run-token"
+        self.client.put_object("object-a", s3.SeededPayload(seed, 200000))
+        self.client.put_object("object-b", s3.SeededPayload(seed, 200000))
+        first, second = self.state["requests"]
+        self.assertNotEqual(first["path"], second["path"])
+        self.assertEqual(first["headers"]["x-amz-content-sha256"],
+                         second["headers"]["x-amz-content-sha256"])
+        self.assertEqual(first["headers"]["x-amz-checksum-crc32"],
+                         second["headers"]["x-amz-checksum-crc32"])
+
+    def test_measured_get_reads_body_in_one_mib_blocks(self):
+        # read(1) still exposes body TTFB; the rest of a measured body arrives
+        # in 1 MiB blocks, one Python callback per MiB (was 64 KiB).
+        self.state["payload"] = s3.SeededPayload("blocks", int(2.5 * 1024 * 1024))
+        sizes = []
+        self.client.get_object("key", payload=self.state["payload"],
+                               consume=lambda data, offset: sizes.append(len(data)))
+        self.assertEqual(sizes[0], 1)
+        self.assertEqual(sizes[1:-1], [s3.READ_BLOCK] * 2)
+        self.assertEqual(sum(sizes), self.state["payload"].size)
 
     def test_full_get_and_download_corruption(self):
         result = self.client.get_object("key", payload=self.state["payload"])
@@ -568,9 +649,12 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(self.state["counts"]["DELETE"], 0)
 
     def test_gib_source_upload_uses_bounded_reads_and_memory(self):
-        # Source is GB-scale; transfer a 32 MiB part near its end. Both hashing
-        # and socket send see <=64 KiB chunks, not a 32 MiB or 2 GiB allocation.
+        # Source is GB-scale; transfer a 32 MiB part near its end. Socket sends
+        # and server reads stay <= 1 MiB, and memory is bounded by the chunk
+        # cache cap (never the 2 GiB object): this part touches 32 distinct
+        # 1 MiB chunks, so the peak sits near the part size plus working set.
         source = s3.SeededPayload("gib", 2 * 1024**3)
+        s3.clear_payload_caches()
         tracemalloc.start()
         try:
             response = self.client.upload_part("large", "id", 1, source,
@@ -580,7 +664,8 @@ class TransportTests(unittest.TestCase):
             tracemalloc.stop()
         self.assertEqual(response.timing.bytes_sent, 32 * 1024**2)
         self.assertLessEqual(self.state["max_read"], 8192)
-        self.assertLess(peak, 4 * 1024**2)
+        self.assertLess(peak, 40 * 1024**2)
+        self.assertLessEqual(s3._CHUNK_CACHE.total, s3.CHUNK_CACHE_LIMIT)
 
 
 if __name__ == "__main__":

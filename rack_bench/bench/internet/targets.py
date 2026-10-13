@@ -36,3 +36,16 @@ def run_prefix(options):
     if not hasattr(options, "_internet_prefix"):
         options._internet_prefix = f"rack-bench/{uuid4().hex}/"
     return options._internet_prefix
+
+
+def run_seed(options):
+    """One payload seed per run, shared by every transfer object.
+
+    Keys stay unique per object; only the pseudorandom seed is shared, so the
+    chunk at any given offset is identical across sibling objects and their
+    part digests hit the data-path caches. Per-object records still persist
+    {seed, size, chunk_size}, so verification of any stored object is unchanged.
+    """
+    if not hasattr(options, "_internet_seed"):
+        options._internet_seed = uuid4().hex
+    return options._internet_seed

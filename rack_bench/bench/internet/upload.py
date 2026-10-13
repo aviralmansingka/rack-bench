@@ -9,7 +9,7 @@ from rack_bench.common.models import Check
 from .latency import OBJECT_SIZE as LATENCY_SIZE
 from .s3client import S3Client, SeededPayload
 from .stats import describe
-from .targets import reason, run_prefix
+from .targets import reason, run_prefix, run_seed
 from .transfer import (ERRORS, LIGHT_SIZE, MIB, OBJECT_SIZE, baseline, object_url, plan,
                        prerequisites, sample_timing, transfer_check, transfer_window)
 
@@ -38,7 +38,7 @@ def upload_reports(provider, options, *, client_factory=S3Client, window=transfe
             key = prefix + "loaded.bin"
             record["owned"].append(key)
             record["loaded_key"] = key
-            payload = SeededPayload(key, LATENCY_SIZE)
+            payload = SeededPayload(run_seed(options), LATENCY_SIZE)
             try:
                 _echo(f"PUT {object_url(client, key)} (loaded setup)")
                 response = client.put_object(key, payload)
@@ -61,7 +61,7 @@ def upload_reports(provider, options, *, client_factory=S3Client, window=transfe
             for index in range(runs):
                 run, objects = window(client, direction="up", prefix=f"{prefix}{kind}-{concurrency}-{index}/",
                                       concurrency=concurrency, duration=options.duration, objects=[], owned=record["owned"],
-                                      size=size, part_size=options.part_size * MIB,
+                                      size=size, part_size=options.part_size * MIB, seed=run_seed(options),
                                       one_object=target["band"] == "light", loaded=loaded if kind == "bulk" else None,
                                       host=target["host"] if provider == "r2" else f'{options.buckets[provider]}.{target["host"]}')
                 run.update(kind=kind, run=index)
