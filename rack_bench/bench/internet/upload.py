@@ -61,7 +61,7 @@ def upload_reports(provider, options, *, client_factory=S3Client, window=transfe
             for index in range(runs):
                 run, objects = window(client, direction="up", prefix=f"{prefix}{kind}-{concurrency}-{index}/",
                                       concurrency=concurrency, duration=options.duration, objects=[], owned=record["owned"],
-                                      size=size,
+                                      size=size, part_size=options.part_size * MIB,
                                       one_object=target["band"] == "light", loaded=loaded if kind == "bulk" else None,
                                       host=target["host"] if provider == "r2" else f'{options.buckets[provider]}.{target["host"]}')
                 run.update(kind=kind, run=index)
