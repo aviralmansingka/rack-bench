@@ -3,13 +3,19 @@ from uuid import uuid4
 
 from .s3client import Credentials, CredentialError, resolve_endpoint
 
+# Nearest-band defaults: AWS Mumbai, R2 apac placement hint, GCS bucket
+# location Mumbai (asia-south1) on the global interop endpoint.
+DEFAULT_REGIONS = {"s3": "ap-south-1", "r2": "apac", "gcs": "asia-south1"}
+
 
 def targets(provider, options):
     """Nearest band first; unsupported providers/bands remain explicit records."""
-    Credentials.from_env()  # Spec §6: even context probes require provider credentials.
-    if provider == "gcs":
-        raise ValueError("GCS interoperability not implemented")
-    nearest = options.regions.get(provider, "ap-south-1" if provider == "s3" else "apac")
+    # Spec §6: even context probes require provider credentials. s3/r2 read
+    # the AWS-named variables; gcs reads its interop HMAC variables.
+    Credentials.from_env(provider)
+    if provider not in DEFAULT_REGIONS:
+        raise ValueError(f"unsupported provider: {provider}")
+    nearest = options.regions.get(provider, DEFAULT_REGIONS[provider])
     regions = [nearest]
     if options.profile == "certify" and provider not in options.regions:
         regions += ["ap-southeast-1", "us-east-1"]
@@ -19,6 +25,9 @@ def targets(provider, options):
         reason = None
         if provider == "r2" and region not in {"apac", "auto"}:
             reason = "unsupported pinned R2 band: placement hint does not establish a regional path"
+        if provider == "gcs" and index > 0:
+            reason = ("unsupported far band: the global interop endpoint and one bucket location "
+                      "do not establish a distinct regional path")
         result.append({"region": region, "endpoint": f"https://{endpoint.host}",
                        "host": endpoint.host, "band": "nearest" if index == 0 else "light",
                        "runs": 3 if options.profile == "certify" and index == 0 else 1,

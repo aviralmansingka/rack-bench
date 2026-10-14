@@ -119,7 +119,8 @@ class FakeClient:
 
 class TransferTests(unittest.TestCase):
     def setUp(self):
-        env = patch.dict(os.environ, {"AWS_ACCESS_KEY_ID": "fake", "AWS_SECRET_ACCESS_KEY": "fake", "R2_ACCOUNT_ID": "fake"}, clear=True)
+        env = patch.dict(os.environ, {"AWS_ACCESS_KEY_ID": "fake", "AWS_SECRET_ACCESS_KEY": "fake", "R2_ACCOUNT_ID": "fake",
+                                      "GCS_ACCESS_KEY_ID": "fake", "GCS_SECRET_ACCESS_KEY": "fake"}, clear=True)
         env.start()
         self.addCleanup(env.stop)
         self.options = Options(providers=("s3",), buckets={"s3": "bench-test"}, duration=1)
@@ -287,6 +288,21 @@ class TransferTests(unittest.TestCase):
         for value in ("7", "513", "0", "-8", "x", "8.5"):
             with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
                 part_size_mib(value)
+
+    def test_gcs_windows_pin_the_location_and_use_the_global_host(self):
+        # The gcs provider path through the policy layer: records pin the
+        # bucket location, and every window's ss host is the bare global
+        # endpoint (path-style), never a bucket-prefixed virtual host.
+        self.options = Options(providers=("gcs",), buckets={"gcs": ("bench-gcs",)}, duration=1)
+        self.calls = []
+        records = upload.upload_reports("gcs", self.options, client_factory=lambda *a, **k: self.client,
+                                        window=self.fake_window)
+        download.download_reports("gcs", self.options, client_factory=lambda *a, **k: self.client,
+                                  window=self.fake_window)
+        self.assertTrue(self.calls)
+        self.assertTrue(all(call["host"] == "storage.googleapis.com" for call in self.calls))
+        self.assertEqual(records[0]["region"], "asia-south1")
+        self.assertEqual(records[0]["endpoint"], "https://storage.googleapis.com")
 
     def test_multi_bucket_round_robin_assignment_and_records(self):
         names = ("bench-a", "bench-b")
