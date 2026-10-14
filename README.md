@@ -376,10 +376,12 @@ remain unsupported and SKIP explicitly.
 
 **PASS means observed, not certified.** `expected` stays `null` until the
 certification profile schema exists. Only path RTT sanity can WARN; instability,
-asymmetry, loaded p95 inflation above 20 ms, BDP shortfalls, and retransmit
-findings are diagnostic detail. Missing credentials/tools/buckets, failed
-transfers, invalid timings, and checksum failures SKIP with reasons. A run
-containing SKIPs can exit 0; inspect the checks, not just the exit code.
+asymmetry, loaded p95 inflation above 20 ms, BDP shortfalls, retransmit
+findings, and the per-window ceiling verdicts (service-paced, receive-window
+limited, congestion or loss, send-buffer limited, flat ceiling with clean
+sockets, bursty) are diagnostic detail. Missing credentials/tools/buckets,
+failed transfers, invalid timings, and checksum failures SKIP with reasons. A
+run containing SKIPs can exit 0; inspect the checks, not just the exit code.
 
 #### Workload and ownership
 
@@ -389,7 +391,9 @@ concurrent small-object GETs
 for loaded TTFB. Downloads verify ranges from this run's completed uploads; they
 never use pre-seeded data. All upload windows, including a separate unloaded
 concurrency-1 test, finish before download windows start. TCP socket sampling
-brackets these windows; PMTUD uses stepped DF pings.
+brackets these windows — retransmit deltas plus per-socket
+busy/rwnd/cwnd/sndbuf-limited time shares for ceiling attribution; PMTUD uses
+stepped DF pings.
 
 Quick uses 32 streams for 60 seconds per sustained direction plus separate
 concurrency-1 windows. Certify uses 1/8/32/64 streams, five minutes per window,
@@ -427,8 +431,16 @@ baseline or upload windows SKIPs. TCP retransmits without observable transfer
 socket deltas SKIP. TCP detail describes sampling coverage: short-lived sockets
 can be missed, and local counters cannot measure the remote download sender's
 retransmits. BDP uses observed advertised window/RTT when available; `rcv_space`
-is not treated as an advertised receive window. The client opens a connection
-per request: concurrency 1 is sequential requests, not one persistent TCP flow.
+is not treated as an advertised receive window. Every throughput window also
+records p50/p95/p99 of its 1 s buckets with a steadiness ratio (p50/p95),
+measured-op TTFB percentiles (GET body first byte; PUT status line), the
+post-TTFB per-request streaming rate, and the ss socket-limit aggregate, reduced
+to one ceiling verdict per window; `retransmit_pct` is a percent, so 1.0 means
+1%. Downloads send no data, so their sockets show no local send limit; a clean
+aggregate there leans on bucket shape and post-TTFB rate. Multi-bucket runs keep
+per-bucket sample evidence (bytes, MiB/s, TTFB, post-TTFB rate). The client
+opens a connection per request: concurrency 1 is sequential requests, not one
+persistent TCP flow.
 
 #### Options and artifacts
 
@@ -453,8 +465,9 @@ implemented categories, currently internet. Generic flags match audit:
 exits 2. `--json` prints the version-1 envelope; `--json FILE` exports it
 alongside human stdout. `--run-dir DIR` receives `bench.out` and
 `bench.values.json`. JSON-encoded detail retains all regions/runs, per-operation
-timings, per-second throughput buckets, byte accounting, diagnostic signals, and
-cleanup results. `--show-command` traces real operations; `--quiet` suppresses
+timings, per-second throughput buckets, byte accounting, TTFB percentiles,
+post-TTFB streaming rates, ss socket-limit shares, ceiling verdicts, per-bucket
+evidence, diagnostic signals, and cleanup results. `--show-command` traces real operations; `--quiet` suppresses
 traces and PASS rows, not SKIPs.
 
 **Transfers incur charges.** Certify always prints its reference estimate to

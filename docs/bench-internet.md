@@ -121,8 +121,9 @@ Run in this order; each is one or more `Check` entries per provider.
 5. **Sustained download (ingress)** — parallel range GETs reading back the
    uploaded objects. Downloads read uploads; no pre-seeded data.
 6. **Single-stream** — upload + download with concurrency=1.
-7. **TCP health** — `ss -ti` retransmit deltas wrapped around tests 4–5; PMTUD
-   probe (`ping -M do`, stepped sizes) to each endpoint.
+7. **TCP health** — `ss -ti` retransmit deltas wrapped around tests 4–5, plus
+   per-socket limit-share sampling during the windows (ceiling attribution,
+   §6); PMTUD probe (`ping -M do`, stepped sizes) to each endpoint.
 
 Directions run sequentially (up fully before down) so each is measured on an
 otherwise idle uplink. Per-op latency samples and per-second throughput splits
@@ -170,8 +171,11 @@ internet.<p>.tcp.retransmit_ratio    float % across tests 2-4
 internet.<p>.summary                 dict  region, endpoint, tool, bytes
 ```
 
-Throughput checks carry `detail`: single-stream MiB/s, p95 of 1s buckets,
-retransmit %. For multi-band probes, the scalar value represents the
+Throughput checks carry `detail`: single-stream MiB/s, p50/p95/p99 of the 1 s
+throughput buckets plus a steadiness ratio (p50/p95), retransmit %, TTFB
+percentiles of the measured ops, the per-request post-TTFB streaming rate,
+the ss socket-limit aggregate, and one ceiling verdict per retained window
+(below). For multi-band probes, the scalar value represents the
 nearest/overridden band; JSON-encoded `detail` retains the effective region
 matrix, individual runs, unsupported-band reasons, raw path reports and timing
 samples. These survive in `bench.values.json` without a separate artifact
@@ -183,6 +187,44 @@ provider is `SKIP` with reason "credentials not set"; missing `mtr` → that che
 `SKIP`s, others proceed. `rtt_sanity` is the only WARN-grading check in v1; the
 expected-band table ships in-code (from the research doc's RTT reference) until
 profiles exist.
+
+### Ceiling attribution (diagnostic detail, not a grade)
+
+Every transfer window records the evidence needed to say why its ceiling
+exists, and reduces it to one finding string:
+
+- `bucket_stats`, `steadiness_ratio` — p50/p95/p99 of the 1 s throughput
+  buckets. Steadiness (p50/p95) near 1.0 is a flat ceiling; a low value is
+  bursty.
+- `ttfb_ms` — p50/p95/p99 of measured-op first-byte latency: GET body TTFB,
+  PUT status-line turnaround. TTFB against concurrency is read directly from
+  the artifact; no sample re-parsing.
+- `post_ttfb_mib_per_sec` — per-request streaming rate after first byte
+  (p50/p95). GET: bytes over the body span. PUT: bytes over the request phase
+  (connect to first response byte), because the PUT body streams before the
+  service responds. A service-paced per-connection rate shows here while the
+  socket counters stay clean.
+- `socket_limits` — during the window, `ss -ti` reports per-socket
+  busy/rwnd_limited/cwnd_limited/sndbuf_limited time shares (percent of socket
+  busy time; printed only when nonzero, absent means zero), plus delivery_rate
+  and cwnd. The window aggregate keeps the median share per limit, the median
+  delivery rate and cwnd, and the socket count per dominant limit state.
+  Download sockets carry no send-side data, so a clean aggregate on a download
+  means "no local send limit", never "no remote limit".
+- `ceiling.finding` — one of: `service-paced` (sockets stay busy, no socket
+  limit, flat buckets); `receive-window limited`; `congestion or loss`
+  (cwnd-limited share high or elevated retransmits); `send-buffer limited`
+  (node-side tunable); `flat ceiling, clean sockets` (points past TCP at a
+  policer, the wire, or a per-client cap); `bursty`; `no dominant ceiling
+  signature`. `retransmit_pct` is a percent: 1.0 means 1%, not 100%.
+
+The thresholds (busy 80%, socket limits 20%, retrans 1%, p95/p50 1.2 flat /
+2.0 bursty) are diagnostic shape splits, not certification gates, in the
+spirit of the BDP reference note. Multi-bucket runs also keep `per_bucket`
+sample evidence: bytes, per-bucket MiB/s, TTFB and post-TTFB rates; buckets
+without a measured sample stay absent. The summary check repeats the findings
+as `ceiling_findings`, and the `bench.out` summary line appends them after
+the sustained rates.
 
 ## 7. Tooling — the one real decision
 
@@ -392,12 +434,21 @@ ISP, not the node — a WARN is an offtake conversation, not a hardware defect.
 | --------------------- | ----------------------- | ---------------------------- |
 | Sustained MiB/s       | stable, near link class | collapses over the window    |
 | p95/p50 of 1s buckets | ~1.0-1.2                | >2 (instability, policing)   |
+| Steadiness (p50/p95)  | near 1.0, flat ceiling  | low: bursty or idle gaps     |
+| Socket limit shares   | low on every limit      | one share >20% names the cap |
+| TTFB vs concurrency   | stable p95              | grows with streams (queueing)|
+| Post-TTFB rate        | wire-class p50          | flat cap: service-paced      |
 | obj/s vs throughput   | consistent              | retries/errors dominate      |
 | Per-op latency p99    | low tail                | fat tail (queueing upstream) |
 
 Bad-shape examples: throughput decaying after the first minute = upstream buffer
 exhaustion or policing; sawtooth buckets = congestion control fighting a lossy
-path (cross-check A.6 retransmits).
+path (cross-check A.6 retransmits). A flat ceiling with clean sockets and a
+bounded post-TTFB rate points at a policer, the wire, or a per-client cap, not
+at the node; a high busy share with no socket limit points at service pacing
+(see the verdict labels in §6). Download windows show clean local sockets by
+construction: the node sends no data, so the verdict leans on the bucket shape
+and the post-TTFB rate.
 
 ### A.3 Sustained download (ingress)
 
@@ -438,7 +489,12 @@ request path.
 | Signal             | Good                   | Bad                 |
 | ------------------ | ---------------------- | ------------------- |
 | Retransmit ratio   | <0.5%                  | >1% on a clean path |
+| Limit shares       | low on every limit     | rwnd/cwnd/sndbuf-limited >20% |
 | PMTUD (DF payload) | 1472 passes (1500 MTU) | hangs at some size  |
+
+The retransmit ratio is a percent: 0.5 means 0.5%. The limit shares are
+percent of socket busy time and appear only for sockets that reported them;
+see §6 for the per-tick aggregation.
 
 A PMTUD blackhole is the classic "SSH works, big transfers stall" failure —
 worth operator attention because it silently caps every other test's numbers. v1
