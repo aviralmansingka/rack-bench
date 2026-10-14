@@ -28,7 +28,7 @@ from rack_bench.common.models import Check
 from .latency import timing_sample
 from .s3client import S3Client, S3Error, ProtocolError, SeededPayload, set_chunk_cache_limit
 from .stats import describe, windows
-from .targets import reason, run_prefix, targets
+from .targets import bucket_names, reason, run_prefix, targets
 from .tcp import TCPWindow
 
 MIB = 1024 ** 2
@@ -396,7 +396,7 @@ def prerequisites(provider, options, direction):
     selected = targets(provider, options)
     if direction not in options.directions:
         raise ValueError(f"direction {direction} disabled by --directions")
-    if not options.buckets.get(provider):
+    if not bucket_names(provider, options):
         raise ValueError(f"missing bucket configuration: --buckets {provider}=<name>")
     if options.tool != "stdlib":
         raise ValueError("Warp execution not implemented; use --tool stdlib")
@@ -468,7 +468,7 @@ def transfer_check(provider, direction, metric, options, records):
                             "needs valid sustained transfer runs (all 3 for certify reduction)")
     return Check(f"internet.{provider}.{suffix}.{metric}", "pass" if chosen else "skip",
                  chosen["mib_per_sec" if metric == "throughput" else "objs_per_sec"] if chosen else None,
-                 detail=json.dumps(detail), source=[f'{"multipart PUT" if direction == "up" else "verified range GET"} {r["endpoint"]} bucket={options.buckets[provider]} prefix={run_prefix(options)}' for r in records])
+                 detail=json.dumps(detail), source=[f'{"multipart PUT" if direction == "up" else "verified range GET"} {r["endpoint"]} buckets={",".join(bucket_names(provider, options))} prefix={run_prefix(options)}' for r in records])
 
 
 def cleanup(options):

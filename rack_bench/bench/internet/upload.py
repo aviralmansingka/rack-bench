@@ -9,7 +9,7 @@ from rack_bench.common.models import Check
 from .latency import OBJECT_SIZE as LATENCY_SIZE
 from .s3client import S3Client, SeededPayload
 from .stats import describe
-from .targets import reason, run_prefix, run_seed
+from .targets import bucket_names, reason, run_prefix, run_seed
 from .transfer import (ERRORS, LIGHT_SIZE, MIB, OBJECT_SIZE, baseline, object_url, plan,
                        prerequisites, sample_timing, transfer_check, transfer_window)
 
@@ -27,7 +27,7 @@ def upload_reports(provider, options, *, client_factory=S3Client, window=transfe
             continue
         prefix = f'{run_prefix(options)}{provider}/{target["region"]}/transfer/'
         try:
-            client = client_factory(options.buckets[provider], target["region"], provider=provider)
+            client = client_factory(bucket_names(provider, options)[0], target["region"], provider=provider)
         except ERRORS as exc:
             record["reason"] = f"{type(exc).__name__}: {reason(exc)}"
             record["cleanup"] = "no client or objects created"
@@ -63,7 +63,7 @@ def upload_reports(provider, options, *, client_factory=S3Client, window=transfe
                                       concurrency=concurrency, duration=options.duration, objects=[], owned=record["owned"],
                                       size=size, part_size=options.part_size * MIB, seed=run_seed(options),
                                       one_object=target["band"] == "light", loaded=loaded if kind == "bulk" else None,
-                                      host=target["host"] if provider == "r2" else f'{options.buckets[provider]}.{target["host"]}')
+                                      host=target["host"] if provider == "r2" else f'{bucket_names(provider, options)[0]}.{target["host"]}')
                 run.update(kind=kind, run=index)
                 record["runs_detail"].append(run)
                 record["objects"].extend(objects)
@@ -117,4 +117,4 @@ def loaded_probe(provider, options):
     if not valid:
         detail["reason"] = records[0].get("loaded_reason", "needs valid concurrent TTFB samples inside successful upload windows")
     return Check(name, "pass" if valid else "skip", stats["p95"] if valid else None,
-                 detail=json.dumps(detail), source=[f'concurrent verified GET {records[0]["endpoint"]} bucket={options.buckets[provider]} key={records[0].get("loaded_key")}; upload windows only'])
+                 detail=json.dumps(detail), source=[f'concurrent verified GET {records[0]["endpoint"]} buckets={",".join(bucket_names(provider, options))} key={records[0].get("loaded_key")}; upload windows only'])
