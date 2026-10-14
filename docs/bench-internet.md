@@ -60,6 +60,9 @@ rack-bench bench internet
                                     # a provider may repeat for several buckets
     [--concurrent N]               # override parallel streams (default 32)
     [--duration 60s]               # override per-test duration
+    [--upload-mode auto|multipart] # default auto: single-part-sized objects
+                                   # use one plain PutObject; multipart forces
+                                   # multipart for request-pattern A/B
     [--tool stdlib|warp]           # default stdlib; warp for certify (§7)
     [--keep-data]                  # skip bucket cleanup
     [--yes]                        # accept cost estimate for certify
@@ -112,10 +115,22 @@ Run in this order; each is one or more `Check` entries per provider.
    Failed/invalid samples never become zero latency. Certify's nearest band
    retains three runs and drops best/worst ranked by response-TTFB p50; each
    light band has only one 20-GET run.
-4. **Sustained upload (egress)** — parallel multipart PUTs of profile-sized
+4. **Sustained upload (egress)** — parallel PUTs of profile-sized
    random objects for the profile duration (32 MiB in quick so objects
    complete and feed downloads; ~1 GiB in certify for sustained streams). Random data defeats provider-side
-   compression/dedup. With several buckets configured, streams are assigned
+   compression/dedup. **Upload mode:** an object that fits in one part
+   (`object_size <= part_size`) goes up as ONE plain `PutObject` — 1 request
+   per object, not single-part multipart's initiate + part + complete = 3
+   (the ~3x request rate of that pattern is the suspected trigger of R2's
+   per-bucket ingest limit and its 502 windows at high concurrency). Objects
+   spanning several parts keep multipart unchanged, so every request stays
+   bounded well inside the 30 s client socket timeout: a 1 GiB single PUT at
+   single-stream rates would outlive it, while 64 MiB parts do not. Quick's
+   32 MiB objects therefore measure one request per object; certify's 1 GiB
+   objects measure multipart unchanged. `--upload-mode multipart` forces
+   multipart for every object, for like-for-like request-pattern A/B with
+   this client. Samples and upload records note their mode (`put` |
+   `multipart`) additively. With several buckets configured, streams are assigned
    round-robin across them at window start (§8). **Concurrent small-object TTFB probes** run during the
    window → loaded-latency signal: p95 under load, inflation vs test 3's
    baseline.
@@ -175,7 +190,8 @@ internet.<p>.summary                 dict  region, endpoint, tool, bytes
 Throughput checks carry `detail`: single-stream MiB/s, p50/p95/p99 of the 1 s
 throughput buckets plus a steadiness ratio (p50/p95), retransmit %, TTFB
 percentiles of the measured ops, the per-request post-TTFB streaming rate,
-the ss socket-limit aggregate, and one ceiling verdict per retained window
+the ss socket-limit aggregate, upload-mode sample counts (`upload_modes`:
+`put` vs `multipart`; upload checks only), and one ceiling verdict per retained window
 (below). For multi-band probes, the scalar value represents the
 nearest/overridden band; JSON-encoded `detail` retains the effective region
 matrix, individual runs, unsupported-band reasons, raw path reports and timing
@@ -273,8 +289,9 @@ it.
   single contiguous Range GETs (206 plus inclusive Content-Range) and
   requires Content-Length on non-chunked PUTs, which the client always
   sends. GCS validates only CRC32C natively and mishandles the S3-style
-  CRC32 headers, so gcs uploads omit the flexible-checksum headers and
-  completion elements and carry the signed SHA256 payload digest;
+  CRC32 headers, so gcs uploads — multipart parts and single-part
+  `PutObject`s alike — omit the flexible-checksum headers and completion
+  elements and carry the signed SHA256 payload digest;
   downloads verify every byte client-side, as for every provider.
 - Keys need only a scoped policy: create/delete one bench prefix + read/write
   objects in it. The doc ships the minimal IAM policy.
@@ -405,7 +422,12 @@ Remaining implementation residue: certification thresholds/profile schema,
 optional Warp execution, and effective matrix-aware cost estimates. All v1
 probes are implemented, including the opt-in GCS interoperability provider
 (loopback-tested only); cloud transfer interoperability — S3, R2, and GCS
-alike — still requires a paid live exercise. Reference cost output is not a quote for
+alike — still requires a paid live exercise. Single-part uploads as one
+plain `PutObject` (the request-pattern reduction of §4 test 4) are likewise
+loopback-tested only; the first live A/B is a free R2 quick upload run at
+concurrency 64, expected to clear the 502 `InternalError` windows if the
+multipart request pattern was their trigger — every window self-reports its
+ceiling verdict. Reference cost output is not a quote for
 custom runs. Missing credentials still SKIP every provider check, including
 context and summary. See README for orchestration, TCP sampling limitations,
 part-boundary duration overruns, and filtered-prerequisite behavior.
