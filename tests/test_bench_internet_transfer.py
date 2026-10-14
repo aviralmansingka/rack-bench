@@ -385,6 +385,97 @@ class TransferTests(unittest.TestCase):
         self.assertEqual([b["mib_per_sec"] for b in buckets], [1, 0, 2])
         self.assertEqual([b["start_seconds"] for b in buckets], [0, 1, 2])
 
+    def test_window_profiles_ttfb_post_ttfb_steadiness_and_ceiling(self):
+        # FakeClient timings are constant: PUT parts turn around in 2 ms (status
+        # line), GET bodies start at 4 ms and stream the range in 1 ms.
+        run, _ = self.window()  # up: 4 parts of 8 bytes
+        self.assertEqual(run["ttfb_ms"], {"count": 4, "min": 2.0, "max": 2.0, "mean": 2.0,
+                                         "p50": 2.0, "p95": 2.0, "p99": 2.0})
+        self.assertEqual(run["post_ttfb_mib_per_sec"]["p50"], 8 / transfer.MIB / .001)  # request-phase rate
+        self.assertEqual(run["steadiness_ratio"], stats.steadiness([b["mib_per_sec"] for b in run["buckets"]]))
+        self.assertEqual(run["ceiling"], transfer.ceiling_verdict(run["bucket_stats"], run["tcp"].get("limits"),
+                                                                   run["tcp"]["ratio_pct"]))
+        _, objects = self.window()
+        with patch.object(transfer, "PART_SIZE", 8):
+            run, _ = transfer.transfer_window(self.client, direction="down", prefix="unused/", concurrency=1,
+                                            duration=.1, objects=objects, owned=[], one_object=True,
+                                            clock=self.clock, tcp_factory=FakeTCP)
+        self.assertEqual(run["ttfb_ms"]["p50"], 4.0)  # GET TTFB is the first body byte
+        self.assertEqual(run["post_ttfb_mib_per_sec"]["count"], 2)  # one per verified range
+        self.assertEqual(run["post_ttfb_mib_per_sec"]["p50"], 8 / transfer.MIB / .001)
+
+    def test_post_ttfb_zero_span_has_no_invented_rate(self):
+        # A body that completes with its first byte has no streaming span.
+        sample = {"bytes": 16, "connect_ms": 1.0, "response_first_byte_ms": 4.0,
+                  "headers_ms": 4.0, "body_first_byte_ms": 5.0, "total_ms": 5.0}
+        self.assertIsNone(transfer.post_ttfb_mib_per_sec(sample, "down"))
+        self.assertEqual(transfer.ttfb_ms(sample, "down"), 5.0)
+        self.assertEqual(transfer.ttfb_ms(sample, "up"), 4.0)
+
+    def test_ceiling_verdict_labels_thresholds_and_retransmit_percent_units(self):
+        flat = {"p50": 100, "p95": 110}
+        limits = {"busy_pct_median": 100.0, "rwnd_limited_pct_median": 0.0,
+                  "cwnd_limited_pct_median": 0.0, "sndbuf_limited_pct_median": 0.0}
+        self.assertEqual(transfer.ceiling_verdict(flat, limits, .2)["finding"], "service-paced")
+        self.assertEqual(transfer.ceiling_verdict(flat, dict(limits, busy_pct_median=0.0), None)["finding"],
+                         "flat ceiling, clean sockets")
+        self.assertEqual(transfer.ceiling_verdict(flat, None, None)["finding"], "flat ceiling, clean sockets")  # no owned socket observed
+        self.assertEqual(transfer.ceiling_verdict(flat, dict(limits, rwnd_limited_pct_median=40.0), None)["finding"],
+                         "receive-window limited")
+        self.assertEqual(transfer.ceiling_verdict(flat, dict(limits, cwnd_limited_pct_median=25.0), None)["finding"],
+                         "congestion or loss")
+        self.assertEqual(transfer.ceiling_verdict(flat, limits, 1.5)["finding"], "congestion or loss")  # elevated retrans
+        self.assertEqual(transfer.ceiling_verdict(flat, limits, .5)["finding"], "service-paced")  # 0.5 is 0.5%, not 50%
+        self.assertEqual(transfer.ceiling_verdict(flat, dict(limits, sndbuf_limited_pct_median=30.0), None)["finding"],
+                         "send-buffer limited")
+        self.assertEqual(transfer.ceiling_verdict({"p50": 10, "p95": 30}, limits, None)["finding"], "bursty")
+        self.assertEqual(transfer.ceiling_verdict({"p50": 10, "p95": 15}, limits, None)["finding"],
+                         "no dominant ceiling signature")  # spread between flat and bursty bands
+        self.assertEqual(transfer.ceiling_verdict({"p50": None, "p95": None}, limits, None)["finding"],
+                         "no dominant ceiling signature")  # no buckets, no invented shape
+        verdict = transfer.ceiling_verdict(flat, limits, .2)
+        self.assertIn("not certification gates", verdict["reference"])
+        self.assertIn("1.0 = 1%", verdict["reference"])
+
+    def test_multi_bucket_window_reports_per_bucket_sample_evidence(self):
+        names = ("bench-a", "bench-b")
+        clients = {name: FakeClient() for name in names}
+        for name, fake in clients.items():
+            fake.bucket = name
+        with patch.object(transfer, "PART_SIZE", 8):
+            run, _ = transfer.transfer_window(clients[names[0]], direction="up", prefix="rack-bench/test/",
+                                              concurrency=4, duration=.1, objects=[], owned=[],
+                                              size=16, one_object=True, clock=self.clock, tcp_factory=FakeTCP,
+                                              pool_factory=transfer._thread_pool_factory,
+                                              buckets=names, clients=clients)
+        per_bucket = run["per_bucket"]
+        self.assertEqual(set(per_bucket), set(names))  # buckets without samples stay absent, never zeroed
+        for name in names:
+            self.assertEqual(per_bucket[name]["bytes"], 32)  # two 16-byte objects per bucket
+            self.assertEqual(per_bucket[name]["ttfb_ms"]["count"], 4)
+            self.assertEqual(per_bucket[name]["post_ttfb_mib_per_sec"]["count"], 4)
+            self.assertGreater(per_bucket[name]["mib_per_sec"], 0)
+        # Single-bucket windows keep today's shape: no per_bucket key at all.
+        single, _ = self.window()
+        self.assertNotIn("per_bucket", single)
+
+    def test_transfer_check_surfaces_ceiling_detail_additively(self):
+        self.reports()
+        records = download.download_reports("s3", self.options, client_factory=lambda *a, **k: self.client, window=self.fake_window)
+        chosen = next(r for r in records[0]["runs_detail"] if r["kind"] == "bulk")
+        chosen["per_bucket"] = {"bench-test": {"bytes": 1, "mib_per_sec": 1, "ttfb_ms": {}, "post_ttfb_mib_per_sec": {}}}
+        check = transfer.transfer_check("s3", "down", "throughput", self.options, records)
+        detail = json.loads(check.detail)
+        for field in ("bucket_stats", "p95_p50_ratio", "retransmit_pct", "steadiness_ratio",
+                      "ttfb_ms", "post_ttfb_mib_per_sec", "socket_limits", "ceiling", "per_bucket"):
+            self.assertIn(field, detail)
+        self.assertEqual(detail["ceiling"]["finding"], "flat ceiling, clean sockets")
+        self.assertEqual(detail["socket_limits"]["dominant_state"], "busy")
+        self.assertEqual(detail["ttfb_ms"]["p50"], 110)
+        # Envelope shape is unchanged; only detail fields were added.
+        self.assertEqual(detail["selection"], "nearest; median of 3 by MiB/s per concurrency, scalar is largest concurrency; all runs retained")
+        self.assertTrue(all("runs_detail" in region for region in detail["regions"]))
+
     def test_concurrent_loaded_gets_are_inside_upload_window(self):
         started, twice = threading.Event(), threading.Event()
         original = self.client.multipart_upload
@@ -633,8 +724,12 @@ class TransferTests(unittest.TestCase):
             self.assertEqual(summary["status"], "pass")
             self.assertEqual(summary["value"]["bytes"]["uploaded"], 2 * transfer.LIGHT_SIZE)  # quick uploads 32 MiB objects
             self.assertEqual(json.loads(summary["detail"])["cleanup"][0]["status"], "deleted exact owned keys")
+            # The ceiling verdict lands in the summary value, detail and human line.
+            self.assertEqual(summary["value"]["ceiling"], {"upload": "flat ceiling, clean sockets"})
+            self.assertEqual(json.loads(summary["detail"])["ceiling_findings"], {"upload": "flat ceiling, clean sockets"})
             self.assertEqual(Path(tmp, "bench.values.json").read_text(), out.getvalue())
             self.assertIn("upload=100.00 MiB/s", Path(tmp, "bench.out").read_text())
+            self.assertIn("ceiling upload=flat ceiling, clean sockets", Path(tmp, "bench.out").read_text())
 
 
 class WorkerProcessS3(BaseHTTPRequestHandler):
@@ -856,6 +951,7 @@ class ProcessPoolTransferTests(unittest.TestCase):
         self.assertEqual(limits["busy_pct_median"], 100.0)
         self.assertEqual(limits["rwnd_limited_pct_median"], 40.0)
         self.assertEqual(limits["dominant_state"], "rwnd_limited")
+        self.assertEqual(run["ceiling"]["finding"], "receive-window limited")
         # ss with no matching sockets: the window still passes, limits explain themselves.
         def socketless(host, pids=None):
             return tcp.TCPWindow(host, command=lambda args, timeout: "", interval=.05, pids=pids)
@@ -866,6 +962,9 @@ class ProcessPoolTransferTests(unittest.TestCase):
         self.assertEqual(run["status"], "pass")
         self.assertEqual(run["tcp"]["limits"]["ticks"], 0)
         self.assertIn("no sample tick", run["tcp"]["limits"]["reason"])
+        self.assertIn(run["ceiling"]["finding"],  # a verdict still lands from the bucket shape
+                      {"service-paced", "receive-window limited", "congestion or loss", "send-buffer limited",
+                       "flat ceiling, clean sockets", "bursty", "no dominant ceiling signature"})
 
     def test_worker_error_sets_cross_process_stop_and_siblings_drain_out(self):
         self.server.state = {"payload": s3.SeededPayload("proc-seed", self.size),
