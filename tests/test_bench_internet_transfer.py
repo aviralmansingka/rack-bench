@@ -289,6 +289,92 @@ class TransferTests(unittest.TestCase):
                 part_size_mib(value)
 
 
+    def test_multi_bucket_round_robin_assignment_and_records(self):
+        names = ("bench-a", "bench-b")
+        clients = {name: FakeClient() for name in names}
+        for name, fake in clients.items():
+            fake.bucket = name
+        owned = []
+        with patch.object(transfer, "PART_SIZE", 8):
+            run, objects = transfer.transfer_window(clients[names[0]], direction="up", prefix="rack-bench/test/",
+                                                    concurrency=4, duration=.1, objects=[], owned=owned,
+                                                    size=16, one_object=True, clock=self.clock, tcp_factory=FakeTCP,
+                                                    pool_factory=transfer._thread_pool_factory,
+                                                    buckets=names, clients=clients)
+        self.assertEqual(run["status"], "pass")
+        # Streams 0..3 are assigned round-robin at window start, in order.
+        self.assertEqual([obj["bucket"] for obj in objects], ["bench-a", "bench-b", "bench-a", "bench-b"])
+        self.assertEqual(owned, [(obj["bucket"], obj["key"]) for obj in objects])
+        self.assertEqual([sample["bucket"] for sample in run["samples"]],
+                         ["bench-a", "bench-a", "bench-b", "bench-b", "bench-a", "bench-a", "bench-b", "bench-b"])
+        self.assertEqual(len(clients["bench-a"].objects), 2)
+        self.assertEqual(len(clients["bench-b"].objects), 2)
+        # Single-stream windows always use the first bucket.
+        with patch.object(transfer, "PART_SIZE", 8):
+            run, objects = transfer.transfer_window(clients[names[0]], direction="up", prefix="rack-bench/test/",
+                                                    concurrency=1, duration=.1, objects=[], owned=[],
+                                                    size=16, one_object=True, clock=self.clock, tcp_factory=FakeTCP,
+                                                    buckets=names, clients=clients)
+        self.assertEqual(run["status"], "pass")
+        self.assertEqual([obj["bucket"] for obj in objects], ["bench-a"])
+
+    def test_download_reads_each_object_from_its_recorded_bucket(self):
+        names = ("bench-a", "bench-b")
+        clients = {name: FakeClient() for name in names}
+        objects = []
+        for index, name in enumerate(names):
+            fake = clients[name]
+            fake.bucket = name
+            key = f"rack-bench/test/{index}-0.bin"
+            fake.objects[key] = True  # assert_owned fails any GET against the wrong bucket's store
+            objects.append({"key": key, "bucket": name,
+                            "payload": {"seed": key, "size": 16, "chunk_size": 65536}})
+        run, completed = transfer.transfer_window(clients[names[0]], direction="down", prefix="unused/",
+                                                  concurrency=2, duration=.1, objects=objects, owned=[],
+                                                  one_object=True, part_size=8, clock=self.clock, tcp_factory=FakeTCP,
+                                                  pool_factory=transfer._thread_pool_factory,
+                                                  buckets=names, clients=clients)
+        self.assertEqual(run["status"], "pass")
+        self.assertEqual([obj["bucket"] for obj in completed], ["bench-a", "bench-b"])
+        self.assertEqual(clients["bench-a"].calls, [("down", "rack-bench/test/0-0.bin")] * 2)  # two verified ranges
+        self.assertEqual(clients["bench-b"].calls, [("down", "rack-bench/test/1-0.bin")] * 2)
+        self.assertEqual({sample["bucket"] for sample in run["samples"]}, set(names))
+
+    def test_multi_bucket_reports_cleanup_and_check_detail(self):
+        fakes = {}
+        def factory(name, *args, **kwargs):
+            if name not in fakes:  # one client per bucket survives across windows and cleanup
+                fake = FakeClient()
+                fake.bucket = name
+                fakes[name] = fake
+            return fakes[name]
+        self.options = Options(providers=("s3",), buckets={"s3": ("bench-a", "bench-b")}, duration=1)
+        self.baseline()
+        self.calls = []
+        records = upload.upload_reports("s3", self.options, client_factory=factory, window=self.fake_window)
+        self.assertEqual(records[0]["buckets"], ["bench-a", "bench-b"])
+        self.assertTrue(all(call["buckets"] == ("bench-a", "bench-b") for call in self.calls))
+        download.download_reports("s3", self.options, client_factory=factory, window=self.fake_window)
+        owned = {bucket: [key for holder, key in records[0]["owned"] if holder == bucket]
+                 for bucket in ("bench-a", "bench-b")}
+        self.assertIn(records[0]["loaded_key"], owned["bench-a"])  # the loaded probe uses the first bucket
+        self.assertTrue(all(owned.values()))
+        transfer.cleanup(self.options)
+        for bucket, fake in fakes.items():
+            self.assertEqual(fake.deleted, owned[bucket])  # every bucket loses exactly its own keys
+        check = transfer.transfer_check("s3", "up", "throughput", self.options, records)
+        self.assertEqual(json.loads(check.detail)["buckets"], ["bench-a", "bench-b"])
+        self.assertIn("buckets=bench-a,bench-b", check.source[0])
+
+    def test_single_bucket_regression_normalized_shape(self):
+        # A bare name normalizes to a 1-tuple; single-bucket runs keep today's shape.
+        self.assertEqual(self.options.buckets, {"s3": ("bench-test",)})
+        records = self.reports()
+        self.assertEqual(records[0]["buckets"], ["bench-test"])
+        self.assertTrue(all(call["buckets"] == ("bench-test",) for call in self.calls))
+        self.options.buckets = {"s3": "direct-assign"}  # library callers may assign a bare name
+        self.assertEqual(targets.bucket_names("s3", self.options), ("direct-assign",))
+
     def test_buckets_idle_seconds_boundary_and_partial_tail(self):
         buckets = transfer.throughput_buckets([(0.1, transfer.MIB), (2., transfer.MIB)], 2.5)
         self.assertEqual([b["mib_per_sec"] for b in buckets], [1, 0, 2])
@@ -321,16 +407,19 @@ class TransferTests(unittest.TestCase):
     def fake_window(self, client, **kwargs):
         self.calls.append(kwargs)
         size = kwargs.get("size", transfer.OBJECT_SIZE) if kwargs["direction"] == "up" else kwargs["objects"][0]["payload"]["size"]
-        key = kwargs["prefix"] + "object.bin"
+        # One completed object per bucket, mirroring the real round-robin spread.
+        objects = [{"key": f'{kwargs["prefix"]}{name}-{index}.bin', "bucket": name,
+                    "payload": {"seed": name, "size": size, "chunk_size": 65536}}
+                   for index, name in enumerate(kwargs["buckets"])]
         if kwargs["direction"] == "up":
-            kwargs["owned"].append(key)
+            kwargs["owned"].extend((obj["bucket"], obj["key"]) for obj in objects)
         run = {"status": "pass", "concurrency": kwargs["concurrency"], "bytes": size,
                "mib_per_sec": 100 if kwargs["direction"] == "up" else 50, "objs_per_sec": 2,
                "elapsed_seconds": 1, "progress_bytes_lower_bound": size, "samples": [],
                "bucket_stats": {"p50": 100, "p95": 100}, "p95_p50_ratio": 1,
                "tcp": FakeTCP("").detail, "loaded_samples": [{"response_first_byte_ms": 45}],
                "loaded_errors": [], "loaded_bytes": upload.LATENCY_SIZE}
-        return run, [{"key": key, "payload": {"seed": key, "size": size, "chunk_size": 65536}}]
+        return run, objects
 
     def reports(self):
         self.calls = []
@@ -464,9 +553,9 @@ class TransferTests(unittest.TestCase):
     def test_cleanup_exact_owned_keys_keep_data_and_failure(self):
         records = self.reports()
         owned = list(records[0]["owned"])
-        records[0]["owned"].append("someone-elses/key")
+        records[0]["owned"].append(("bench-test", "someone-elses/key"))
         transfer.cleanup(self.options)
-        self.assertEqual(self.client.deleted, owned)
+        self.assertEqual(self.client.deleted, [key for _, key in owned])
         self.assertIn("outside owned prefix", records[0]["cleanup_errors"][0]["reason"])
         self.assertEqual(transfer.transfer_check("s3", "up", "throughput", self.options, records).status, "skip")
         self.options.keep_data = True
@@ -614,14 +703,20 @@ class ProcessPoolTransferTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), WorkerProcessS3)
+        cls.server_beta = ThreadingHTTPServer(("127.0.0.1", 0), WorkerProcessS3)  # second bucket root
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread_beta = threading.Thread(target=cls.server_beta.serve_forever, daemon=True)
         cls.thread.start()
+        cls.thread_beta.start()
 
     @classmethod
     def tearDownClass(cls):
         cls.server.shutdown()
+        cls.server_beta.shutdown()
         cls.server.server_close()
+        cls.server_beta.server_close()
         cls.thread.join()
+        cls.thread_beta.join()
 
     def setUp(self):
         env = patch.dict(os.environ, {"AWS_ACCESS_KEY_ID": "fake", "AWS_SECRET_ACCESS_KEY": "fake", "R2_ACCOUNT_ID": "fake"}, clear=True)
@@ -631,6 +726,7 @@ class ProcessPoolTransferTests(unittest.TestCase):
         self.addCleanup(lambda: s3.set_chunk_cache_limit(s3.CHUNK_CACHE_LIMIT))
         self.addCleanup(transfer._POOL_STATE.clear)
         self.endpoint = s3.Endpoint("127.0.0.1", "auto", True, self.server.server_port, False)
+        self.endpoint_beta = s3.Endpoint("127.0.0.1", "auto", True, self.server_beta.server_port, False)
         self.client = S3Client("bucket", "auto", timeout=10, backoff=0, endpoint=self.endpoint)
         self.addCleanup(self.client.close)
         self.size, self.part = 16 * transfer.MIB, 8 * transfer.MIB
@@ -651,10 +747,12 @@ class ProcessPoolTransferTests(unittest.TestCase):
         self.assertEqual(run["objects"], 2)
         self.assertEqual([sample["part"] for sample in run["samples"]], [0, 1, 0, 1])  # two parts per process
         self.assertEqual([obj["key"] for obj in objects], ["proc/0-0.bin", "proc/1-0.bin"])
-        self.assertEqual(owned, ["proc/0-0.bin", "proc/1-0.bin"])  # ambiguous PUTs stay cleanable
+        self.assertEqual(owned, [("bucket", "proc/0-0.bin"), ("bucket", "proc/1-0.bin")])  # ambiguous PUTs stay cleanable
         self.assertEqual(run["progress_bytes_lower_bound"], 2 * self.size)
         self.assertEqual(run["errors"], [])
         self.assertTrue(all(obj["payload"]["seed"] == "proc-seed" for obj in objects))
+        self.assertTrue(all(obj["bucket"] == "bucket" for obj in objects))  # records name their bucket
+        self.assertEqual({sample["bucket"] for sample in run["samples"]}, {"bucket"})
         # Loaded-latency stays a parent-side probe with fresh-connection semantics.
         self.assertTrue(run["loaded_samples"])
         self.assertTrue(all(0 <= sample["at_seconds"] <= run["elapsed_seconds"] for sample in run["loaded_samples"]))
@@ -674,6 +772,58 @@ class ProcessPoolTransferTests(unittest.TestCase):
         self.assertEqual(len(run["samples"]), 4)
         self.assertEqual(run["errors"], [])
 
+    def test_multi_bucket_worker_processes_route_by_recorded_bucket(self):
+        # Two loopback roots, one per bucket: worker processes build a client
+        # per bucket from the pool initargs, streams shard round-robin, and
+        # downloads follow each record's bucket, not the stream assignment.
+        clients = {"alpha": S3Client("alpha", "auto", timeout=10, backoff=0, endpoint=self.endpoint),
+                   "beta": S3Client("beta", "auto", timeout=10, backoff=0, endpoint=self.endpoint_beta)}
+        for server in (self.server, self.server_beta):
+            server.state = {"payload": s3.SeededPayload("proc-seed", self.size), "requests": []}
+        owned = []
+        run, objects = transfer.transfer_window(clients["alpha"], direction="up", prefix="proc/",
+                                                 concurrency=4, duration=.05, objects=[], owned=owned,
+                                                 size=self.size, one_object=True, part_size=self.part,
+                                                 seed="proc-seed", buckets=("alpha", "beta"), clients=clients,
+                                                 tcp_factory=FakeTCP, host="127.0.0.1")
+        self.assertEqual(run["status"], "pass")
+        self.assertEqual(run["bytes"], 4 * self.size)
+        self.assertEqual([obj["bucket"] for obj in objects], ["alpha", "beta", "alpha", "beta"])
+        self.assertEqual([obj["key"] for obj in objects], [f"proc/{index}-0.bin" for index in range(4)])
+        self.assertEqual(owned, [(obj["bucket"], obj["key"]) for obj in objects])
+        for server, name in ((self.server, "alpha"), (self.server_beta, "beta")):
+            paths = [path for _, path in server.state["requests"]]
+            self.assertTrue(paths)
+            self.assertTrue(all(f"/{name}/" in path for path in paths))  # this root saw only its bucket
+        self.server.state["requests"] = []
+        self.server_beta.state["requests"] = []
+        run, completed = transfer.transfer_window(clients["alpha"], direction="down", prefix="unused/",
+                                                   concurrency=2, duration=.05, objects=objects, owned=[],
+                                                   one_object=True, part_size=self.part,
+                                                   buckets=("alpha", "beta"), clients=clients,
+                                                   tcp_factory=FakeTCP, host="127.0.0.1")
+        self.assertEqual(run["status"], "pass")
+        self.assertEqual([obj["bucket"] for obj in completed], ["alpha", "beta"])
+        gets = {name: {path for method, path in server.state["requests"] if method == "GET"}
+                for server, name in ((self.server, "alpha"), (self.server_beta, "beta"))}
+        self.assertEqual({path for paths in gets.values() for path in paths},
+                         {f'/{obj["bucket"]}/{obj["key"]}' for obj in completed})
+        for name, paths in gets.items():
+            self.assertTrue(all(f"/{name}/" in path for path in paths))
+        # Cleanup deletes every owned key from the bucket that holds it.
+        options = Options(providers=("s3",), buckets={"s3": ("alpha", "beta")}, duration=1)
+        prefix = targets.run_prefix(options) + "s3/ap-south-1/transfer/"
+        options.__dict__["_transfer_owners"] = [(clients, {"owned": [("alpha", prefix + "a.bin"),
+                                                                      ("beta", prefix + "b.bin")]}, prefix)]
+        self.server.state["requests"] = []
+        self.server_beta.state["requests"] = []
+        transfer.cleanup(options)
+        deletes = {name: [path for method, path in server.state["requests"]
+                          if method == "DELETE" and "uploadId" not in path]
+                   for server, name in ((self.server, "alpha"), (self.server_beta, "beta"))}
+        self.assertEqual(deletes["alpha"], [f"/alpha/{prefix}a.bin"])
+        self.assertEqual(deletes["beta"], [f"/beta/{prefix}b.bin"])
+
     def test_worker_error_sets_cross_process_stop_and_siblings_drain_out(self):
         self.server.state = {"payload": s3.SeededPayload("proc-seed", self.size),
                              "fail_prefix": "0-0", "requests": []}
@@ -684,7 +834,7 @@ class ProcessPoolTransferTests(unittest.TestCase):
                                            tcp_factory=FakeTCP, host="127.0.0.1")
         self.assertEqual(run["status"], "skip")
         self.assertEqual(run["errors"][0]["type"], "ServiceError")
-        self.assertIn("proc/0-0.bin", owned)
+        self.assertIn(("bucket", "proc/0-0.bin"), owned)
         # The multiprocessing stop event reaches sibling processes: no worker
         # streams for the full scheduled window after the first failure.
         self.assertLess(run["elapsed_seconds"], 10)
@@ -695,9 +845,9 @@ class ProcessPoolTransferTests(unittest.TestCase):
         import pickle
         slots = multiprocessing.Array("i", 2)
         stop = multiprocessing.Event()
-        transfer._pool_initialiser(("bucket", self.endpoint, 10, 2, 0), stop, slots,
+        transfer._pool_initialiser((("bucket", self.endpoint, 10, 2, 0),), stop, slots,
                                    2 * 1024 * 1024, None)
-        self.assertIsInstance(transfer._POOL_STATE["client"], S3Client)
+        self.assertIsInstance(transfer._POOL_STATE["clients"]["bucket"], S3Client)
         self.assertIs(transfer._POOL_STATE["stop"], stop)
         self.assertIn(os.getpid(), list(slots))
         s3.clear_payload_caches()
@@ -708,7 +858,7 @@ class ProcessPoolTransferTests(unittest.TestCase):
         self.assertIs(pickle.loads(pickle.dumps(transfer._transfer_worker)), transfer._transfer_worker)
         task = {"direction": "up", "prefix": "p/", "index": 3, "objects": [], "size": 8,
                 "one_object": True, "deadline": 1.5, "start": .5, "part_size": 8, "seed": None,
-                "clock": time.monotonic, "client": None, "stop": None, "active": None}
+                "clock": time.monotonic, "bucket": "bucket", "clients": None, "stop": None, "active": None}
         self.assertEqual(pickle.loads(pickle.dumps(task)), task)  # the process-mode task payload
 
 

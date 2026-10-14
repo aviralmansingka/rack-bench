@@ -20,23 +20,30 @@ def upload_reports(provider, options, *, client_factory=S3Client, window=transfe
     if "up" in state:
         return state["up"]
     records = state["up"] = []
+    names = bucket_names(provider, options)
     for target in selected:
-        record = dict(target, runs_detail=[], objects=[], owned=[], cleanup="pending collection finalizer")
+        record = dict(target, runs_detail=[], objects=[], owned=[], buckets=list(names),
+                      cleanup="pending collection finalizer")
         records.append(record)
         if target["reason"]:
             continue
         prefix = f'{run_prefix(options)}{provider}/{target["region"]}/transfer/'
+        clients = {}
         try:
-            client = client_factory(bucket_names(provider, options)[0], target["region"], provider=provider)
+            for name in names:
+                clients[name] = client_factory(name, target["region"], provider=provider)
         except ERRORS as exc:
+            for created in clients.values():
+                created.close()
             record["reason"] = f"{type(exc).__name__}: {reason(exc)}"
             record["cleanup"] = "no client or objects created"
             continue
-        options.__dict__.setdefault("_transfer_owners", []).append((client, record, prefix))
+        client = clients[names[0]]  # first bucket: loaded-latency probe and TCP host anchor
+        options.__dict__.setdefault("_transfer_owners", []).append((clients, record, prefix))
         loaded = None
         if target["band"] == "nearest" and baseline(provider, options) is not None:
             key = prefix + "loaded.bin"
-            record["owned"].append(key)
+            record["owned"].append((names[0], key))
             record["loaded_key"] = key
             payload = SeededPayload(run_seed(options), LATENCY_SIZE)
             try:
@@ -62,12 +69,16 @@ def upload_reports(provider, options, *, client_factory=S3Client, window=transfe
                 run, objects = window(client, direction="up", prefix=f"{prefix}{kind}-{concurrency}-{index}/",
                                       concurrency=concurrency, duration=options.duration, objects=[], owned=record["owned"],
                                       size=size, part_size=options.part_size * MIB, seed=run_seed(options),
+                                      buckets=names, clients=clients,
                                       one_object=target["band"] == "light", loaded=loaded if kind == "bulk" else None,
-                                      host=target["host"] if provider == "r2" else f'{bucket_names(provider, options)[0]}.{target["host"]}')
+                                      # ss diagnostics anchor to the first bucket's virtual host;
+                                      # sibling buckets share the endpoint IPs in practice
+                                      host=target["host"] if provider == "r2" else f'{names[0]}.{target["host"]}')
                 run.update(kind=kind, run=index)
                 record["runs_detail"].append(run)
                 record["objects"].extend(objects)
-        client.close()  # parent-side pooled socket; worker sockets died with their threads/processes
+        for entry in clients.values():
+            entry.close()  # parent-side pooled sockets; worker sockets died with their threads/processes
     return records
 
 
