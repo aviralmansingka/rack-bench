@@ -55,7 +55,8 @@ rack-bench bench internet
     [--directions up,down]         # default both
     [--profile quick|certify]      # default quick
     [--regions s3=us-east-1,...]    # override the tiered region matrix (§11)
-    [--buckets s3=<name>,r2=<name>] # existing buckets for object probes (§8)
+    [--buckets s3=<n1>,s3=<n2>,...] # existing buckets for object probes (§8);
+                                    # a provider may repeat for several buckets
     [--concurrent N]               # override parallel streams (default 32)
     [--duration 60s]               # override per-test duration
     [--tool stdlib|warp]           # default stdlib; warp for certify (§7)
@@ -113,7 +114,8 @@ Run in this order; each is one or more `Check` entries per provider.
 4. **Sustained upload (egress)** — parallel multipart PUTs of profile-sized
    random objects for the profile duration (32 MiB in quick so objects
    complete and feed downloads; ~1 GiB in certify for sustained streams). Random data defeats provider-side
-   compression/dedup. **Concurrent small-object TTFB probes** run during the
+   compression/dedup. With several buckets configured, streams are assigned
+   round-robin across them at window start (§8). **Concurrent small-object TTFB probes** run during the
    window → loaded-latency signal: p95 under load, inflation vs test 3's
    baseline.
 5. **Sustained download (ingress)** — parallel range GETs reading back the
@@ -210,13 +212,23 @@ it.
 - Keys need only a scoped policy: create/delete one bench prefix + read/write
   objects in it. The doc ships the minimal IAM policy.
 - **Bucket configuration:** `--buckets s3=<name>,r2=<name>` is a provider-keyed
-  map of existing bucket names, following `--regions`: known, unique providers
-  only. Names must be DNS-compatible; S3 virtual-hosted TLS bucket names cannot
-  contain dots. Flags are run configuration; environment variables remain
-  credentials-only. Path and DNS ignore this map. Object probes without a bucket
-  SKIP with a reason naming `--buckets <provider>=<name>`. No buckets are
-  created. A bucket must be accessible at the selected endpoint/region: regional
-  S3 redirects/errors are ungradable, never silently followed into another band.
+  map of existing bucket names, following `--regions`: known providers only.
+  A provider may name several buckets: repeat the provider key inside the
+  list (`s3=one,s3=two`) or repeat the flag; occurrences merge in flag order,
+  and the same name twice is rejected. Names must be DNS-compatible; S3
+  virtual-hosted TLS bucket names cannot contain dots. Flags are run
+  configuration; environment variables remain credentials-only. Path and DNS
+  ignore this map. Object probes without a bucket SKIP with a reason naming
+  `--buckets <provider>=<name>`. No buckets are created. A bucket must be
+  accessible at the selected endpoint/region: regional S3 redirects/errors are
+  ungradable, never silently followed into another band.
+- **Multiple buckets per provider:** bulk windows assign streams round-robin
+  across the provider's buckets at window start; single-stream windows use the
+  first bucket. Every upload record stores its bucket, each download reads the
+  object from that bucket, and cleanup deletes owned keys in every bucket.
+  One bucket per provider behaves exactly as before. Several buckets spread
+  the per-bucket request rate (suspected provider-side ingest limits); they
+  change no measurement, grading, or retry policy.
 - **Prefix ownership:** each collection owns a fresh `rack-bench/<run-id>/...`
   prefix. Create objects only beneath it; cleanup may list/delete only under
   that prefix, never any other key or the bucket root. Buckets may contain real
@@ -233,7 +245,7 @@ it.
 
 ## 9. Methodology (fixed; published in README when implemented)
 
-1. Fresh prefix `rack-bench/<ts>/` in a dedicated bench bucket.
+1. Fresh prefix `rack-bench/<ts>/` in every configured bench bucket.
 2. Path audit first (idle RTT) → DNS → small-object (idle TTFB baseline) →
    upload (loaded probes) → download → single-stream → TCP health last
    (retransmits aggregate tests 4–6).
