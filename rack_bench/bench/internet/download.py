@@ -4,7 +4,7 @@ reads only the options-local manifest and never manufactures a setup upload.
 """
 from rack_bench.common.models import Check
 from .s3client import S3Client
-from .targets import reason, run_prefix
+from .targets import bucket_names, reason, run_prefix
 from .transfer import ERRORS, MIB, plan, prerequisites, transfer_check, transfer_window
 
 
@@ -16,8 +16,9 @@ def download_reports(provider, options, *, client_factory=S3Client, window=trans
     if not state.get("up"):
         raise ValueError(f"needs internet.{provider}.upload objects from this run; no pre-seeded data")
     records = state["down"] = []
+    names = bucket_names(provider, options)
     for upload in state["up"]:
-        record = {key: upload[key] for key in ("region", "endpoint", "host", "band", "runs", "reason")}
+        record = {key: upload[key] for key in ("region", "endpoint", "host", "band", "runs", "reason", "buckets")}
         record["runs_detail"] = []
         records.append(record)
         if record["reason"]:
@@ -25,21 +26,28 @@ def download_reports(provider, options, *, client_factory=S3Client, window=trans
         if not upload["objects"] or any(r["status"] != "pass" for r in upload["runs_detail"]):
             record["reason"] = "needs completed objects from successful upload windows"
             continue
+        clients = {}
         try:
-            client = client_factory(options.buckets[provider], upload["region"], provider=provider)
+            # One client per bucket: each downloaded object is read from the
+            # bucket its upload record names, whatever the stream assignment.
+            for name in names:
+                clients[name] = client_factory(name, upload["region"], provider=provider)
         except ERRORS as exc:
+            for created in clients.values():
+                created.close()
             record["reason"] = f"{type(exc).__name__}: {reason(exc)}"
             continue
         for concurrency, kind, runs in plan(upload, options):
             for index in range(runs):
-                run, _ = window(client, direction="down", prefix=run_prefix(options),
+                run, _ = window(clients[names[0]], direction="down", prefix=run_prefix(options),
                                 concurrency=concurrency, duration=options.duration,
                                 objects=upload["objects"], owned=[], one_object=upload["band"] == "light",
-                                part_size=options.part_size * MIB,
-                                host=upload["host"] if provider == "r2" else f'{options.buckets[provider]}.{upload["host"]}')
+                                part_size=options.part_size * MIB, buckets=names, clients=clients,
+                                host=upload["host"] if provider == "r2" else f'{names[0]}.{upload["host"]}')
                 run.update(kind=kind, run=index)
                 record["runs_detail"].append(run)
-        client.close()  # parent-side pooled socket; worker sockets died with their threads/processes
+        for client in clients.values():
+            client.close()  # parent-side pooled sockets; worker sockets died with their threads/processes
     return records
 
 

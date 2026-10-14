@@ -440,7 +440,7 @@ Internet flags follow `bench internet`, not the `bench` parent.
 | `--directions up,down`          | Selected directions; down needs this run's uploads    |
 | `--profile quick\|certify`      | Default `quick`; certify requires `--yes`             |
 | `--regions s3=us-east-1,...`    | Override the tiered provider region matrix            |
-| `--buckets s3=<name>,r2=<name>` | Existing buckets; required for object probes          |
+| `--buckets s3=<n1>,s3=<n2>,...` | Existing buckets; a provider may repeat for sharding   |
 | `--concurrent N`                | Override quick's 32 streams or certify's sweep        |
 | `--duration 60s`                | Per-window duration; defaults: quick 60s, certify 5m  |
 | `--tool stdlib\|warp`           | Default `stdlib`; Warp execution unsupported          |

@@ -16,7 +16,7 @@ class Options:
     directions: tuple[str, ...] = DIRECTIONS
     profile: str = "quick"
     regions: dict[str, str] = field(default_factory=dict)
-    buckets: dict[str, str] = field(default_factory=dict)
+    buckets: dict[str, tuple[str, ...]] = field(default_factory=dict)
     concurrent: int | None = None
     duration: int | None = None  # seconds per test; defaults depend on profile
     object_size: int | None = None  # MiB per uploaded object; default depends on profile
@@ -33,6 +33,10 @@ class Options:
             self.duration = 300 if self.profile == "certify" else 60
         if self.part_size is None:
             self.part_size = 64  # MiB; see transfer.PART_SIZE for the timeout rationale
+        # Library callers may pass a bare name; normalize to the ordered tuple
+        # every consumer reads (targets.bucket_names).
+        self.buckets = {provider: (names,) if isinstance(names, str) else tuple(names)
+                        for provider, names in self.buckets.items()}
 
 
 def csv_choices(value, *, choices):
@@ -54,22 +58,50 @@ def regions(value):
     return result
 
 
+def _bucket_name(provider, bucket):
+    if not bucket:
+        raise argparse.ArgumentTypeError(f"empty bucket name for {provider}")
+    if (not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket) or
+            ".." in bucket or ".-" in bucket or "-." in bucket or
+            re.fullmatch(r"[0-9]+(?:\.[0-9]+){3}", bucket) or
+            provider == "s3" and "." in bucket):
+        raise argparse.ArgumentTypeError(
+            "expected provider=bucket pairs with DNS-compatible bucket names "
+            "(S3 virtual-hosted TLS names cannot contain dots)")
+    return bucket
+
+
 def buckets(value):
+    """One --buckets occurrence: provider=bucket pairs; a provider may repeat.
+
+    Repeated provider keys append buckets in flag order, so s3=one,s3=two is
+    two S3 buckets. The exact same name twice is a typo, not a shard.
+    """
     result = {}
     for item in value.split(","):
         provider, separator, bucket = item.strip().partition("=")
-        if (not separator or provider not in PROVIDERS or
-                not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket) or
-                ".." in bucket or ".-" in bucket or "-." in bucket or
-                re.fullmatch(r"[0-9]+(?:\.[0-9]+){3}", bucket) or
-                provider == "s3" and "." in bucket):
-            raise argparse.ArgumentTypeError(
-                "expected provider=bucket pairs with DNS-compatible bucket names "
-                "(S3 virtual-hosted TLS names cannot contain dots)")
-        if provider in result:
-            raise argparse.ArgumentTypeError(f"duplicate bucket for {provider}")
-        result[provider] = bucket
-    return result
+        if not separator or provider not in PROVIDERS:
+            raise argparse.ArgumentTypeError("expected provider=bucket pairs, e.g. s3=bench-1,r2=bench-2")
+        name = _bucket_name(provider, bucket)
+        names = result.setdefault(provider, [])
+        if name in names:
+            raise argparse.ArgumentTypeError(f"duplicate bucket for {provider}: {name}")
+        names.append(name)
+    return {provider: tuple(names) for provider, names in result.items()}
+
+
+class merge_buckets(argparse.Action):
+    """--buckets may itself repeat; occurrences merge per provider in order."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        merged = dict(getattr(namespace, self.dest) or {})
+        for provider, names in values.items():
+            combined = merged.get(provider, ()) + tuple(names)
+            duplicates = sorted({name for name in combined if combined.count(name) > 1})
+            if duplicates:
+                raise argparse.ArgumentError(self, f"duplicate bucket for {provider}: {','.join(duplicates)}")
+            merged[provider] = combined
+        setattr(namespace, self.dest, merged)
 
 
 def positive_int(value):
@@ -107,8 +139,9 @@ def add_arguments(parser):
     parser.add_argument("--profile", choices=("quick", "certify"), default="quick")
     parser.add_argument("--regions", type=regions, default={}, metavar="PROVIDER=REGION,...",
                         help="region overrides; otherwise use provider defaults")
-    parser.add_argument("--buckets", type=buckets, default={}, metavar="PROVIDER=BUCKET,...",
-                        help="existing buckets, e.g. s3=my-bench,r2=my-bench; required for object probes")
+    parser.add_argument("--buckets", type=buckets, action=merge_buckets, default={}, metavar="PROVIDER=BUCKET,...",
+                        help="existing buckets; a provider may repeat (in the list or the flag) "
+                             "to shard streams across buckets, e.g. s3=bench-1,s3=bench-2; required for object probes")
     parser.add_argument("--concurrent", type=positive_int, metavar="N",
                         help="parallel streams (default: 32)")
     parser.add_argument("--duration", type=duration_seconds, metavar="DURATION",

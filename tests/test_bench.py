@@ -1,4 +1,5 @@
 """Bench dispatch and internet CLI contracts; no credentials or network required."""
+import argparse
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from io import StringIO
@@ -57,7 +58,7 @@ class BenchTests(unittest.TestCase):
             self.assertEqual(main([
                 "bench", "internet", "--providers", "gcs,s3", "--directions", "down",
                 "--profile", "certify", "--regions", "s3=us-east-1,gcs=us-central1",
-                "--buckets", "s3=bench-s3,gcs=bench-gcs",
+                "--buckets", "s3=bench-s3,s3=bench-s3b", "--buckets", "gcs=bench-gcs",
                 "--concurrent", "8", "--duration", "2m", "--object-size", "256",
                 "--part-size", "16", "--tool", "warp", "--keep-data", "--yes",
                 "--json", "export.json", "--run-dir", "artifacts", "--show-command", "--quiet",
@@ -65,7 +66,7 @@ class BenchTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["options"], internet.Options(
             providers=("gcs", "s3"), directions=("down",), profile="certify",
             regions={"s3": "us-east-1", "gcs": "us-central1"},
-            buckets={"s3": "bench-s3", "gcs": "bench-gcs"}, concurrent=8, duration=120,
+            buckets={"s3": ("bench-s3", "bench-s3b"), "gcs": ("bench-gcs",)}, concurrent=8, duration=120,
             object_size=256, part_size=16, tool="warp", keep_data=True, yes=True))
         self.assertEqual(run.call_args.kwargs["json_target"], "export.json")
         self.assertEqual(run.call_args.kwargs["run_dir"], "artifacts")
@@ -80,6 +81,26 @@ class BenchTests(unittest.TestCase):
                 main(["bench", "internet", *flags])
                 self.assertEqual(run.call_args.kwargs["options"].duration, seconds)
 
+    def test_bucket_flags_parse_merge_and_reject_clear_errors(self):
+        # A provider may repeat inside one list and across repeated --buckets
+        # flags; both merge in order. Single-bucket input stays a 1-tuple.
+        self.assertEqual(internet.cli.buckets("s3=bench"), {"s3": ("bench",)})
+        self.assertEqual(internet.cli.buckets("s3=one,s3=two,r2=r2bench"),
+                         {"s3": ("one", "two"), "r2": ("r2bench",)})
+        for value in ("", "azure=x", "s3=", "s3=bench,", "s3=bench,s3=bench",
+                      "s3=dotted.bucket", "r2=bad..bucket", "r2=127.0.0.1", "s3=a=b"):
+            with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError) as error:
+                internet.cli.buckets(value)
+            self.assertIn("bucket", str(error.exception))
+        parser = argparse.ArgumentParser()
+        internet.add_arguments(parser)
+        merged = parser.parse_args(["--buckets", "s3=one", "--buckets", "s3=two,r2=r2bench"])
+        self.assertEqual(merged.buckets, {"s3": ("one", "two"), "r2": ("r2bench",)})
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit) as exit_status:
+            parser.parse_args(["--buckets", "s3=one", "--buckets", "s3=one"])
+        self.assertEqual(exit_status.exception.code, 2)
+        self.assertEqual(parser.parse_args([]).buckets, {})
+
     def test_invalid_flags_rejected_before_dispatch(self):
         cases = [
             ("--providers", "azure"), ("--providers", "s3,s3"), ("--providers", "s3,"),
@@ -92,7 +113,7 @@ class BenchTests(unittest.TestCase):
             ("--regions", "s3=east,s3=west"), ("--regions", "s3=a=b"),
             ("--regions", "s3=east,"), ("--regions", ""), ("--unknown", "x"),
             ("--buckets", ""), ("--buckets", "azure=bench"), ("--buckets", "s3="),
-            ("--buckets", "s3=bench,s3=other"), ("--buckets", "s3=ab"),
+            ("--buckets", "s3=bench,s3=bench"), ("--buckets", "s3=ab"),
             ("--buckets", "s3=dotted.bucket"), ("--buckets", "r2=bad..bucket"),
             ("--buckets", "r2=127.0.0.1"), ("--buckets", "s3=bench,"),
         ]

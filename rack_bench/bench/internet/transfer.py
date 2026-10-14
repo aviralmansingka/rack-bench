@@ -28,7 +28,7 @@ from rack_bench.common.models import Check
 from .latency import timing_sample
 from .s3client import S3Client, S3Error, ProtocolError, SeededPayload, set_chunk_cache_limit
 from .stats import describe, windows
-from .targets import reason, run_prefix, targets
+from .targets import bucket_names, reason, run_prefix, targets
 from .tcp import TCPWindow
 
 MIB = 1024 ** 2
@@ -120,32 +120,36 @@ def _thread_pool_factory(concurrency, *, initializer=None, initargs=()):
 
 
 _POOL_STATE = {}
-"""Worker-process state (client, stop event) set by _pool_initialiser.
+"""Worker-process state (per-bucket clients, stop event) set by _pool_initialiser.
 
 Only worker processes populate this; the parent and in-process worker threads
-receive the client and stop event through the task spec instead, so stale
+receive the clients and stop event through the task spec instead, so stale
 parent-side state can never leak into a threaded window.
 """
 
 
-def _pool_initialiser(client_config, stop, pid_slots, chunk_limit, echo):
-    """Worker-process setup: own S3Client, shared stop event, pid registration.
+def _pool_initialiser(client_configs, stop, pid_slots, chunk_limit, echo):
+    """Worker-process setup: own S3Client per bucket, shared stop event, pid registration.
 
     S3Client is not picklable (its connection pool is threading.local), so each
     child constructs its own from plain config and thereby keeps its own warm
-    pooled TLS connection across objects. The stop event and pid slots arrive
-    through the pool initargs, which travel via Process construction rather
-    than the task queue, so synchronization primitives remain shareable.
+    pooled TLS connection across objects. client_configs carries one
+    (bucket, endpoint, timeout, control_retries, backoff) tuple per bucket in
+    the window: multi-bucket windows give every worker process a client for
+    every bucket, and each stream uses only its assigned bucket, so only one
+    pooled connection per worker materializes. The stop event and pid slots
+    arrive through the pool initargs, which travel via Process construction
+    rather than the task queue, so synchronization primitives remain shareable.
     chunk_limit re-caps this process's chunk cache: bulk workers each cache the
     same run-shared payload bytes, so N processes must not each hold the
     parent-side cap; one part's worth of chunks keeps the current part hot.
     The operation-echo contextvar does not cross process boundaries; the
     parent's callback is passed in and re-installed explicitly.
     """
-    bucket, endpoint, timeout, control_retries, backoff = client_config
-    _POOL_STATE["client"] = S3Client(bucket, endpoint.region, endpoint=endpoint,
-                                     timeout=timeout, control_retries=control_retries,
-                                     backoff=backoff)
+    _POOL_STATE["clients"] = {
+        bucket: S3Client(bucket, endpoint.region, endpoint=endpoint, timeout=timeout,
+                         control_retries=control_retries, backoff=backoff)
+        for bucket, endpoint, timeout, control_retries, backoff in client_configs}
     _POOL_STATE["stop"] = stop
     set_chunk_cache_limit(chunk_limit)
     operation_echo.set(echo)
@@ -160,16 +164,20 @@ def _transfer_worker(spec):
     """One scheduled transfer stream; validates each part/range, returns results.
 
     Runs as an in-process worker thread (single-stream windows) or inside a
-    worker process (bulk windows). Per-part validation -- timing shape,
-    monotonic progress, byte accounting -- happens here, before anything is
-    accepted. Nothing is shared with the scheduler: the worker returns
-    (samples, points, completed, errors, owned_keys, incomplete_objects,
-    attempted_bytes) and the parent merges. owned_keys are collected before
-    each upload attempt so ambiguous PUTs stay cleanable even when the worker
+    worker process (bulk windows). spec["bucket"] is this stream's assigned
+    bucket (round-robin at window start); spec["clients"] maps bucket name to
+    client in-process, and worker processes resolve the same mapping from
+    _POOL_STATE. Downloads read each object from ITS recorded bucket, not the
+    stream's assignment. Per-part validation -- timing shape, monotonic
+    progress, byte accounting -- happens here, before anything is accepted.
+    Nothing is shared with the scheduler: the worker returns (samples, points,
+    completed, errors, owned_keys, incomplete_objects, attempted_bytes) and the
+    parent merges. owned_keys are (bucket, key) pairs collected before each
+    upload attempt so ambiguous PUTs stay cleanable even when the worker
     reports them only at completion. A failing worker sets the shared stop
     event so sibling workers exit at their next check.
     """
-    client = spec["client"] if spec["client"] is not None else _POOL_STATE["client"]
+    clients = spec["clients"] if spec["clients"] is not None else _POOL_STATE["clients"]
     stop = spec["stop"] if spec["stop"] is not None else _POOL_STATE["stop"]
     clock, deadline, start, active = spec["clock"], spec["deadline"], spec["start"], spec["active"]
     samples, points, completed, errors, owned_keys = [], [], [], [], []
@@ -177,8 +185,16 @@ def _transfer_worker(spec):
     index, iteration = spec["index"], 0
     while not stop.is_set() and (iteration == 0 or clock() < deadline):
         direction = spec["direction"]
-        key = f'{spec["prefix"]}{index}-{iteration}.bin' if direction == "up" else spec["objects"][index % len(spec["objects"])]["key"]
-        payload = SeededPayload(spec["seed"] if spec["seed"] is not None else key, spec["size"]) if direction == "up" else SeededPayload(**spec["objects"][index % len(spec["objects"])]["payload"])
+        if direction == "up":
+            bucket = spec["bucket"]
+            key = f'{spec["prefix"]}{index}-{iteration}.bin'
+            payload = SeededPayload(spec["seed"] if spec["seed"] is not None else key, spec["size"])
+        else:
+            record = spec["objects"][index % len(spec["objects"])]
+            bucket = record.get("bucket") or spec["bucket"]  # recorded bucket; fallback for bare manifests
+            key = record["key"]
+            payload = SeededPayload(**record["payload"])
+        client = clients[bucket]
         pending, last, part_number = {}, 0, 0
         cpu_start = time.thread_time()
 
@@ -200,7 +216,7 @@ def _transfer_worker(spec):
             sample = sample_timing(response.timing, count, direction)
             if sum(pending.values()) != count:
                 raise ProtocolError("progress bytes differ from measured transfer", timing=response.timing)
-            sample.update(bytes=count, key=key, part=part_number, cpu_ms=(time.thread_time() - cpu_start) * 1000)
+            sample.update(bytes=count, key=key, part=part_number, bucket=bucket, cpu_ms=(time.thread_time() - cpu_start) * 1000)
             samples.append(sample)
             points.extend(pending.items())
             pending.clear()
@@ -210,14 +226,14 @@ def _transfer_worker(spec):
 
         try:
             if direction == "up":
-                owned_keys.append(key)
+                owned_keys.append((bucket, key))
                 _echo(f"multipart PUT {object_url(client, key)} ({payload.size} bytes)")
                 def on_part(response):
                     accept(response, min(spec["part_size"], payload.size - part_number * spec["part_size"]))
                     if part_number * spec["part_size"] < payload.size and (stop.is_set() or not spec["one_object"] and clock() >= deadline):
                         raise _WindowEnded("profile window ended; abort incomplete multipart")
                 client.multipart_upload(key, payload, part_size=spec["part_size"], on_part=on_part, on_progress=progress)
-                completed.append({"key": key, "payload": {"seed": payload.seed, "size": payload.size, "chunk_size": payload.chunk_size}})
+                completed.append({"key": key, "bucket": bucket, "payload": {"seed": payload.seed, "size": payload.size, "chunk_size": payload.chunk_size}})
             else:
                 # One stream reads one uploaded object in bounded, verified ranges.
                 for offset in range(0, payload.size, spec["part_size"]):
@@ -229,7 +245,7 @@ def _transfer_worker(spec):
                     accept(response, count)
                     if offset + count < payload.size and (stop.is_set() or not spec["one_object"] and clock() >= deadline):
                         raise _WindowEnded("profile window ended at range boundary")
-                completed.append({"key": key})
+                completed.append({"key": key, "bucket": bucket})
         except _WindowEnded as exc:
             incomplete_objects += 1
             if exc.cleanup_error:
@@ -249,7 +265,7 @@ def _transfer_worker(spec):
 def transfer_window(client, *, direction, prefix, concurrency, duration, objects,
                     owned, size=OBJECT_SIZE, one_object=False, loaded=None,
                     clock=time.monotonic, tcp_factory=TCPWindow, host="", loaded_interval=1.0,
-                    part_size=None, seed=None, pool_factory=None):
+                    part_size=None, seed=None, pool_factory=None, buckets=None, clients=None):
     """Schedule until deadline, drain the current part/range; report actual wall time.
 
     No object-sized buffers. Validate each measured part/range before accepting
@@ -261,6 +277,15 @@ def transfer_window(client, *, direction, prefix, concurrency, duration, objects
     caches in s3client turn the signed-digest pre-pass and chunk regeneration
     into hits. seed=None falls back to the object key, matching stored records.
 
+    Bucket scoping: buckets is the ordered name tuple for this window (default:
+    the passed client's bucket). Bulk windows assign stream i to
+    buckets[i mod len(buckets)] round-robin at window start -- the per-bucket
+    sharding experiment; single-stream windows use buckets[0]. clients maps
+    bucket name to client for in-process windows (default: every name maps to
+    the passed client); worker processes build their own per-bucket clients
+    from the plain configs in the pool initargs. The passed client itself is
+    the first bucket's client and serves the parent-side loaded-latency probe.
+
     Execution scoping: concurrency > 1 windows schedule one worker per process
     (pool_factory=None picks _process_pool_factory) so the data path escapes the
     GIL; concurrency 1 windows keep in-process threads (_thread_pool_factory).
@@ -271,6 +296,8 @@ def transfer_window(client, *, direction, prefix, concurrency, duration, objects
     """
     if part_size is None:
         part_size = PART_SIZE  # resolved per call so tests can patch the default
+    names = tuple(buckets) if buckets is not None else (client.bucket,)
+    in_process = {name: (clients or {}).get(name, client) for name in names}
     out_of_process = concurrency > 1 and pool_factory in (None, _process_pool_factory)
     factory = pool_factory or (_process_pool_factory if out_of_process else _thread_pool_factory)
     stop, pid_slots, initializer, initargs = threading.Event(), None, None, ()
@@ -282,7 +309,11 @@ def transfer_window(client, *, direction, prefix, concurrency, duration, objects
         # parent-pid ss filter. The array and event travel via pool initargs.
         pid_slots = context.Array("i", concurrency)
         initializer = _pool_initialiser
-        initargs = ((client.bucket, client.endpoint, client.timeout, client.control_retries, client.backoff),
+        # One plain config per bucket; each worker process builds a client for
+        # every bucket, then streams only to its assigned one.
+        initargs = (tuple((name, in_process[name].endpoint, in_process[name].timeout,
+                           in_process[name].control_retries, in_process[name].backoff)
+                          for name in names),
                     stop, pid_slots, part_size, operation_echo.get())
 
     def pids():
@@ -303,7 +334,8 @@ def transfer_window(client, *, direction, prefix, concurrency, duration, objects
         return {"direction": direction, "prefix": prefix, "index": index, "objects": objects,
                 "size": size, "one_object": one_object, "deadline": deadline, "start": start,
                 "part_size": part_size, "seed": seed, "clock": clock,
-                "client": None if out_of_process else client,
+                "bucket": names[index % len(names)],
+                "clients": None if out_of_process else in_process,
                 "stop": None if out_of_process else stop,
                 "active": None if out_of_process else active}
 
@@ -396,7 +428,7 @@ def prerequisites(provider, options, direction):
     selected = targets(provider, options)
     if direction not in options.directions:
         raise ValueError(f"direction {direction} disabled by --directions")
-    if not options.buckets.get(provider):
+    if not bucket_names(provider, options):
         raise ValueError(f"missing bucket configuration: --buckets {provider}=<name>")
     if options.tool != "stdlib":
         raise ValueError("Warp execution not implemented; use --tool stdlib")
@@ -433,7 +465,8 @@ def transfer_check(provider, direction, metric, options, records):
     if primary.get("cleanup_errors"):
         chosen = None
     singles = next((reduce_runs(runs) for (kind, _), runs in groups.items() if kind == "single"), None)
-    detail = {"regions": records, "selection": "nearest; median of 3 by MiB/s per concurrency, scalar is largest concurrency; all runs retained",
+    detail = {"regions": records, "buckets": list(bucket_names(provider, options)),
+              "selection": "nearest; median of 3 by MiB/s per concurrency, scalar is largest concurrency; all runs retained",
               "single_stream_mib_per_sec": singles["mib_per_sec"] if singles else None,
               "timing_semantics": "schedule for duration, drain current part/range; abort incomplete multipart; actual elapsed denominator includes hashing/verification/control; per-op CPU is thread CPU",
               "single_stream": {}}
@@ -468,24 +501,25 @@ def transfer_check(provider, direction, metric, options, records):
                             "needs valid sustained transfer runs (all 3 for certify reduction)")
     return Check(f"internet.{provider}.{suffix}.{metric}", "pass" if chosen else "skip",
                  chosen["mib_per_sec" if metric == "throughput" else "objs_per_sec"] if chosen else None,
-                 detail=json.dumps(detail), source=[f'{"multipart PUT" if direction == "up" else "verified range GET"} {r["endpoint"]} bucket={options.buckets[provider]} prefix={run_prefix(options)}' for r in records])
+                 detail=json.dumps(detail), source=[f'{"multipart PUT" if direction == "up" else "verified range GET"} {r["endpoint"]} buckets={",".join(bucket_names(provider, options))} prefix={run_prefix(options)}' for r in records])
 
 
 def cleanup(options):
-    """No listings: delete exact owned keys, even after ambiguous PUT responses."""
-    for client, record, prefix in getattr(options, "_transfer_owners", []):
+    """No listings: delete exact owned (bucket, key) pairs, even after ambiguous PUTs."""
+    for clients, record, prefix in getattr(options, "_transfer_owners", []):
         if options.keep_data:
             record["cleanup"] = "retained (--keep-data)"
             continue
         errors = []
-        for key in record["owned"]:
+        for bucket, key in record["owned"]:
             try:
                 if not key.startswith(prefix) or not prefix.startswith(run_prefix(options)):
                     raise ValueError("refusing cleanup outside owned prefix")
-                _echo(f"DELETE {object_url(client, key)}")
-                client.delete_object(key)
+                _echo(f"DELETE {object_url(clients[bucket], key)}")
+                clients[bucket].delete_object(key)
             except ERRORS as exc:
-                errors.append({"key": key, "reason": reason(exc)})
+                errors.append({"bucket": bucket, "key": key, "reason": reason(exc)})
         record["cleanup"] = "failed" if errors else "deleted exact owned keys"
         record["cleanup_errors"] = errors
-        client.close()  # pooled socket teardown after the final owned-key DELETE
+        for client in clients.values():
+            client.close()  # pooled socket teardown after the final owned-key DELETE

@@ -7,7 +7,7 @@ from rack_bench.common.host import _echo
 from rack_bench.common.models import Check
 from .s3client import CredentialError, ProtocolError, S3Client, S3Error, SeededPayload
 from .stats import describe
-from .targets import reason, run_prefix, targets
+from .targets import bucket_names, reason, run_prefix, targets
 
 OBJECT_SIZE = 100 * 1024
 SAMPLES = 20  # Also the hard per-far-band GET budget.
@@ -36,9 +36,10 @@ def latency_probe(provider, options, *, client_factory=S3Client, cpu_clock=time.
         selected = targets(provider, options)
     except ValueError as exc:
         return Check(name, "skip", detail=reason(exc))
-    bucket = options.buckets.get(provider)
-    if not bucket:
+    names = bucket_names(provider, options)
+    if not names:
         return Check(name, "skip", detail=f"missing bucket configuration: --buckets {provider}=<name>")
+    bucket = names[0]  # the sequential TTFB baseline is a single-bucket probe
     if options.tool != "stdlib":
         return Check(name, "skip", detail="Warp execution not implemented; use --tool stdlib")
     prefix = run_prefix(options)

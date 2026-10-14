@@ -32,6 +32,17 @@ def reason(exc):
     return str(exc)
 
 
+def bucket_names(provider, options):
+    """Ordered bucket names for a provider; the first name is the default.
+
+    Options normalizes values to tuples at construction; this helper also
+    accepts a bare string for library callers that assign Options.buckets
+    directly. Order is flag order and is the round-robin assignment order.
+    """
+    names = options.buckets.get(provider) or ()
+    return (names,) if isinstance(names, str) else tuple(names)
+
+
 def run_prefix(options):
     if not hasattr(options, "_internet_prefix"):
         options._internet_prefix = f"rack-bench/{uuid4().hex}/"

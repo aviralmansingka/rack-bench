@@ -9,7 +9,7 @@ from rack_bench.common.models import Check
 from .latency import OBJECT_SIZE as LATENCY_SIZE
 from .s3client import S3Client, SeededPayload
 from .stats import describe
-from .targets import reason, run_prefix, run_seed
+from .targets import bucket_names, reason, run_prefix, run_seed
 from .transfer import (ERRORS, LIGHT_SIZE, MIB, OBJECT_SIZE, baseline, object_url, plan,
                        prerequisites, sample_timing, transfer_check, transfer_window)
 
@@ -20,23 +20,30 @@ def upload_reports(provider, options, *, client_factory=S3Client, window=transfe
     if "up" in state:
         return state["up"]
     records = state["up"] = []
+    names = bucket_names(provider, options)
     for target in selected:
-        record = dict(target, runs_detail=[], objects=[], owned=[], cleanup="pending collection finalizer")
+        record = dict(target, runs_detail=[], objects=[], owned=[], buckets=list(names),
+                      cleanup="pending collection finalizer")
         records.append(record)
         if target["reason"]:
             continue
         prefix = f'{run_prefix(options)}{provider}/{target["region"]}/transfer/'
+        clients = {}
         try:
-            client = client_factory(options.buckets[provider], target["region"], provider=provider)
+            for name in names:
+                clients[name] = client_factory(name, target["region"], provider=provider)
         except ERRORS as exc:
+            for created in clients.values():
+                created.close()
             record["reason"] = f"{type(exc).__name__}: {reason(exc)}"
             record["cleanup"] = "no client or objects created"
             continue
-        options.__dict__.setdefault("_transfer_owners", []).append((client, record, prefix))
+        client = clients[names[0]]  # first bucket: loaded-latency probe and TCP host anchor
+        options.__dict__.setdefault("_transfer_owners", []).append((clients, record, prefix))
         loaded = None
         if target["band"] == "nearest" and baseline(provider, options) is not None:
             key = prefix + "loaded.bin"
-            record["owned"].append(key)
+            record["owned"].append((names[0], key))
             record["loaded_key"] = key
             payload = SeededPayload(run_seed(options), LATENCY_SIZE)
             try:
@@ -62,12 +69,16 @@ def upload_reports(provider, options, *, client_factory=S3Client, window=transfe
                 run, objects = window(client, direction="up", prefix=f"{prefix}{kind}-{concurrency}-{index}/",
                                       concurrency=concurrency, duration=options.duration, objects=[], owned=record["owned"],
                                       size=size, part_size=options.part_size * MIB, seed=run_seed(options),
+                                      buckets=names, clients=clients,
                                       one_object=target["band"] == "light", loaded=loaded if kind == "bulk" else None,
-                                      host=target["host"] if provider == "r2" else f'{options.buckets[provider]}.{target["host"]}')
+                                      # ss diagnostics anchor to the first bucket's virtual host;
+                                      # sibling buckets share the endpoint IPs in practice
+                                      host=target["host"] if provider == "r2" else f'{names[0]}.{target["host"]}')
                 run.update(kind=kind, run=index)
                 record["runs_detail"].append(run)
                 record["objects"].extend(objects)
-        client.close()  # parent-side pooled socket; worker sockets died with their threads/processes
+        for entry in clients.values():
+            entry.close()  # parent-side pooled sockets; worker sockets died with their threads/processes
     return records
 
 
@@ -117,4 +128,4 @@ def loaded_probe(provider, options):
     if not valid:
         detail["reason"] = records[0].get("loaded_reason", "needs valid concurrent TTFB samples inside successful upload windows")
     return Check(name, "pass" if valid else "skip", stats["p95"] if valid else None,
-                 detail=json.dumps(detail), source=[f'concurrent verified GET {records[0]["endpoint"]} bucket={options.buckets[provider]} key={records[0].get("loaded_key")}; upload windows only'])
+                 detail=json.dumps(detail), source=[f'concurrent verified GET {records[0]["endpoint"]} buckets={",".join(bucket_names(provider, options))} key={records[0].get("loaded_key")}; upload windows only'])
