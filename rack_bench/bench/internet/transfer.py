@@ -27,7 +27,7 @@ from rack_bench.common.host import _echo, operation_echo
 from rack_bench.common.models import Check
 from .latency import timing_sample
 from .s3client import S3Client, S3Error, ProtocolError, SeededPayload, set_chunk_cache_limit
-from .stats import describe, windows
+from .stats import describe, steadiness, windows
 from .targets import bucket_names, reason, run_prefix, targets
 from .tcp import TCPWindow
 
@@ -89,6 +89,71 @@ def bdp(single, multi, window_bytes, rtt_ms):
             "finding": "possible node-side window/loss defect" if single < expected / 2 and multi and multi >= expected else
                        "compare measured single stream with window/RTT; 5 Gbit/s cap",
             "reference": "RFC 6349; diagnostic ratios, not certification thresholds"}
+
+
+def ttfb_ms(sample, direction):
+    """First-byte latency of one measured op, in ms: GET body TTFB; PUT
+    status-line turnaround (part responses carry no body, so the service's
+    first response byte is the turnaround point)."""
+    return sample["body_first_byte_ms"] if direction == "down" else sample["response_first_byte_ms"]
+
+
+def post_ttfb_mib_per_sec(sample, direction):
+    """Streaming rate after first byte, in MiB/s: GET body span (total minus
+    body TTFB; includes verification). The PUT body streams before the service
+    responds, so the PUT span runs from connect to the first response byte
+    (request phase: wire plus service ingest). A zero span has no rate."""
+    span_ms = (sample["total_ms"] - sample["body_first_byte_ms"] if direction == "down"
+               else sample["response_first_byte_ms"] - sample["connect_ms"])
+    return sample["bytes"] / MIB / (span_ms / 1000) if span_ms > 0 else None
+
+
+CEILING_THRESHOLDS = {"busy_pct": 80.0, "limit_pct": 20.0, "retransmit_pct": 1.0,
+                      "flat_p95_p50": 1.2, "bursty_p95_p50": 2.0}
+"""Shape splits for ceiling attribution, diagnostics only (never pass/fail).
+
+busy_pct: median socket busy share that marks a service-paced window.
+limit_pct: median rwnd/cwnd/sndbuf-limited share that names a socket limiter
+(the kernel reports these only when nonzero). retransmit_pct matches the
+retransmit probe's high band and is a PERCENT: 1.0 means 1%, not 100%.
+flat/bursty bound the 1 s bucket p95/p50 spread (spec A.2: ~1.0-1.2 stable,
+>2 unstable)."""
+
+
+def ceiling_verdict(bucket_stats, limits, retransmit_pct):
+    """Map one window's profiling signals to a single STE finding: why the
+    measured ceiling exists.
+
+    bucket_stats is the describe() of the 1 s throughput buckets; limits is the
+    window's ss socket-limit aggregate (None or tickless when no owned socket
+    was observed); retransmit_pct is the window retransmit ratio in PERCENT.
+    Priority: a named socket limiter, then loss, then bucket shape. A flat
+    ceiling with clean sockets points past TCP at a policer, the wire, or a
+    per-client cap. Reference: tcp_info socket time shares and bucket
+    percentiles; diagnostic thresholds, not certification gates."""
+    gate = CEILING_THRESHOLDS
+    spread = bucket_stats["p95"] / bucket_stats["p50"] if bucket_stats.get("p50") else None
+
+    def median(name):
+        return limits.get(f"{name}_pct_median") if limits else None
+
+    rwnd, cwnd, sndbuf, busy = (median(name) for name in ("rwnd_limited", "cwnd_limited", "sndbuf_limited", "busy"))
+    low = all(share is None or share < gate["limit_pct"] for share in (rwnd, cwnd, sndbuf))
+    if rwnd is not None and rwnd >= gate["limit_pct"]:
+        finding = "receive-window limited"
+    elif (cwnd is not None and cwnd >= gate["limit_pct"]) or (retransmit_pct is not None and retransmit_pct >= gate["retransmit_pct"]):
+        finding = "congestion or loss"
+    elif sndbuf is not None and sndbuf >= gate["limit_pct"]:
+        finding = "send-buffer limited"
+    elif spread is not None and spread >= gate["bursty_p95_p50"]:
+        finding = "bursty"
+    elif spread is not None and spread <= gate["flat_p95_p50"] and low:
+        finding = "service-paced" if busy is not None and busy >= gate["busy_pct"] else "flat ceiling, clean sockets"
+    else:
+        finding = "no dominant ceiling signature"
+    return {"finding": finding,
+            "reference": "tcp_info socket time shares, 1 s bucket percentiles, retransmit percent "
+                         "(1.0 = 1%); diagnostic thresholds, not certification gates"}
 
 
 def throughput_buckets(points, elapsed):
@@ -412,6 +477,7 @@ def transfer_window(client, *, direction, prefix, concurrency, duration, objects
     elapsed = end - start
     buckets = throughput_buckets(points, elapsed) if elapsed > 0 else []
     stats = describe([b["mib_per_sec"] for b in buckets])
+    rates = [rate for rate in (post_ttfb_mib_per_sec(s, direction) for s in samples) if rate is not None]
     valid_bytes = sum(s["bytes"] for s in samples)
     valid = not errors and elapsed > 0 and valid_bytes > 0
     result = {"status": "pass" if valid else "skip", "concurrency": concurrency,
@@ -423,8 +489,26 @@ def transfer_window(client, *, direction, prefix, concurrency, duration, objects
               "samples": samples, "latency_ms": describe([s["total_ms"] for s in samples]),
               "buckets": buckets, "bucket_stats": stats,
               "p95_p50_ratio": stats["p95"] / stats["p50"] if stats["p50"] else None,
+              "steadiness_ratio": steadiness([b["mib_per_sec"] for b in buckets]),
+              "ttfb_ms": describe([ttfb_ms(s, direction) for s in samples]),
+              "post_ttfb_mib_per_sec": describe(rates),
+              "ceiling": ceiling_verdict(stats, tcp.detail.get("limits"), tcp.detail.get("ratio_pct")),
               "errors": errors, "loaded_samples": loaded_samples, "loaded_errors": loaded_errors,
               "loaded_bytes": loaded_bytes, "tcp": tcp.detail}
+    if len(names) > 1:
+        # Multi-bucket windows keep per-bucket sample evidence; buckets without a
+        # measured sample stay absent, never a zero rate. The 1 s bucket stream
+        # itself is not bucket-tagged, so per-bucket steady shape is not claimed.
+        grouped = {}
+        for sample in samples:
+            grouped.setdefault(sample["bucket"], []).append(sample)
+        result["per_bucket"] = {
+            name: {"bytes": sum(s["bytes"] for s in group),
+                   "mib_per_sec": sum(s["bytes"] for s in group) / MIB / elapsed if elapsed > 0 else None,
+                   "ttfb_ms": describe([ttfb_ms(s, direction) for s in group]),
+                   "post_ttfb_mib_per_sec": describe(
+                       [r for r in (post_ttfb_mib_per_sec(s, direction) for s in group) if r is not None])}
+            for name, group in grouped.items()}
     if not valid:
         result["reason"] = "invalid/failed transfer samples" if errors else "no complete verified transfer in window"
     return result, completed
@@ -494,7 +578,13 @@ def transfer_check(provider, direction, metric, options, records):
     detail["single_stream"] = primary.get("single_stream", {})
     if chosen:
         detail.update(bucket_stats=chosen["bucket_stats"], p95_p50_ratio=chosen["p95_p50_ratio"],
-                      retransmit_pct=chosen["tcp"]["ratio_pct"])
+                      retransmit_pct=chosen["tcp"]["ratio_pct"],
+                      steadiness_ratio=chosen.get("steadiness_ratio"),
+                      ttfb_ms=chosen.get("ttfb_ms"), post_ttfb_mib_per_sec=chosen.get("post_ttfb_mib_per_sec"),
+                      socket_limits=chosen["tcp"].get("limits"), ceiling=chosen.get("ceiling"))
+        if chosen.get("per_bucket"):
+            # Multi-bucket runs only: per-bucket sample evidence, additive.
+            detail["per_bucket"] = chosen["per_bucket"]
         if direction == "down":
             # Generic grading over shared run state; no direction-policy callbacks.
             uploads = getattr(options, "_transfer_reports", {}).get(provider, {}).get("up", [])

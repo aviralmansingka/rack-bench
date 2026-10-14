@@ -1,7 +1,7 @@
 """Pure synthetic samples; no clock or I/O."""
 import unittest
 
-from rack_bench.bench.internet.stats import describe, percentile, windows
+from rack_bench.bench.internet.stats import describe, percentile, steadiness, windows
 
 
 class StatsTests(unittest.TestCase):
@@ -35,3 +35,9 @@ class StatsTests(unittest.TestCase):
                 windows([], duration)
         with self.assertRaises(ValueError):
             windows([(float("nan"), 1)])
+
+    def test_steadiness_flat_bursty_and_unmeasured(self):
+        self.assertEqual(steadiness([100] * 5), 1.0)  # flat ceiling
+        self.assertAlmostEqual(steadiness([10, 20, 100]), 20 / 92)  # p50 20, p95 92
+        self.assertIsNone(steadiness([]))  # no buckets, no invented ratio
+        self.assertIsNone(steadiness([0, 0]))  # p95 0: no measurable shape

@@ -35,9 +35,12 @@ def internet_summary(value):
         if check.get("status") == "pass":
             rates.append(f"{direction}={check['value']:.2f} MiB/s")
     counts = Counter(check["status"] for check in checks.values())
+    ceiling = value.get("ceiling") or {}
+    attribution = "".join(f" {direction}={ceiling[direction]}" for direction in ("upload", "download") if direction in ceiling)
     payload = value.get("bytes", {})
     return (f"{value['region']} {value['endpoint']} tool={value['tool']}; " +
             ", ".join(rates or ["no sustained rate observed"]) +
+            (f"; ceiling{attribution}" if attribution else "") +
             f"; bytes up={payload.get('uploaded', 0)} down={payload.get('downloaded', 0)}; " +
             " ".join(f"{status.upper()}={counts[status]}" for status in ("pass", "warn", "fail", "skip")))
 

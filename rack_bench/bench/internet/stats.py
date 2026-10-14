@@ -27,6 +27,12 @@ def describe(samples):
             **{f"p{p}": percentile(values, p) for p in (50, 95, 99)}}
 
 
+def steadiness(samples):
+    """p50/p95 of a throughput population; near 1.0 is a flat ceiling, low is bursty."""
+    p50, p95 = percentile(samples, 50), percentile(samples, 95)
+    return p50 / p95 if p50 is not None and p95 else None
+
+
 def windows(samples, duration=1.0, *, origin=0.0):
     """Return populated fixed-duration windows, ordered by start time.
 

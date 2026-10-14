@@ -31,11 +31,22 @@ def summary(provider, options):
             if direction == "up":
                 totals["uploaded"] += region.get("loaded_setup_bytes", 0)
                 totals["downloaded"] += sum(r.get("loaded_bytes", 0) for r in region["runs_detail"])
+    ceiling = {}
+    for label in ("upload", "download"):
+        check = checks.get(f"internet.{provider}.{label}.throughput")
+        if check and check.status == "pass":
+            try:  # plain-text SKIP reasons carry no JSON; absent findings stay absent
+                finding = json.loads(check.detail).get("ceiling", {}).get("finding")
+            except (ValueError, TypeError, AttributeError):
+                finding = None
+            if finding:
+                ceiling[label] = finding
     value = {"region": selected[0]["region"], "endpoint": selected[0]["endpoint"], "tool": options.tool,
-             "bytes": totals, "checks": {key.rsplit(f"internet.{provider}.", 1)[1]:
+             "bytes": totals, "ceiling": ceiling, "checks": {key.rsplit(f"internet.{provider}.", 1)[1]:
                                           {"status": c.status, "value": c.value} for key, c in checks.items()}}
     detail = {"regions": selected, "prefix": run_prefix(options), "directions": options.directions,
-              "profile": options.profile, "byte_semantics": "application payload progress lower bounds, including baseline and loaded probes; excludes protocol/control traffic",
+              "profile": options.profile, "ceiling_findings": ceiling,
+              "byte_semantics": "application payload progress lower bounds, including baseline and loaded probes; excludes protocol/control traffic",
               "cleanup": [{"region": r["region"], "status": r["cleanup"], "errors": r.get("cleanup_errors", [])}
                           for r in state.get("up", [])],
               "selection": "only checks actually collected; missing checks were filtered, never silently run"}
