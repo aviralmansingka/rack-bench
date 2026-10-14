@@ -71,7 +71,7 @@ def upload_reports(provider, options, *, client_factory=S3Client, window=transfe
                                       size=size, part_size=options.part_size * MIB, seed=run_seed(options),
                                       buckets=names, clients=clients,
                                       one_object=target["band"] == "light", loaded=loaded if kind == "bulk" else None,
-                                      provider=provider,
+                                      provider=provider, upload_mode=options.upload_mode,
                                       # ss diagnostics anchor to the first bucket's virtual host;
                                       # sibling buckets share the endpoint IPs in practice.
                                       # Path-style providers (r2, gcs) pass the bare endpoint host.
