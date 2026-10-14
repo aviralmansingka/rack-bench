@@ -30,7 +30,7 @@ from unittest.mock import Mock, patch
 import zlib
 
 from rack_bench.bench import internet, runner
-from rack_bench.bench.internet import download, s3client as s3, targets, tcp, transfer, upload
+from rack_bench.bench.internet import download, s3client as s3, stats, targets, tcp, transfer, upload
 from rack_bench.bench.internet.latency import OBJECT_SIZE as LATENCY_SIZE
 from rack_bench.bench.internet.cli import Options, before_run, part_size_mib
 from rack_bench.bench.internet.s3client import S3Client, Timing, TransportError
@@ -66,7 +66,12 @@ class FakeTCP:
         self.pids = pids  # bulk windows pass a parent+worker-process provider
         self.detail = {"segments": 1000, "retransmits": 2, "ratio_pct": .2,
                        "observations": [{"window_bytes": 1024 * 1024, "rtt_ms": 10}],
-                       "sources": ["ss -4tinpH ( dst 192.0.2.1 )"], "errors": []}
+                       "sources": ["ss -4tinpH ( dst 192.0.2.1 )"], "errors": [],
+                       "limits": {"ticks": 5, "busy_pct_median": 100.0,
+                                  "rwnd_limited_pct_median": 0.0, "cwnd_limited_pct_median": 0.0,
+                                  "sndbuf_limited_pct_median": 0.0, "sockets_per_dominant_state": {"busy": 4},
+                                  "dominant_state": "busy",
+                                  "semantics": "shares of socket busy time in percent; busy_pct is 100 when ss reports any busy time"}}
 
     def __enter__(self):
         return self
@@ -417,6 +422,11 @@ class TransferTests(unittest.TestCase):
                "mib_per_sec": 100 if kwargs["direction"] == "up" else 50, "objs_per_sec": 2,
                "elapsed_seconds": 1, "progress_bytes_lower_bound": size, "samples": [],
                "bucket_stats": {"p50": 100, "p95": 100}, "p95_p50_ratio": 1,
+               "steadiness_ratio": .98,
+               "ttfb_ms": {"count": 2, "p50": 110, "p95": 130, "p99": 150},
+               "post_ttfb_mib_per_sec": {"count": 2, "p50": 40, "p95": 45},
+               "ceiling": {"finding": "flat ceiling, clean sockets",
+                           "reference": "tcp_info socket time shares, 1 s bucket percentiles, retransmit percent (1.0 = 1%); diagnostic thresholds, not certification gates"},
                "tcp": FakeTCP("").detail, "loaded_samples": [{"response_first_byte_ms": 45}],
                "loaded_errors": [], "loaded_bytes": upload.LATENCY_SIZE}
         return run, objects
@@ -824,6 +834,39 @@ class ProcessPoolTransferTests(unittest.TestCase):
         self.assertEqual(deletes["alpha"], [f"/alpha/{prefix}a.bin"])
         self.assertEqual(deletes["beta"], [f"/beta/{prefix}b.bin"])
 
+    def test_loopback_window_captures_socket_limits_and_passes_without_sockets(self):
+        # Real worker processes on loopback with the real TCPWindow: the ss
+        # command is faked (macOS dev hosts have no ss); the flags capture and
+        # the socket-less fallback are what is under test.
+        self.server.state = {"payload": s3.SeededPayload("proc-seed", self.size), "requests": []}
+        info = (" cubic rtt:1/1 mss:1448 cwnd:10 data_segs_out:5 segs_out:6 "
+                "delivery_rate 65208000000bps busy:3529ms rwnd_limited:1411ms(40.0%)")
+        text = f'ESTAB 0 0 127.0.0.1:1 192.0.2.1:443 users:(("python",pid={os.getpid()},fd=4))\n\t{info}\n'
+        objects = [{"key": "proc/0-0.bin", "bucket": "bucket",
+                    "payload": {"seed": "proc-seed", "size": self.size, "chunk_size": 1024 * 1024}}]
+        def flagged(host, pids=None):
+            return tcp.TCPWindow(host, command=lambda args, timeout: text, interval=.05, pids=pids)
+        run, _ = transfer.transfer_window(self.client, direction="down", prefix="unused/",
+                                           concurrency=2, duration=.05, objects=objects, owned=[],
+                                           one_object=True, part_size=self.part,
+                                           tcp_factory=flagged, host="127.0.0.1")
+        self.assertEqual(run["status"], "pass")
+        limits = run["tcp"]["limits"]
+        self.assertGreater(limits["ticks"], 0)  # flag capture present in detail
+        self.assertEqual(limits["busy_pct_median"], 100.0)
+        self.assertEqual(limits["rwnd_limited_pct_median"], 40.0)
+        self.assertEqual(limits["dominant_state"], "rwnd_limited")
+        # ss with no matching sockets: the window still passes, limits explain themselves.
+        def socketless(host, pids=None):
+            return tcp.TCPWindow(host, command=lambda args, timeout: "", interval=.05, pids=pids)
+        run, _ = transfer.transfer_window(self.client, direction="down", prefix="unused/",
+                                           concurrency=2, duration=.05, objects=objects, owned=[],
+                                           one_object=True, part_size=self.part,
+                                           tcp_factory=socketless, host="127.0.0.1")
+        self.assertEqual(run["status"], "pass")
+        self.assertEqual(run["tcp"]["limits"]["ticks"], 0)
+        self.assertIn("no sample tick", run["tcp"]["limits"]["reason"])
+
     def test_worker_error_sets_cross_process_stop_and_siblings_drain_out(self):
         self.server.state = {"payload": s3.SeededPayload("proc-seed", self.size),
                              "fail_prefix": "0-0", "requests": []}
@@ -935,6 +978,107 @@ class TCPTests(unittest.TestCase):
         self.assertEqual(window.detail["segments"], 1000)
         self.assertEqual(window.detail["ratio_pct"], 0)
         self.assertIn("192.0.2.1", window.sources[0])
+
+    def test_ss_limit_flags_captured_and_absent_flags_zero(self):
+        text = (FIXTURES / "internet-ss.txt").read_text()
+        parsed = tcp.parse_ss(text)
+        first, second = list(parsed.values())
+        # The capture has busy/delivery_rate/cwnd but no limit flags (the kernel
+        # reported none): absent shares are zero, never invented.
+        self.assertEqual(first["busy_pct"], 100.0)
+        self.assertEqual((first["rwnd_limited_pct"], first["cwnd_limited_pct"], first["sndbuf_limited_pct"]),
+                         (0.0, 0.0, 0.0))
+        self.assertEqual(first["delivery_rate_bps"], 65208000000.0)
+        self.assertEqual(first["cwnd"], 10)
+        self.assertEqual(second["busy_pct"], 100.0)
+        self.assertEqual(second["retransmits"], 2383)  # existing counters unchanged
+
+    def test_ss_limit_shares_paren_percent_and_scaled_rates(self):
+        info = (" cubic rtt:1.2/0.3 mss:1448 cwnd:42 data_segs_out:9 segs_out:10 "
+                "delivery_rate 48.5kbps delivered:9 busy:1000ms "
+                "rwnd_limited:400ms(40.0%) cwnd_limited:0ms(0.0%) sndbuf_limited:100ms(10.5%)")
+        text = (f'ESTAB 0 0 10.0.0.1:5 192.0.2.1:443 users:(("python",pid={os.getpid()},fd=4))\n\t{info}\n')
+        entry = tcp.parse_ss(text, os.getpid())["10.0.0.1:5 192.0.2.1:443"]
+        self.assertEqual(entry["busy_pct"], 100.0)
+        self.assertEqual(entry["rwnd_limited_pct"], 40.0)
+        self.assertEqual(entry["cwnd_limited_pct"], 0.0)
+        self.assertEqual(entry["sndbuf_limited_pct"], 10.5)
+        self.assertEqual(entry["delivery_rate_bps"], 48500.0)
+        self.assertEqual(entry["cwnd"], 42)
+
+    def test_ss_limit_shares_defensive_formats_and_malformed(self):
+        def entry(info):
+            text = f"ESTAB 0 0 10.0.0.1:5 192.0.2.1:443\n\t cubic data_segs_out:9 {info}\n"
+            return tcp.parse_ss(text)["10.0.0.1:5 192.0.2.1:443"]
+        # Older token shape: usec durations without a printed share derive it from busy.
+        old = entry("busy:142841usec rwnd_limited:578usec")
+        self.assertEqual(old["busy_pct"], 100.0)
+        self.assertAlmostEqual(old["rwnd_limited_pct"], 100 * .578 / 142.841)
+        # Percent tokens and sec durations.
+        self.assertEqual(entry("busy:88% rwnd_limited:12.5% sndbuf_limited:25%")["sndbuf_limited_pct"], 25.0)
+        self.assertEqual(entry("busy:2.5sec sndbuf_limited:500ms(20%)")["sndbuf_limited_pct"], 20.0)
+        # A limited duration without any busy denominator stays zero, not a guess.
+        self.assertEqual(entry("cwnd_limited:400ms")["cwnd_limited_pct"], 0.0)
+        # Scaled delivery rates.
+        self.assertEqual(entry("busy:1ms delivery_rate 1.2Mbps")["delivery_rate_bps"], 1.2e6)
+        self.assertEqual(entry("busy:1ms delivery_rate 65.2Gbps cwnd:55")["delivery_rate_bps"], 65.2e9)
+        # Malformed tokens never raise and never invent a value.
+        broken = entry("busy:soon rwnd_limited: cwnd_limited:-3ms delivery_rate fast cwnd:x")
+        self.assertEqual((broken["busy_pct"], broken["rwnd_limited_pct"], broken["cwnd_limited_pct"]),
+                         (0.0, 0.0, 0.0))
+        self.assertIsNone(broken["delivery_rate_bps"])
+        self.assertIsNone(broken["cwnd"])
+
+    def test_limit_ticks_and_stats_medians_and_dominant_states(self):
+        def socket(busy=0.0, rwnd=0.0, cwnd=0.0, sndbuf=0.0):
+            return {"segments": 1, "retransmits": 0, "rtt_ms": 1.0, "window_bytes": None,
+                    "receive_window_bytes": None, "busy_pct": busy, "rwnd_limited_pct": rwnd,
+                    "cwnd_limited_pct": cwnd, "sndbuf_limited_pct": sndbuf,
+                    "delivery_rate_bps": 1000.0, "cwnd": 10}
+        first = {"a b": socket(busy=100.0), "c d": socket(busy=100.0, rwnd=40.0),
+                 "e f": socket(busy=100.0, rwnd=80.0)}
+        second = {"a b": socket(busy=100.0, cwnd=30.0)}
+        ticks = tcp.limit_ticks([{}, first, second])
+        self.assertEqual([tick["sockets"] for tick in ticks], [2 + 1, 1])  # socket-less ticks stay absent
+        self.assertEqual(ticks[0]["busy_pct"], 100.0)
+        self.assertEqual(ticks[0]["rwnd_limited_pct"], 40.0)  # median of 0, 40, 80
+        self.assertEqual(ticks[0]["dominant_states"], {"busy": 1, "rwnd_limited": 2})
+        self.assertEqual(ticks[1]["dominant_states"], {"cwnd_limited": 1})
+        self.assertEqual(ticks[0]["delivery_rate_bps"], 1000.0)
+        stats_aggregate = tcp.limit_stats(ticks)
+        self.assertEqual(stats_aggregate["ticks"], 2)
+        self.assertEqual(stats_aggregate["busy_pct_median"], 100.0)
+        self.assertEqual(stats_aggregate["rwnd_limited_pct_median"], 20.0)  # median of 40 and 0
+        self.assertEqual(stats_aggregate["cwnd_limited_pct_median"], 15.0)
+        self.assertEqual(stats_aggregate["sockets_per_dominant_state"],
+                         {"busy": 1, "rwnd_limited": 2, "cwnd_limited": 1})
+        self.assertEqual(stats_aggregate["dominant_state"], "rwnd_limited")
+        self.assertEqual(stats_aggregate["delivery_rate_bps_median"], 1000.0)
+        self.assertEqual(stats_aggregate["cwnd_median"], 10)
+        empty = tcp.limit_stats(tcp.limit_ticks([{}, {}]))
+        self.assertEqual(empty["ticks"], 0)
+        self.assertIn("no sample tick", empty["reason"])
+
+    def test_tcp_window_limits_in_detail_with_and_without_owned_sockets(self):
+        info = (" cubic rtt:1/1 mss:1448 cwnd:10 data_segs_out:5 segs_out:6 "
+                "delivery_rate 65208000000bps busy:3529ms rwnd_limited:1411ms(40.0%)")
+        text = f'ESTAB 0 0 127.0.0.1:1 192.0.2.1:443 users:(("python",pid={os.getpid()},fd=4))\n\t{info}\n'
+        with patch.object(tcp.socket, "getaddrinfo", return_value=[(2, 1, 6, "", ("192.0.2.1", 443))]):
+            with tcp.TCPWindow("example.invalid", command=lambda args, timeout: text, interval=1000) as window:
+                pass
+        limits = window.detail["limits"]
+        self.assertEqual(limits["ticks"], 2)  # enter and exit samples
+        self.assertEqual(limits["busy_pct_median"], 100.0)
+        self.assertEqual(limits["rwnd_limited_pct_median"], 40.0)
+        self.assertEqual(limits["sockets_per_dominant_state"], {"rwnd_limited": 2})
+        self.assertEqual(limits["dominant_state"], "rwnd_limited")
+        self.assertEqual(limits["delivery_rate_bps_median"], 65208000000.0)
+        # ss yielding no matching sockets: limits carry a reason, nothing raises.
+        with patch.object(tcp.socket, "getaddrinfo", return_value=[(2, 1, 6, "", ("192.0.2.1", 443))]):
+            with tcp.TCPWindow("example.invalid", command=lambda args, timeout: "", interval=1000) as window:
+                pass
+        self.assertEqual(window.detail["limits"]["ticks"], 0)
+        self.assertIn("no sample tick", window.detail["limits"]["reason"])
 
 
 if __name__ == "__main__":
