@@ -22,7 +22,8 @@ from rack_bench.bench.internet import path
 from rack_bench.bench.internet.targets import targets
 
 FIXTURES = Path(__file__).parent / "fixtures"
-ENV = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test", "R2_ACCOUNT_ID": "test"}
+ENV = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test", "R2_ACCOUNT_ID": "test",
+       "GCS_ACCESS_KEY_ID": "test", "GCS_SECRET_ACCESS_KEY": "test"}
 MTR = (FIXTURES / "internet-mtr.txt").read_text()
 TRACE = (FIXTURES / "internet-traceroute.txt").read_text()
 DEST = "  4. AS16509 strange.aws-name.example (192.0.2.4) 0.0% 10 25.0 25.0 20.0 30.0 1.0\n"
@@ -122,9 +123,34 @@ class PathTests(unittest.TestCase):
         override = targets("s3", Options(profile="certify", regions={"s3": "eu-west-1"}))
         self.assertEqual(len(override), 1)
 
+    def test_gcs_pins_bucket_location_on_the_global_endpoint(self):
+        # The gcs region is the bucket's location; the endpoint is one global
+        # interop host. Far bands stay explicit skip records, like R2's.
+        gcs = targets("gcs", Options())
+        self.assertEqual([t["region"] for t in gcs], ["asia-south1"])
+        self.assertEqual(gcs[0]["endpoint"], "https://storage.googleapis.com")
+        self.assertIsNone(gcs[0]["reason"])
+        certified = targets("gcs", Options(profile="certify"))
+        self.assertEqual([t["region"] for t in certified], ["asia-south1", "ap-southeast-1", "us-east-1"])
+        self.assertTrue(all(t["reason"] for t in certified[1:]))
+        pinned = targets("gcs", Options(regions={"gcs": "asia-south2"}))
+        self.assertEqual([t["region"] for t in pinned], ["asia-south2"])
+        self.assertIsNone(pinned[0]["reason"])
+
+    def test_gcs_rtt_sanity_grades_the_location_band(self):
+        check = path.path_probe("gcs", "rtt_sanity", self.options, run=self.run,
+                                which=lambda name: "/usr/bin/" + name, resolve=self.resolve)
+        self.assertEqual(check.status, "pass")
+        self.assertIn("asia-south1: 25 ms (reference 20-35 ms)", check.detail)
+        self.resolve.assert_called_once_with("storage.googleapis.com", 443,
+                                              socket.AF_INET, socket.SOCK_STREAM)
+
     def test_context_missing_credentials_no_io(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertIn("credentials not set", self.probe("hops").detail)
+            gcs = path.path_probe("gcs", "hops", self.options, run=self.run,
+                                  which=lambda name: "/usr/bin/" + name, resolve=self.resolve)
+            self.assertIn("GCS_ACCESS_KEY_ID", gcs.detail)  # provider-keyed credential names
             resolver = Mock()
             self.assertIn("credentials not set", path.dns_probe("s3", self.options, resolver=resolver).detail)
             resolver.assert_not_called()
