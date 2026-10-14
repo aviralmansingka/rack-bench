@@ -145,6 +145,22 @@ class BenchTests(unittest.TestCase):
         result = runner.collect("internet", options=internet.Options(providers=("gcs", "r2")))[0]
         self.assertEqual([c.name for c in result.checks], names(("r2", "gcs")))
 
+    def test_gcs_checks_skip_naming_gcs_credentials(self):
+        # GCS is opt-in and credential-gated like the others: without its HMAC
+        # variables every gcs check SKIPs with a reason naming them.
+        result = runner.collect("internet", options=internet.Options(providers=("gcs",)))[0]
+        self.assertEqual([c.name for c in result.checks], names(("gcs",)))
+        self.assertTrue(all(c.status == "skip" and
+                            c.detail == "credentials not set: missing environment variable: GCS_ACCESS_KEY_ID"
+                            for c in result.checks))
+
+    def test_gcs_flags_accept_locations_and_dotted_buckets(self):
+        with patch.object(runner, "run", return_value=0) as run:
+            self.assertEqual(main(["bench", "internet", "--providers", "gcs,s3",
+                                   "--regions", "gcs=asia-south2", "--buckets", "gcs=bench.gcs"]), 0)
+        self.assertEqual(run.call_args.kwargs["options"], internet.Options(
+            providers=("gcs", "s3"), regions={"gcs": "asia-south2"}, buckets={"gcs": ("bench.gcs",)}))
+
     def test_filters_prevent_probe_calls(self):
         checks = {name: Mock(return_value=Check(name, "skip")) for name in internet.CHECKS}
         with patch.dict(internet.CHECKS, checks, clear=True):
