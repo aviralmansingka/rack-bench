@@ -445,18 +445,18 @@ per request: concurrency 1 is sequential requests, not one persistent TCP flow.
 
 Internet flags follow `bench internet`, not the `bench` parent.
 
-| Flag                            | Description                                           |
-| ------------------------------- | ----------------------------------------------------- |
+| Flag                            | Description                                              |
+| ------------------------------- | -------------------------------------------------------- |
 | `--providers s3,r2`             | Unique providers: `s3`, `r2`, `gcs` (gcs opt-in interop) |
-| `--directions up,down`          | Selected directions; down needs this run's uploads    |
-| `--profile quick\|certify`      | Default `quick`; certify requires `--yes`             |
-| `--regions s3=us-east-1,...`    | Override the tiered provider region matrix            |
-| `--buckets s3=<n1>,s3=<n2>,...` | Existing buckets; a provider may repeat for sharding   |
-| `--concurrent N`                | Override quick's 32 streams or certify's sweep        |
-| `--duration 60s`                | Per-window duration; defaults: quick 60s, certify 5m  |
-| `--tool stdlib\|warp`           | Default `stdlib`; Warp execution unsupported          |
-| `--keep-data`                   | Retain completed objects under the run-owned prefix   |
-| `--yes`                         | Accept the certify reference cost estimate            |
+| `--directions up,down`          | Selected directions; down needs this run's uploads       |
+| `--profile quick\|certify`      | Default `quick`; certify requires `--yes`                |
+| `--regions s3=us-east-1,...`    | Override the tiered provider region matrix               |
+| `--buckets s3=<n1>,s3=<n2>,...` | Existing buckets; a provider may repeat for sharding     |
+| `--concurrent N`                | Override quick's 32 streams or certify's sweep           |
+| `--duration 60s`                | Per-window duration; defaults: quick 60s, certify 5m     |
+| `--tool stdlib\|warp`           | Default `stdlib`; Warp execution unsupported             |
+| `--keep-data`                   | Retain completed objects under the run-owned prefix      |
+| `--yes`                         | Accept the certify reference cost estimate               |
 
 The default run selects 26 checks (S3 and R2); bare `rack-bench bench` runs only
 implemented categories, currently internet. Generic flags match audit:
