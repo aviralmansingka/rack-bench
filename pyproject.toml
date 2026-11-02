@@ -10,8 +10,8 @@ dependencies = []
 rack-bench = "rack_bench.cli:main"
 
 [build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
+requires = ["uv_build"]
+build-backend = "uv_build"
 
-[tool.setuptools.packages.find]
-include = ["rack_bench*"]
+[tool.uv.build-backend]
+module-root = ""
