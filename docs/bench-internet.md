@@ -112,13 +112,23 @@ Run in this order; each is one or more `Check` entries per provider.
    Failed/invalid samples never become zero latency. Certify's nearest band
    retains three runs and drops best/worst ranked by response-TTFB p50; each
    light band has only one 20-GET run.
-4. **Sustained upload (egress)** — parallel multipart PUTs of profile-sized
-   random objects for the profile duration (32 MiB in quick so objects
-   complete and feed downloads; ~1 GiB in certify for sustained streams). Random data defeats provider-side
-   compression/dedup. With several buckets configured, streams are assigned
-   round-robin across them at window start (§8). **Concurrent small-object TTFB probes** run during the
-   window → loaded-latency signal: p95 under load, inflation vs test 3's
-   baseline.
+4. **Sustained upload (egress)** — parallel PUTs of profile-sized random
+   objects for the profile duration (32 MiB in quick so objects complete and
+   feed downloads; ~1 GiB in certify for sustained streams). Random data
+   defeats provider-side compression/dedup. An object that fits one part
+   (`object_size <= part_size`) goes up as ONE plain `PutObject`. A
+   single-part multipart sequence costs three requests per object (initiate,
+   one part, complete), and that request amplification trips per-bucket
+   ingest limits before the wire fills; open-beta R2 documents roughly
+   100 PUT/s per bucket. An object that spans parts keeps multipart, so each
+   request stays inside the 30 s socket timeout (the default 64 MiB part sets
+   that bound; a raised `--part-size` raises the largest single PUT). No
+   upload request retries: a 5xx fails the window. `--upload-mode multipart`
+   forces the older three-request pattern for A/B comparison; `auto` is the
+   default rule above. With several buckets configured, streams are assigned
+   round-robin across them at window start (§8). **Concurrent small-object
+   TTFB probes** run during the window → loaded-latency signal: p95 under
+   load, inflation vs test 3's baseline.
 5. **Sustained download (ingress)** — parallel range GETs reading back the
    uploaded objects. Downloads read uploads; no pre-seeded data.
 6. **Single-stream** — upload + download with concurrency=1.
@@ -175,11 +185,14 @@ internet.<p>.summary                 dict  region, endpoint, tool, bytes
 Throughput checks carry `detail`: single-stream MiB/s, p50/p95/p99 of the 1 s
 throughput buckets plus a steadiness ratio (p50/p95), retransmit %, TTFB
 percentiles of the measured ops, the per-request post-TTFB streaming rate,
-the ss socket-limit aggregate, and one ceiling verdict per retained window
-(below). For multi-band probes, the scalar value represents the
-nearest/overridden band; JSON-encoded `detail` retains the effective region
-matrix, individual runs, unsupported-band reasons, raw path reports and timing
-samples. These survive in `bench.values.json` without a separate artifact
+the ss socket-limit aggregate, one ceiling verdict per retained window
+(below), and `upload_modes` (measured upload requests per mode, `put` or
+`multipart`, in the retained upload window). Upload samples and completed
+object records also name their `upload_mode`; both fields are additive. For
+multi-band probes, the scalar value represents the nearest/overridden band;
+JSON-encoded `detail` retains the effective region matrix, individual runs,
+unsupported-band reasons, raw path reports and timing samples. These survive
+in `bench.values.json` without a separate artifact
 writer. RTT sanity can WARN on any measured band's reference excursion; its
 value still describes the nearest band. R2 has no guaranteed regional RTT band,
 so RTT sanity SKIPs with a reason. GCS grades its pinned bucket location
