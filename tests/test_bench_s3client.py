@@ -455,6 +455,22 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(len(parts), 2)
         self.assertTrue(all(part.timing.attempts == 1 for part in parts))
 
+    def test_single_put_signs_the_same_digests_as_the_multipart_part(self):
+        # The whole-object PUT replaces the single-part multipart sequence: for
+        # the same bytes it sends the same signed header set and digests, with
+        # no initiate/partNumber/complete query.
+        payload = s3.SeededPayload("put", 123456)
+        self.client.put_object("whole", payload)
+        self.client.upload_part("whole", "id", 1, payload, 0, payload.size)
+        whole, part = self.state["requests"][-2:]
+        self.assertEqual(whole["path"], "/bucket/whole")
+        self.assertEqual(part["path"], "/bucket/whole?partNumber=1&uploadId=id")
+        for name in ("x-amz-content-sha256", "x-amz-checksum-crc32"):
+            self.assertEqual(whole["headers"][name], part["headers"][name])
+        self.assertEqual(whole["crc32"], part["crc32"])
+        signed = lambda request: request["headers"]["authorization"].split("SignedHeaders=")[1].split(",")[0]
+        self.assertEqual(signed(whole), signed(part))
+
     def test_checksum_rejection_is_typed_and_aborts_without_retry(self):
         self.state["reject_digest"] = True
         with self.assertRaises(s3.ChecksumError) as caught:
@@ -750,6 +766,14 @@ class GcsInteropTests(unittest.TestCase):
                          hashlib.sha256(b"".join(payload.iter_chunks())).hexdigest())
         self.assertNotIn("x-amz-checksum-crc32", request["headers"])
         self.assertNotIn("x-amz-security-token", request["headers"])  # static HMAC keys
+
+    def test_single_part_upload_is_one_put_without_multipart_control(self):
+        # The auto upload-mode rule uses this path for single-part objects: one
+        # PUT, no initiate/complete POST, no S3 flexible-checksum header.
+        self.client.put_object("key", s3.SeededPayload("s", 8))
+        self.assertEqual([request["method"] for request in self.state["requests"]], ["PUT"])
+        self.assertEqual(self.state["requests"][0]["path"], "/bucket/key")
+        self.assertNotIn("x-amz-checksum-crc32", self.state["requests"][0]["headers"])
 
     def test_multipart_omits_checksum_headers_and_completion_elements(self):
         self.client.multipart_upload("multi", s3.SeededPayload("large", 5 * 1024**2 + 99),
