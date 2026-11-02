@@ -91,6 +91,38 @@ class SigningVectors(unittest.TestCase):
                          "s3/aws4_request,SignedHeaders=host;range;x-amz-content-sha256;x-amz-date,"
                          "Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41")
 
+    def test_gcs_interop_scope_is_the_bucket_location_and_s3(self):
+        # Google accepts any location in an x-amz credential scope; the
+        # recommended value is the bucket location. The service stays s3 and
+        # the request type stays aws4_request. This fixed vector locks the
+        # scope so a future signer change cannot silently alter gcs requests.
+        credentials = s3.Credentials("GOOG1EXAMPLE", "gcs-secret")
+        timestamp = "20190817T061205Z"
+        headers = {"host": "storage.googleapis.com",
+                   "x-amz-content-sha256": EMPTY_HASH, "x-amz-date": timestamp}
+        expected = (
+            "GET\n/bench-gcs/key\n\nhost:storage.googleapis.com\n"
+            "x-amz-content-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+            "x-amz-date:20190817T061205Z\n\n"
+            "host;x-amz-content-sha256;x-amz-date\n"
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        canonical = s3.canonical_request("GET", "/bench-gcs/key", (), headers, EMPTY_HASH)
+        self.assertEqual(canonical, expected)
+        self.assertEqual(
+            s3.string_to_sign(canonical, timestamp, "asia-south1", "s3"),
+            "AWS4-HMAC-SHA256\n20190817T061205Z\n"
+            "20190817/asia-south1/s3/aws4_request\n"
+            "6fe17c1ed914053859226c535e67aad9fa3d00116bd72534b02acefec9c04aa7")
+        self.assertEqual(
+            s3.authorization(credentials, canonical, timestamp, "asia-south1", "s3"),
+            "AWS4-HMAC-SHA256 Credential=GOOG1EXAMPLE/20190817/asia-south1/s3/aws4_request, "
+            "SignedHeaders=host;x-amz-content-sha256;x-amz-date, "
+            "Signature=6827f1b53e18c40e2f53792d19cd3510ca9e91ac21acce69f0b4adc2bc179472")
+        signed = s3.sign_headers(credentials, "GET", "/bench-gcs/key", (), headers,
+                                 EMPTY_HASH, "asia-south1", timestamp)
+        self.assertEqual(signed["authorization"],
+                         s3.authorization(credentials, canonical, timestamp, "asia-south1", "s3"))
+
     def test_s3_path_not_normalized_and_query_encoded_once(self):
         canonical = s3.canonical_request("GET", "/a//.././% +/ሴ", (
             ("z", ""), ("a", "+ %"), ("a", "/")), {}, EMPTY_HASH)
