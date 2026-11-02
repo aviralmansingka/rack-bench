@@ -13,7 +13,9 @@ from unittest.mock import patch
 import xml.etree.ElementTree as ET
 import zlib
 
-from rack_bench.bench.internet import s3client as s3
+from rack_bench.bench.internet import s3client as s3, tcp, transfer
+from rack_bench.bench.internet.cli import Options
+from rack_bench.bench.internet.targets import run_prefix
 
 
 EMPTY_HASH = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -405,6 +407,88 @@ class TransportTests(unittest.TestCase):
                                   endpoint=s3.Endpoint("127.0.0.1", "auto", True,
                                                        self.server.server_port, False))
         self.addCleanup(self.client.close)
+
+    def window(self, client, *, size, part_size=None, direction="up", objects=(), owned=None, prefix="bench/"):
+        return transfer.transfer_window(
+            client, direction=direction, prefix=prefix, concurrency=1, duration=.01,
+            objects=objects, owned=owned if owned is not None else [], size=size,
+            part_size=part_size, one_object=True, seed="window-seed",
+            tcp_factory=lambda host, pids=None: tcp.TCPWindow(
+                host, command=lambda args, timeout: "", interval=.01, pids=pids))
+
+    def test_single_put_window_verifies_download_and_cleans_owned_key(self):
+        size = 64 * 1024**2
+        self.state["payload"] = s3.SeededPayload("window-seed", size)
+        options = Options(providers=("s3",), buckets={"s3": "bucket"})
+        prefix = run_prefix(options) + "s3/transfer/"
+        owned = []
+        run, objects = self.window(self.client, size=size, owned=owned, prefix=prefix)
+        self.assertEqual(run["status"], "pass")
+        self.assertEqual(run["upload_mode_counts"], {"put": 1})
+        self.assertEqual(run["samples"][0]["upload_mode"], "put")
+        self.assertEqual(objects[0]["upload_mode"], "put")
+        self.assertEqual([r["method"] for r in self.state["requests"]], ["PUT"])
+        self.assertNotIn("?", self.state["requests"][0]["path"])
+        self.assertEqual(objects[0]["payload"]["seed"], "window-seed")
+        downloaded, _ = self.window(self.client, size=size, direction="down", objects=objects)
+        self.assertEqual(downloaded["status"], "pass")
+        self.assertEqual(downloaded["bytes"], size)
+        self.assertNotIn("upload_mode_counts", downloaded)
+        record = {"owned": owned}
+        options._transfer_owners = [({"bucket": self.client}, record, prefix)]
+        transfer.cleanup(options)
+        self.assertEqual(record["cleanup_errors"], [])
+        self.assertEqual([r["method"] for r in self.state["requests"]], ["PUT", "GET", "DELETE"])
+        self.assertTrue(all(r["path"] == f"/bucket/{objects[0]['key']}" for r in self.state["requests"]))
+
+    def test_multi_part_window_keeps_initiate_parts_complete(self):
+        part_size = 8 * 1024**2
+        run, objects = self.window(self.client, size=part_size + 1024**2, part_size=part_size)
+        self.assertEqual(run["status"], "pass")
+        self.assertEqual(run["upload_mode_counts"], {"multipart": 2})
+        self.assertEqual(objects[0]["upload_mode"], "multipart")
+        self.assertEqual([r["method"] for r in self.state["requests"]], ["POST", "PUT", "PUT", "POST"])
+
+    def test_single_put_window_5xx_fails_without_retry_and_keeps_owned_key(self):
+        self.state["fail_method"] = "PUT"
+        owned = []
+        run, objects = self.window(self.client, size=1024**2, owned=owned)
+        self.assertEqual(run["status"], "skip")
+        self.assertEqual(run["errors"][0]["type"], "ServiceError")
+        self.assertEqual(objects, [])
+        self.assertEqual(owned, [("bucket", "bench/0-0.bin")])
+        self.assertEqual(run["samples"], [])
+        self.assertEqual([r["method"] for r in self.state["requests"]], ["PUT"])
+
+    def test_single_put_window_preserves_provider_digests_and_signing(self):
+        with patch.dict(os.environ, {"GCS_ACCESS_KEY_ID": "key", "GCS_SECRET_ACCESS_KEY": "secret"}):
+            for provider in ("s3", "r2", "gcs"):
+                with self.subTest(provider=provider):
+                    self.state["requests"].clear()
+                    client = s3.S3Client("bucket", "auto", provider=provider,
+                                         endpoint=self.client.endpoint, backoff=0)
+                    self.addCleanup(client.close)
+                    size = 1024**2
+                    run, _ = self.window(client, size=size)
+                    self.assertEqual(run["status"], "pass")
+                    self.assertEqual(len(self.state["requests"]), 1)
+                    put = self.state["requests"][0]
+                    self.assertEqual(put["method"], "PUT")
+                    self.assertNotIn("?", put["path"])
+                    payload = s3.SeededPayload("window-seed", size)
+                    expected = s3.part_checksum_headers(payload, 0, size)
+                    if provider == "gcs":
+                        del expected["x-amz-checksum-crc32"]
+                    for name, value in expected.items():
+                        self.assertEqual(put["headers"][name], value)
+                    self.assertEqual(put["headers"]["content-length"], str(size))
+                    self.assertEqual(any(name.startswith("x-amz-checksum-") for name in put["headers"]),
+                                     provider != "gcs")
+                    headers = {name: put["headers"][name] for name in
+                               put["headers"]["authorization"].split("SignedHeaders=")[1].split(",")[0].split(";")}
+                    signed = s3.sign_headers(client.credentials, "PUT", put["path"], (), headers,
+                                             expected["x-amz-content-sha256"], "auto", headers["x-amz-date"])
+                    self.assertEqual(put["headers"]["authorization"], signed["authorization"])
 
     def test_put_shapes_auth_and_checksums(self):
         progress = []

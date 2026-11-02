@@ -12,6 +12,7 @@ code path is identical to earlier fixes, and the parent-pid ss filter still
 applies to them. Both modes run the same picklable top-level worker, which
 validates every part/range and RETURNS results for the parent to merge.
 """
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from contextvars import copy_context
@@ -527,6 +528,8 @@ def transfer_window(client, *, direction, prefix, concurrency, duration, objects
               "ceiling": ceiling_verdict(stats, tcp.detail.get("limits"), tcp.detail.get("ratio_pct")),
               "errors": errors, "loaded_samples": loaded_samples, "loaded_errors": loaded_errors,
               "loaded_bytes": loaded_bytes, "tcp": tcp.detail}
+    if direction == "up":
+        result["upload_mode_counts"] = dict(Counter(s["upload_mode"] for s in samples))
     if len(names) > 1:
         # Multi-bucket windows keep per-bucket sample evidence; buckets without a
         # measured sample stay absent, never a zero rate. The 1 s bucket stream
@@ -590,8 +593,12 @@ def transfer_check(provider, direction, metric, options, records):
     detail = {"regions": records, "buckets": list(bucket_names(provider, options)),
               "selection": "nearest; median of 3 by MiB/s per concurrency, scalar is largest concurrency; all runs retained",
               "single_stream_mib_per_sec": singles["mib_per_sec"] if singles else None,
-              "timing_semantics": "schedule for duration, drain current part/range; abort incomplete multipart; actual elapsed denominator includes hashing/verification/control; per-op CPU is thread CPU",
+              "timing_semantics": "schedule for duration, drain current PUT/part/range; abort incomplete multipart; actual elapsed denominator includes hashing/verification/control; per-op CPU is thread CPU",
               "single_stream": {}}
+    if direction == "up":
+        detail["upload_mode_counts"] = dict(Counter(
+            sample["upload_mode"] for region in records for run in region["runs_detail"]
+            for sample in run["samples"] if "upload_mode" in sample))
     for region in records:
         single = reduce_runs([r for r in region["runs_detail"] if r["kind"] == "single"])
         if not single:
