@@ -133,7 +133,10 @@ Run in this order; each is one or more `Check` entries per provider.
    `multipart`) additively. With several buckets configured, streams are assigned
    round-robin across them at window start (§8). **Concurrent small-object TTFB probes** run during the
    window → loaded-latency signal: p95 under load, inflation vs test 3's
-   baseline.
+   baseline. A started PUT drains before the next object deadline check, as
+   for a final multipart part. A failed measured PUT fails the window without
+   a retry. Multipart still checks each part boundary and aborts incomplete
+   uploads.
 5. **Sustained download (ingress)** — parallel range GETs reading back the
    uploaded objects. Downloads read uploads; no pre-seeded data.
 6. **Single-stream** — upload + download with concurrency=1.
@@ -213,6 +216,17 @@ profiles exist.
 Every transfer window records the evidence needed to say why its ceiling
 exists, and reduces it to one finding string:
 
+- Upload samples and completed upload records include `upload_mode`: `put`
+  or `multipart`. Upload windows include `upload_mode_counts`, which counts
+  accepted payload request samples by mode, not objects or control requests.
+  Upload check detail sums these counts across all regions and windows,
+  including dedicated single-stream windows. A multipart part counts once;
+  initiate and complete do not count. Modes with no accepted samples are
+  absent. These fields are additive; check names and `regions/runs_detail`
+  stay the same. The existing `upload_modes` field continues to count samples
+  from the selected bulk run. Compare the mode as well as concurrency and
+  part size when you compare ceiling findings. A mode change alone does not
+  prove the cause of a provider limit.
 - `bucket_stats`, `steadiness_ratio` — p50/p95/p99 of the 1 s throughput
   buckets. Steadiness (p50/p95) near 1.0 is a flat ceiling; a low value is
   bursty.

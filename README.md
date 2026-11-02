@@ -395,6 +395,9 @@ for loaded TTFB. An object that fits in one part uploads as ONE plain
 `PutObject` (1 request per object — quick's default); larger objects keep
 multipart so every request stays bounded well inside the 30 s socket
 timeout. `--upload-mode multipart` forces multipart for comparisons.
+Upload windows and check detail include `upload_mode_counts` for accepted
+payload requests. Check detail also retains `upload_modes` for the selected
+bulk run.
 Downloads verify ranges from this run's completed uploads; they
 never use pre-seeded data. All upload windows, including a separate unloaded
 concurrency-1 test, finish before download windows start. TCP socket sampling
@@ -407,7 +410,7 @@ concurrency-1 windows. Certify uses 1/8/32/64 streams, five minutes per window,
 three runs per concurrency, dropping the best and worst by measured rate.
 Dedicated single-stream windows also have three runs. The scalar rate is the
 largest concurrency's retained run, not the fastest result. Scheduling stops at
-a part/range boundary; actual elapsed time includes setup and the current
+a PUT/part/range boundary; actual elapsed time includes setup and the current
 operation's overrun. Incomplete multipart uploads are aborted. A slow/short run
 can measure uploaded parts without completing an object: download then SKIPs
 rather than manufacturing data.
