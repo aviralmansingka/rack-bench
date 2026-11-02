@@ -8,6 +8,7 @@ from rack_bench.common.output import show_cost_estimate
 
 PROVIDERS = ("s3", "r2", "gcs")
 DIRECTIONS = ("up", "down")
+UPLOAD_MODES = ("auto", "multipart")  # one PUT for a single-part object; or force multipart
 
 
 @dataclass
@@ -21,6 +22,7 @@ class Options:
     duration: int | None = None  # seconds per test; defaults depend on profile
     object_size: int | None = None  # MiB per uploaded object; default depends on profile
     part_size: int | None = None  # MiB per multipart part / range GET; default 64
+    upload_mode: str = "auto"  # auto: one PUT when the object fits one part; multipart: force
     tool: str = "stdlib"
     keep_data: bool = False
     yes: bool = False
@@ -151,6 +153,9 @@ def add_arguments(parser):
                         help="uploaded object size in MiB (default: quick 32, certify 1024)")
     parser.add_argument("--part-size", type=part_size_mib, metavar="MIB",
                         help="multipart part / range GET size in MiB (default: 64; 8..512)")
+    parser.add_argument("--upload-mode", choices=UPLOAD_MODES, default="auto",
+                        help="auto uploads an object that fits one part as one PUT (default); "
+                             "multipart forces the 3-request pattern for A/B comparison")
     parser.add_argument("--tool", choices=("stdlib", "warp"), default="stdlib")
     parser.add_argument("--keep-data", action="store_true", help="retain objects under this run's rack-bench/ prefix")
     parser.add_argument("--yes", action="store_true", help="accept the certify reference cost estimate")
