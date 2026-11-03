@@ -60,6 +60,8 @@ rack-bench bench internet
                                     # a provider may repeat for several buckets
     [--concurrent N]               # override parallel streams (default 32)
     [--duration 60s]               # override per-test duration
+    [--upload-mode auto|multipart] # default auto: one PutObject when the object
+                                   # fits in one part (§4)
     [--tool stdlib|warp]           # default stdlib; warp for certify (§7)
     [--keep-data]                  # skip bucket cleanup
     [--yes]                        # accept cost estimate for certify
@@ -112,9 +114,18 @@ Run in this order; each is one or more `Check` entries per provider.
    Failed/invalid samples never become zero latency. Certify's nearest band
    retains three runs and drops best/worst ranked by response-TTFB p50; each
    light band has only one 20-GET run.
-4. **Sustained upload (egress)** — parallel multipart PUTs of profile-sized
+4. **Sustained upload (egress)** — parallel PUTs of profile-sized
    random objects for the profile duration (32 MiB in quick so objects
-   complete and feed downloads; ~1 GiB in certify for sustained streams). Random data defeats provider-side
+   complete and feed downloads; ~1 GiB in certify for sustained streams).
+   Upload mode `auto` (the default) sends an object that fits in one part as
+   a single plain `PutObject`: one measured request per object. Only objects
+   larger than one part use multipart (initiate + parts + complete). Multipart
+   bounds each request of a large object to the part size, so every request
+   stays inside the 30 s socket timeout; a single-part-sized object needs no
+   split, and the initiate/part/complete pattern would triple its request
+   rate against per-bucket ingest limits. `--upload-mode multipart` forces
+   the multipart pattern for every object, for forced A/B comparison. Random
+   data defeats provider-side
    compression/dedup. With several buckets configured, streams are assigned
    round-robin across them at window start (§8). **Concurrent small-object TTFB probes** run during the
    window → loaded-latency signal: p95 under load, inflation vs test 3's
@@ -221,6 +232,11 @@ exists, and reduces it to one finding string:
   (node-side tunable); `flat ceiling, clean sockets` (points past TCP at a
   policer, the wire, or a per-client cap); `bursty`; `no dominant ceiling
   signature`. `retransmit_pct` is a percent: 1.0 means 1%, not 100%.
+
+Upload windows record `upload_mode` (`put` or `multipart`) on every upload
+sample and `upload_modes` per-mode measured-op counts on the window and in
+the upload check detail. Check names and the regions/runs_detail envelope are
+unchanged.
 
 The thresholds (busy 80%, socket limits 20%, retrans 1%, p95/p50 1.2 flat /
 2.0 bursty) are diagnostic shape splits, not certification gates, in the
