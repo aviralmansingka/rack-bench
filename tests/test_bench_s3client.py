@@ -221,12 +221,24 @@ class PayloadTests(unittest.TestCase):
             os.environ["R2_ACCOUNT_ID"] = "account"
             self.assertEqual(s3.resolve_endpoint("r2", "apac"),
                              s3.Endpoint("account.r2.cloudflarestorage.com", "auto", True))
+            with self.assertRaisesRegex(s3.CredentialError, "GCS_ACCESS_KEY_ID"):
+                s3.Credentials.from_env("gcs")
+            os.environ["GCS_ACCESS_KEY_ID"] = "GOOGEXAMPLE"
+            with self.assertRaisesRegex(s3.CredentialError, "GCS_SECRET_ACCESS_KEY"):
+                s3.Credentials.from_env("gcs")
+            os.environ["GCS_SECRET_ACCESS_KEY"] = "gcs-secret"
+            self.assertIsNone(s3.Credentials.from_env("gcs").token)  # static HMAC keys: no token
         self.assertEqual(s3.resolve_endpoint("s3", "ap-south-1"),
                          s3.Endpoint("s3.ap-south-1.amazonaws.com", "ap-south-1", False))
         with self.assertRaises(ValueError):
             s3.resolve_endpoint("s3", "bad/region")
+        # One global interop endpoint; the pinned bucket location rides in the
+        # Endpoint region, which is also the SigV4 scope location (Google
+        # accepts any location value on the x-amz path).
+        self.assertEqual(s3.resolve_endpoint("gcs", "asia-south1"),
+                         s3.Endpoint("storage.googleapis.com", "asia-south1", True))
         with self.assertRaises(ValueError):
-            s3.resolve_endpoint("gcs", "auto")
+            s3.resolve_endpoint("gcs", "bad/location")
 
     def test_ipv4_connection_uses_local_timeout(self):
         with patch.object(s3.socket, "getaddrinfo", return_value=[
@@ -304,8 +316,11 @@ class MockS3(BaseHTTPRequestHandler):
         if self.command == "PUT" or xml:
             expected_crc = base64.b64encode(crc.to_bytes(4, "big")).decode()
             record["crc32"] = expected_crc
+            # GCS interop uploads carry no x-amz-checksum-crc32; the server
+            # verifies a sent CRC32 and never invents one for gcs-style sends.
+            sent_crc = headers.get("x-amz-checksum-crc32")
             if ("content-md5" in headers or
-                    self.command == "PUT" and headers.get("x-amz-checksum-crc32") != expected_crc or
+                    self.command == "PUT" and sent_crc is not None and sent_crc != expected_crc or
                     state.get("reject_digest")):
                 self.reply(400, b"<Error><Code>InvalidDigest</Code></Error>")
                 return
@@ -321,9 +336,11 @@ class MockS3(BaseHTTPRequestHandler):
                 self.reply(body=b"<CompleteMultipartUploadResult><ETag>done</ETag>"
                            b"</CompleteMultipartUploadResult>")
         elif self.command == "PUT":
-            response_headers = {"ETag": '"part-etag"', "x-amz-checksum-crc32": expected_crc}
-            if state.get("bad_returned_crc"):
-                response_headers["x-amz-checksum-crc32"] = "AAAAAA=="
+            response_headers = {"ETag": '"part-etag"'}
+            if headers.get("x-amz-checksum-crc32") is not None:
+                response_headers["x-amz-checksum-crc32"] = expected_crc
+                if state.get("bad_returned_crc"):
+                    response_headers["x-amz-checksum-crc32"] = "AAAAAA=="
             if state.get("missing_etag"):
                 del response_headers["ETag"]
             self.reply(headers=response_headers)
@@ -684,6 +701,82 @@ class TransportTests(unittest.TestCase):
         self.assertLessEqual(self.state["max_read"], 8192)
         self.assertLess(peak, 40 * 1024**2)
         self.assertLessEqual(s3._CHUNK_CACHE.total, s3.CHUNK_CACHE_LIMIT)
+
+
+class GcsInteropTests(unittest.TestCase):
+    """The gcs provider path against a loopback server: path-style requests,
+    location-scoped SigV4, and no S3 flexible checksums. No cloud traffic;
+    the loopback endpoint carries the gcs signing region."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), MockS3)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join()
+
+    def setUp(self):
+        self.env = patch.dict(os.environ, {"GCS_ACCESS_KEY_ID": "GOOGEXAMPLE",
+                                           "GCS_SECRET_ACCESS_KEY": "gcs-secret"})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.state = {"counts": Counter(), "requests": [], "max_read": 0,
+                      "payload": s3.SeededPayload("download", 200000), "failures": 1}
+        self.server.state = self.state
+        self.endpoint = s3.Endpoint("127.0.0.1", "asia-south1", True,
+                                    self.server.server_port, False)
+        self.client = s3.S3Client("bucket", "asia-south1", provider="gcs", timeout=2,
+                                  backoff=0, endpoint=self.endpoint)
+        self.addCleanup(self.client.close)
+
+    def test_put_is_path_style_location_scoped_without_flexible_checksums(self):
+        payload = s3.SeededPayload("put", 123456, chunk_size=64 * 1024)
+        self.client.put_object("key", payload)
+        request = self.state["requests"][0]
+        self.assertEqual(request["path"], "/bucket/key")
+        self.assertEqual(request["headers"]["host"], f"127.0.0.1:{self.server.server_port}")
+        # Google accepts any location value in an x-amz scope; the pinned
+        # bucket location signs directly, service stays s3 (AWS SigV4).
+        self.assertIn("Credential=GOOGEXAMPLE/", request["headers"]["authorization"])
+        self.assertIn("/asia-south1/s3/aws4_request", request["headers"]["authorization"])
+        # The signed SHA256 payload digest rides on every upload; the S3
+        # flexible-checksum header does not (GCS validates CRC32C natively).
+        self.assertEqual(request["headers"]["x-amz-content-sha256"],
+                         hashlib.sha256(b"".join(payload.iter_chunks())).hexdigest())
+        self.assertNotIn("x-amz-checksum-crc32", request["headers"])
+        self.assertNotIn("x-amz-security-token", request["headers"])  # static HMAC keys
+
+    def test_multipart_omits_checksum_headers_and_completion_elements(self):
+        self.client.multipart_upload("multi", s3.SeededPayload("large", 5 * 1024**2 + 99),
+                                     part_size=5 * 1024**2)
+        requests = self.state["requests"]
+        self.assertEqual([r["method"] for r in requests], ["POST", "PUT", "PUT", "POST"])
+        self.assertNotIn("x-amz-checksum-algorithm", requests[0]["headers"])
+        self.assertNotIn("x-amz-checksum-type", requests[0]["headers"])
+        self.assertTrue(all("x-amz-checksum-crc32" not in r["headers"] for r in requests[1:3]))
+        # GCS documents only PartNumber and ETag completion elements.
+        root = ET.fromstring(requests[-1]["body"])
+        self.assertEqual([part.findtext("PartNumber") for part in root], ["1", "2"])
+        self.assertEqual([part.findtext("ETag") for part in root], ['"part-etag"'] * 2)
+        self.assertEqual([part.findtext("ChecksumCRC32") for part in root], [None, None])
+
+    def test_verified_range_get_and_dotted_bucket_names(self):
+        # GCS honors single contiguous ranges with 206 + inclusive Content-Range;
+        # path-style addressing keeps dotted bucket names on TLS.
+        response = self.client.get_object("key", byte_range=(65000, 140000),
+                                          payload=self.state["payload"])
+        self.assertEqual(response.status, 206)
+        self.assertEqual(response.timing.bytes_received, 75001)
+        dotted = s3.S3Client("bench.gcs", "asia-south1", provider="gcs", timeout=2, backoff=0,
+                             endpoint=self.endpoint)
+        self.addCleanup(dotted.close)
+        dotted.put_object("key", s3.SeededPayload("s", 8))
+        self.assertEqual(self.state["requests"][-1]["path"], "/bench.gcs/key")
 
 
 if __name__ == "__main__":
