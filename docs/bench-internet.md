@@ -60,6 +60,8 @@ rack-bench bench internet
                                     # a provider may repeat for several buckets
     [--concurrent N]               # override parallel streams (default 32)
     [--duration 60s]               # override per-test duration
+    [--upload-mode auto|multipart] # default auto: one PutObject for
+                                   # single-part-sized objects
     [--tool stdlib|warp]           # default stdlib; warp for certify (§7)
     [--keep-data]                  # skip bucket cleanup
     [--yes]                        # accept cost estimate for certify
@@ -112,9 +114,17 @@ Run in this order; each is one or more `Check` entries per provider.
    Failed/invalid samples never become zero latency. Certify's nearest band
    retains three runs and drops best/worst ranked by response-TTFB p50; each
    light band has only one 20-GET run.
-4. **Sustained upload (egress)** — parallel multipart PUTs of profile-sized
+4. **Sustained upload (egress)** — parallel PUTs of profile-sized
    random objects for the profile duration (32 MiB in quick so objects
-   complete and feed downloads; ~1 GiB in certify for sustained streams). Random data defeats provider-side
+   complete and feed downloads; ~1 GiB in certify for sustained streams).
+   An object that fits in one part (`object_size <= part_size`) goes up as a
+   single plain `PutObject` — one measured request, no initiate/complete
+   round trips. Larger objects keep multipart: the 64 MiB part bound keeps
+   every request inside the 30 s socket timeout, which a GB-scale single PUT
+   would outlive at single-stream rates. `--upload-mode multipart` forces the
+   initiate/part/complete pattern for forced A/B comparisons; every measured
+   upload still fails its window on 5xx, and each sample records its
+   `upload_mode` (`put` or `multipart`). Random data defeats provider-side
    compression/dedup. With several buckets configured, streams are assigned
    round-robin across them at window start (§8). **Concurrent small-object TTFB probes** run during the
    window → loaded-latency signal: p95 under load, inflation vs test 3's
@@ -208,6 +218,9 @@ exists, and reduces it to one finding string:
   (connect to first response byte), because the PUT body streams before the
   service responds. A service-paced per-connection rate shows here while the
   socket counters stay clean.
+- `upload_modes` — upload windows only: completed objects per upload mode
+  (`put` or `multipart`), matching the `upload_mode` field on each upload
+  sample. Download checks never carry the field.
 - `socket_limits` — during the window, `ss -ti` reports per-socket
   busy/rwnd_limited/cwnd_limited/sndbuf_limited time shares (percent of socket
   busy time; printed only when nonzero, absent means zero), plus delivery_rate
