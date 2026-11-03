@@ -98,6 +98,26 @@ class SigningVectors(unittest.TestCase):
                                                       "a=%2B%20%25&a=%2F&z="])
         self.assertEqual(s3.encoded_query(()), "")
 
+    def test_gcs_interop_signing_scope_golden_string(self):
+        # Google's S3 XML interop accepts the AWS SigV4 credential scope
+        # unchanged; Google's own SDK samples configure signing region "auto".
+        # The scope is the only region-bearing wire string, so pin it exactly.
+        headers = {"host": "storage.googleapis.com", "x-amz-content-sha256": EMPTY_HASH,
+                   "x-amz-date": "20130524T000000Z"}
+        canonical = s3.canonical_request("GET", "/bench-bucket/key", (), headers, EMPTY_HASH)
+        self.assertEqual(canonical,
+                         "GET\n/bench-bucket/key\n\nhost:storage.googleapis.com\n"
+                         "x-amz-content-sha256:" + EMPTY_HASH + "\n"
+                         "x-amz-date:20130524T000000Z\n\n"
+                         "host;x-amz-content-sha256;x-amz-date\n" + EMPTY_HASH)
+        signed = s3.sign_headers(s3.Credentials("GOOG1EXAMPLEKEY", "goog-secret-key"), "GET",
+                                 "/bench-bucket/key", (), headers, EMPTY_HASH, "auto",
+                                 "20130524T000000Z")
+        self.assertEqual(signed["authorization"],
+                         "AWS4-HMAC-SHA256 Credential=GOOG1EXAMPLEKEY/20130524/auto/s3/"
+                         "aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, "
+                         "Signature=c84c105433346fff9dab3f90079658db538d7ae128c9286df7ced6e32b62884b")
+
     def test_session_token_and_real_payload_hash_signed(self):
         digest = hashlib.sha256(b"payload").hexdigest()
         headers = s3.sign_headers(s3.Credentials("key", "secret", "token"), "PUT", "/", (),
@@ -216,17 +236,32 @@ class PayloadTests(unittest.TestCase):
             os.environ["AWS_SECRET_ACCESS_KEY"] = "secret"
             os.environ["AWS_SESSION_TOKEN"] = "session"
             self.assertEqual(s3.Credentials.from_env().token, "session")
+            # gcs keys live in their own variables, so one process can hold
+            # AWS and Google credentials for a mixed-provider run.
+            with self.assertRaisesRegex(s3.CredentialError, "GCS_ACCESS_KEY_ID"):
+                s3.Credentials.from_env("gcs")
+            os.environ["GCS_ACCESS_KEY_ID"] = "GOOG1Ekey"
+            with self.assertRaisesRegex(s3.CredentialError, "GCS_SECRET_ACCESS_KEY"):
+                s3.Credentials.from_env("gcs")
+            os.environ["GCS_SECRET_ACCESS_KEY"] = "goog-secret"
+            self.assertEqual(s3.Credentials.from_env("gcs"),
+                             s3.Credentials("GOOG1Ekey", "goog-secret"))  # no session token
+            self.assertEqual(s3.Credentials.from_env().secret_key, "secret")  # AWS vars untouched
             with self.assertRaisesRegex(s3.CredentialError, "R2_ACCOUNT_ID"):
                 s3.resolve_endpoint("r2", "apac")
             os.environ["R2_ACCOUNT_ID"] = "account"
             self.assertEqual(s3.resolve_endpoint("r2", "apac"),
                              s3.Endpoint("account.r2.cloudflarestorage.com", "auto", True))
+            # Global anycast XML API endpoint; path-style keeps dotted GCS
+            # bucket names valid and the scope signs with Google's "auto".
+            self.assertEqual(s3.resolve_endpoint("gcs", "asia-south1"),
+                             s3.Endpoint("storage.googleapis.com", "auto", True))
         self.assertEqual(s3.resolve_endpoint("s3", "ap-south-1"),
                          s3.Endpoint("s3.ap-south-1.amazonaws.com", "ap-south-1", False))
         with self.assertRaises(ValueError):
             s3.resolve_endpoint("s3", "bad/region")
         with self.assertRaises(ValueError):
-            s3.resolve_endpoint("gcs", "auto")
+            s3.resolve_endpoint("gcs", "bad/location")
 
     def test_ipv4_connection_uses_local_timeout(self):
         with patch.object(s3.socket, "getaddrinfo", return_value=[
@@ -276,6 +311,7 @@ class MockS3(BaseHTTPRequestHandler):
         state["requests"].append(record)
         remaining = int(headers.get("content-length", "0"))
         sha = hashlib.sha256()
+        md5 = hashlib.md5()
         crc = 0
         xml = bytearray()
         while remaining:
@@ -285,6 +321,7 @@ class MockS3(BaseHTTPRequestHandler):
             remaining -= len(data)
             state["max_read"] = max(state["max_read"], len(data))
             sha.update(data)
+            md5.update(data)
             crc = zlib.crc32(data, crc)
             if self.command == "POST":
                 xml.extend(data)
@@ -301,12 +338,20 @@ class MockS3(BaseHTTPRequestHandler):
         if headers.get("x-amz-content-sha256") != sha.hexdigest():
             self.reply(400, b"<Error><Code>BadDigest</Code></Error>")
             return
-        if self.command == "PUT" or xml:
+        if self.command == "PUT":
             expected_crc = base64.b64encode(crc.to_bytes(4, "big")).decode()
+            expected_md5 = base64.b64encode(md5.digest()).decode()
             record["crc32"] = expected_crc
-            if ("content-md5" in headers or
-                    self.command == "PUT" and headers.get("x-amz-checksum-crc32") != expected_crc or
-                    state.get("reject_digest")):
+            sent_crc = headers.get("x-amz-checksum-crc32")
+            sent_md5 = headers.get("content-md5")
+            # Every measured PUT carries exactly one server-verifiable digest:
+            # the S3 CRC32 extension or the GCS interop Content-MD5, never both
+            # (S3 rejects the combination) and never neither. Control POSTs
+            # (complete-multipart XML) carry no body digest, so stay unchecked.
+            if (state.get("reject_digest") or
+                    sent_crc is not None and sent_crc != expected_crc or
+                    sent_md5 is not None and sent_md5 != expected_md5 or
+                    (sent_crc is None and sent_md5 is None)):
                 self.reply(400, b"<Error><Code>InvalidDigest</Code></Error>")
                 return
         if self.command == "POST" and "uploads=" in self.path:
@@ -665,6 +710,51 @@ class TransportTests(unittest.TestCase):
                 with self.assertRaises(s3.ProtocolError):
                     self.client.cleanup_prefix("bench/")
         self.assertEqual(self.state["counts"]["DELETE"], 0)
+
+    def test_gcs_provider_request_shape_end_to_end(self):
+        # The loopback server is provider-agnostic: exercise the full gcs path
+        # (GCS_* env creds, path-style addressing, auto signing scope, and the
+        # documented Content-MD5 verification instead of S3's CRC32 extension).
+        os.environ.update(GCS_ACCESS_KEY_ID="GOOG1EKEY", GCS_SECRET_ACCESS_KEY="goog-secret")
+        client = s3.S3Client("bench-gcs", "asia-south1", provider="gcs", timeout=2, backoff=0,
+                             endpoint=s3.Endpoint("127.0.0.1", "auto", True,
+                                                  self.server.server_port, False))
+        self.addCleanup(client.close)
+        payload = s3.SeededPayload("gcs-payload", 5 * 1024**2 + 5)
+        self.state["payload"] = payload  # the loopback GET serves this payload
+        parts = []
+        client.multipart_upload("gcs/object", payload, part_size=5 * 1024**2,
+                                on_part=parts.append)
+        initiate, put_one, put_two, complete = self.state["requests"]
+        # Path-style addressing and Google-keyed credentials with no session token.
+        self.assertEqual(initiate["path"], "/bench-gcs/gcs/object?uploads=")
+        self.assertEqual(initiate["headers"]["host"], f"127.0.0.1:{self.server.server_port}")
+        self.assertIn("Credential=GOOG1EKEY/", initiate["headers"]["authorization"])
+        self.assertIn("/auto/s3/aws4_request", initiate["headers"]["authorization"])
+        self.assertNotIn("x-amz-security-token", initiate["headers"])
+        # GCS documents Content-MD5, not the S3 flexible-checksum extension.
+        for request in (initiate, put_one, put_two):
+            self.assertNotIn("x-amz-checksum-algorithm", request["headers"])
+        for request in (put_one, put_two):
+            self.assertIn("content-md5", request["headers"])
+            self.assertNotIn("x-amz-checksum-crc32", request["headers"])
+        sha, crc, md5 = s3.part_digests(payload, 0, 5 * 1024**2)
+        self.assertEqual(put_one["headers"]["content-md5"], md5)
+        root = ET.fromstring(complete["body"])
+        self.assertNotIn("ChecksumCRC32", complete["body"].decode())
+        self.assertEqual([part.findtext("PartNumber") for part in root], ["1", "2"])
+        self.assertEqual(len(parts), 2)
+        # A range GET through the same provider path verifies and stays measured.
+        chunks = []
+        response = client.get_object("gcs/object", byte_range=(11, 40000),
+                                     payload=payload,
+                                     consume=lambda data, offset: chunks.append((data, offset)))
+        self.assertEqual(response.status, 206)
+        self.assertEqual(response.timing.bytes_received, 39990)
+        self.assertEqual(b"".join(data for data, _ in chunks),
+                         b"".join(payload.iter_chunks(11, 39990)))
+        client.cleanup_prefix("bench/")  # the loopback list serves bench/* keys
+        self.assertEqual(self.state["counts"]["DELETE"], 2)
 
     def test_gib_source_upload_uses_bounded_reads_and_memory(self):
         # Source is GB-scale; transfer a 32 MiB part near its end. Socket sends
