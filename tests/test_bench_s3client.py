@@ -423,6 +423,11 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(response.timing.attempts, 1)
         self.assertIsNotNone(response.timing.headers_seconds)
         self.assertEqual(response.body, b"")
+        # The measured single-request path is unchanged for s3/r2: one signed
+        # PUT carrying the same SHA256 payload digest and CRC32 header.
+        self.assertEqual([r["method"] for r in self.state["requests"]], ["PUT"])
+        self.assertEqual(request["headers"]["x-amz-checksum-crc32"], request["crc32"])
+        self.assertNotIn("content-md5", request["headers"])
 
     def test_virtual_hosted_request_shape(self):
         self.client.endpoint = s3.Endpoint("localhost", "us-east-1", False,
@@ -737,6 +742,8 @@ class GcsInteropTests(unittest.TestCase):
     def test_put_is_path_style_location_scoped_without_flexible_checksums(self):
         payload = s3.SeededPayload("put", 123456, chunk_size=64 * 1024)
         self.client.put_object("key", payload)
+        # The single-request upload path: one PUT, no initiate/complete.
+        self.assertEqual([request["method"] for request in self.state["requests"]], ["PUT"])
         request = self.state["requests"][0]
         self.assertEqual(request["path"], "/bucket/key")
         self.assertEqual(request["headers"]["host"], f"127.0.0.1:{self.server.server_port}")
