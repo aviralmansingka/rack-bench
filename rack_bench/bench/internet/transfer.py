@@ -39,7 +39,24 @@ OBJECT_SIZE = 1024 * MIB
 # do not raise the default past 128 MiB without re-checking that interaction.
 PART_SIZE = 64 * MIB
 LIGHT_SIZE = 32 * MIB
+UPLOAD_MODES = ("auto", "multipart")
 ERRORS = (S3Error, ValueError, OSError)
+
+
+def select_upload_mode(size, part_size, mode="auto"):
+    """One plain PutObject for single-part-sized objects; multipart otherwise.
+
+    A single PutObject is one request per object instead of initiate + part +
+    complete (three), which removes the request-rate amplification suspected to
+    trip provider ingest limits. Objects larger than one part keep multipart:
+    one request at low single-stream rates would outlive the 30 s socket
+    timeout, while multipart bounds each request to one part. Equal size is
+    single-part; auto is the default rule, and mode="multipart" forces the
+    legacy path for A/B comparisons.
+    """
+    if mode not in UPLOAD_MODES:
+        raise ValueError(f"upload_mode must be one of {UPLOAD_MODES}")
+    return "multipart" if mode == "multipart" or size > part_size else "put"
 
 
 class _WindowEnded(S3Error):
@@ -264,6 +281,7 @@ def _transfer_worker(spec):
             payload = SeededPayload(**record["payload"])
         client = clients[bucket]
         pending, last, part_number = {}, 0, 0
+        mode = None
         cpu_start = time.thread_time()
 
         def progress(count, _seconds):
@@ -285,6 +303,8 @@ def _transfer_worker(spec):
             if sum(pending.values()) != count:
                 raise ProtocolError("progress bytes differ from measured transfer", timing=response.timing)
             sample.update(bytes=count, key=key, part=part_number, bucket=bucket, cpu_ms=(time.thread_time() - cpu_start) * 1000)
+            if mode is not None:
+                sample["upload_mode"] = mode
             samples.append(sample)
             points.extend(pending.items())
             pending.clear()
@@ -295,13 +315,22 @@ def _transfer_worker(spec):
         try:
             if direction == "up":
                 owned_keys.append((bucket, key))
-                _echo(f"multipart PUT {object_url(client, key)} ({payload.size} bytes)")
-                def on_part(response):
-                    accept(response, min(spec["part_size"], payload.size - part_number * spec["part_size"]))
-                    if part_number * spec["part_size"] < payload.size and (stop.is_set() or not spec["one_object"] and clock() >= deadline):
-                        raise _WindowEnded("profile window ended; abort incomplete multipart")
-                client.multipart_upload(key, payload, part_size=spec["part_size"], on_part=on_part, on_progress=progress)
-                completed.append({"key": key, "bucket": bucket, "payload": {"seed": payload.seed, "size": payload.size, "chunk_size": payload.chunk_size}})
+                mode = select_upload_mode(payload.size, spec["part_size"], spec.get("upload_mode", "auto"))
+                _echo(f'{"PUT" if mode == "put" else "multipart PUT"} {object_url(client, key)} ({payload.size} bytes)')
+                if mode == "put":
+                    # One measured request, the same single-part window shape as
+                    # before: the deadline can stop before this object starts or
+                    # between objects, never mid-PUT. No measured request retries.
+                    response = client.put_object(key, payload, on_progress=progress)
+                    accept(response, payload.size)
+                else:
+                    def on_part(response):
+                        accept(response, min(spec["part_size"], payload.size - part_number * spec["part_size"]))
+                        if part_number * spec["part_size"] < payload.size and (stop.is_set() or not spec["one_object"] and clock() >= deadline):
+                            raise _WindowEnded("profile window ended; abort incomplete multipart")
+                    client.multipart_upload(key, payload, part_size=spec["part_size"], on_part=on_part, on_progress=progress)
+                completed.append({"key": key, "bucket": bucket, "upload_mode": mode,
+                                  "payload": {"seed": payload.seed, "size": payload.size, "chunk_size": payload.chunk_size}})
             else:
                 # One stream reads one uploaded object in bounded, verified ranges.
                 for offset in range(0, payload.size, spec["part_size"]):
@@ -327,6 +356,12 @@ def _transfer_worker(spec):
         iteration += 1
         if spec["one_object"]:
             break
+    # Pooled sockets are thread-local, and a single-stream window runs this
+    # worker in a short-lived thread: release the connection this task opened so
+    # it is not left to interpreter finalization. Worker processes close the
+    # same way just before exiting.
+    for used in clients.values():
+        used.close()
     return samples, points, completed, errors, owned_keys, incomplete_objects, attempted_bytes
 
 
@@ -334,7 +369,7 @@ def transfer_window(client, *, direction, prefix, concurrency, duration, objects
                     owned, size=OBJECT_SIZE, one_object=False, loaded=None,
                     clock=time.monotonic, tcp_factory=TCPWindow, host="", loaded_interval=1.0,
                     part_size=None, seed=None, pool_factory=None, buckets=None, clients=None,
-                    provider="s3"):
+                    provider="s3", upload_mode="auto"):
     """Schedule until deadline, drain the current part/range; report actual wall time.
 
     No object-sized buffers. Validate each measured part/range before accepting
@@ -363,7 +398,9 @@ def transfer_window(client, *, direction, prefix, concurrency, duration, objects
     work unchanged. The loaded-latency probe always stays in this (parent)
     process as a thread with fresh_connection=True semantics. provider names
     the window's provider so worker processes build clients that resolve that
-    provider's credentials; direct calls keep the s3 default.
+    provider's credentials; direct calls keep the s3 default. upload_mode is
+    "auto" (one PutObject when the object fits one part, multipart otherwise)
+    or "multipart" to force the legacy path for A/B comparisons.
     """
     if part_size is None:
         part_size = PART_SIZE  # resolved per call so tests can patch the default
@@ -404,7 +441,7 @@ def transfer_window(client, *, direction, prefix, concurrency, duration, objects
     def task(index):
         return {"direction": direction, "prefix": prefix, "index": index, "objects": objects,
                 "size": size, "one_object": one_object, "deadline": deadline, "start": start,
-                "part_size": part_size, "seed": seed, "clock": clock,
+                "part_size": part_size, "seed": seed, "clock": clock, "upload_mode": upload_mode,
                 "bucket": names[index % len(names)],
                 "clients": None if out_of_process else in_process,
                 "stop": None if out_of_process else stop,
@@ -495,6 +532,14 @@ def transfer_window(client, *, direction, prefix, concurrency, duration, objects
               "ceiling": ceiling_verdict(stats, tcp.detail.get("limits"), tcp.detail.get("ratio_pct")),
               "errors": errors, "loaded_samples": loaded_samples, "loaded_errors": loaded_errors,
               "loaded_bytes": loaded_bytes, "tcp": tcp.detail}
+    if direction == "up":
+        # Additive evidence: one count per completed object by upload mode.
+        modes = {}
+        for record in completed:
+            mode = record.get("upload_mode")
+            if mode is not None:
+                modes[mode] = modes.get(mode, 0) + 1
+        result["upload_modes"] = modes
     if len(names) > 1:
         # Multi-bucket windows keep per-bucket sample evidence; buckets without a
         # measured sample stay absent, never a zero rate. The 1 s bucket stream
@@ -582,6 +627,9 @@ def transfer_check(provider, direction, metric, options, records):
                       steadiness_ratio=chosen.get("steadiness_ratio"),
                       ttfb_ms=chosen.get("ttfb_ms"), post_ttfb_mib_per_sec=chosen.get("post_ttfb_mib_per_sec"),
                       socket_limits=chosen["tcp"].get("limits"), ceiling=chosen.get("ceiling"))
+        if direction == "up" and "upload_modes" in chosen:
+            # Additive: completed objects by measured upload mode.
+            detail["upload_modes"] = chosen["upload_modes"]
         if chosen.get("per_bucket"):
             # Multi-bucket runs only: per-bucket sample evidence, additive.
             detail["per_bucket"] = chosen["per_bucket"]
@@ -595,9 +643,20 @@ def transfer_check(provider, direction, metric, options, records):
     else:
         detail["reason"] = ("owned-key cleanup failed" if primary.get("cleanup_errors") else primary["reason"] or
                             "needs valid sustained transfer runs (all 3 for certify reduction)")
+    def source_label(record):
+        if direction != "up":
+            return "verified range GET"
+        modes = {mode for run in record.get("runs_detail", [])
+                 for mode in (run.get("upload_modes") or {})}
+        if modes == {"put"}:
+            return "PUT"
+        if modes == {"multipart"}:
+            return "multipart PUT"
+        return "PUT/multipart" if modes else "multipart PUT"  # no mode evidence: legacy label
+
     return Check(f"internet.{provider}.{suffix}.{metric}", "pass" if chosen else "skip",
                  chosen["mib_per_sec" if metric == "throughput" else "objs_per_sec"] if chosen else None,
-                 detail=json.dumps(detail), source=[f'{"multipart PUT" if direction == "up" else "verified range GET"} {r["endpoint"]} buckets={",".join(bucket_names(provider, options))} prefix={run_prefix(options)}' for r in records])
+                 detail=json.dumps(detail), source=[f'{source_label(r)} {r["endpoint"]} buckets={",".join(bucket_names(provider, options))} prefix={run_prefix(options)}' for r in records])
 
 
 def cleanup(options):

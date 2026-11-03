@@ -650,7 +650,12 @@ class S3Client:
 
     def put_object(self, key: str, payload: SeededPayload, *,
                    on_progress: Callable[[int, float], None] | None = None) -> Response:
-        """on_progress(bytes_sent, seconds) runs after each bounded socket send."""
+        """One measured PutObject request (no initiate/part/complete).
+
+        on_progress(bytes_sent, seconds) runs after each bounded socket send.
+        Provider checksum semantics match upload_part: s3/r2 send the signed
+        SHA256 and CRC32 headers; gcs sends the signed SHA256 only.
+        """
         return self._upload(key, payload, 0, payload.size, on_progress=on_progress)
 
     def initiate_multipart(self, key: str) -> str:
