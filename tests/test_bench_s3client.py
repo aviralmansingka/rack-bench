@@ -423,6 +423,9 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(response.timing.attempts, 1)
         self.assertIsNotNone(response.timing.headers_seconds)
         self.assertEqual(response.body, b"")
+        self.assertEqual(self.state["counts"]["PUT"], 1)  # one measured request, no multipart control calls
+        expected_crc = s3.checksum_headers(s3.SeededPayload("put", 200000, chunk_size=64 * 1024).iter_chunks())["x-amz-checksum-crc32"]
+        self.assertEqual(request["headers"]["x-amz-checksum-crc32"], expected_crc)
 
     def test_virtual_hosted_request_shape(self):
         self.client.endpoint = s3.Endpoint("localhost", "us-east-1", False,
@@ -744,6 +747,8 @@ class GcsInteropTests(unittest.TestCase):
         # bucket location signs directly, service stays s3 (AWS SigV4).
         self.assertIn("Credential=GOOGEXAMPLE/", request["headers"]["authorization"])
         self.assertIn("/asia-south1/s3/aws4_request", request["headers"]["authorization"])
+        self.assertEqual(self.state["counts"]["PUT"], 1)
+        self.assertEqual([item["method"] for item in self.state["requests"]], ["PUT"])
         # The signed SHA256 payload digest rides on every upload; the S3
         # flexible-checksum header does not (GCS validates CRC32C natively).
         self.assertEqual(request["headers"]["x-amz-content-sha256"],
