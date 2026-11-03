@@ -171,11 +171,27 @@ class LatencyTests(unittest.TestCase):
         self.assertEqual([r["status"] for r in regions], ["pass", "skip", "skip"])
         self.assertIn("https://test.r2.cloudflarestorage.com/bench-r2/", check.source[0])
 
-    def test_gcs_and_warp_are_explicitly_unsupported(self):
-        self.assertEqual(self.probe("gcs").status, "skip")
+    def test_gcs_provider_path_and_warp_still_unsupported(self):
+        # Missing GCS HMAC credentials SKIP before any client construction.
+        check = self.probe("gcs")
+        self.assertEqual(check.status, "skip")
+        self.assertIn("credentials not set: missing environment variable: GCS_ACCESS_KEY_ID", check.detail)
+        self.factory.assert_not_called()
+        env = patch.dict(os.environ, {"GCS_ACCESS_KEY_ID": "test", "GCS_SECRET_ACCESS_KEY": "test"})
+        env.start()
+        self.addCleanup(env.stop)
+        self.assertIn("--buckets gcs=<name>", self.probe("gcs").detail)  # no bucket yet
+        self.factory.assert_not_called()
+        self.options.buckets = {"gcs": "bench-gcs"}
+        check = self.probe("gcs")
+        self.assertEqual(check.status, "pass")
+        # GCS maps the bucket location (default asia-south1) to the global
+        # virtual-hosted interop endpoint.
+        self.factory.assert_called_with("bench-gcs", "asia-south1", provider="gcs")
+        self.assertIn("https://bench-gcs.storage.googleapis.com/", check.source[0])
+        self.options.buckets = {"s3": "bench-bucket"}
         self.options.tool = "warp"
         self.assertIn("Warp execution not implemented", self.probe().detail)
-        self.factory.assert_not_called()
 
     def test_part_two_dependencies_do_not_launch_hidden_uploads(self):
         for suffix, needed in (("download.throughput", "upload objects"),

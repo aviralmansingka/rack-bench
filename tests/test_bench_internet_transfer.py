@@ -841,11 +841,54 @@ class ProcessPoolTransferTests(unittest.TestCase):
         self.assertTrue(any(method == "DELETE" and "uploadId" in path
                             for method, path in self.server.state["requests"]))  # aborted upload IDs
 
+    def test_gcs_provider_path_end_to_end_through_loopback(self):
+        # The full gcs provider plumbing -- targets/region mapping, per-provider
+        # credentials, upload + download policies, grading and cleanup -- drives
+        # the real client against the provider-agnostic loopback server.
+        env = patch.dict(os.environ, {"GCS_ACCESS_KEY_ID": "fake", "GCS_SECRET_ACCESS_KEY": "fake"})
+        env.start()
+        self.addCleanup(env.stop)
+        # Concurrency 2 takes the process-pool path: worker processes rebuild
+        # gcs clients from the plain configs, credentials env names included.
+        options = Options(providers=("gcs",), buckets={"gcs": "bucket"}, concurrent=2,
+                          duration=1, object_size=8)
+        self.server.state = {"payload": s3.SeededPayload(targets.run_seed(options), 8 * transfer.MIB),
+                             "requests": []}
+        seen = {}
+
+        def factory(bucket, region, *, provider):
+            seen.update(bucket=bucket, region=region, provider=provider)
+            return S3Client(bucket, region, provider=provider, timeout=10, backoff=0,
+                            endpoint=self.endpoint)
+
+        def window(client, **kwargs):
+            return transfer.transfer_window(client, tcp_factory=FakeTCP, **kwargs)
+
+        selected = targets.targets("gcs", options)
+        self.assertEqual(selected[0]["endpoint"], "https://storage.googleapis.com")
+        self.assertEqual(selected[0]["region"], "asia-south1")
+        up = upload.upload_reports("gcs", options, client_factory=factory, window=window)
+        check = transfer.transfer_check("gcs", "up", "throughput", options, up)
+        self.assertEqual((check.name, check.status), ("internet.gcs.upload.throughput", "pass"))
+        self.assertEqual(seen, {"bucket": "bucket", "region": "asia-south1", "provider": "gcs"})
+        detail = json.loads(check.detail)
+        self.assertEqual(detail["buckets"], ["bucket"])
+        self.assertEqual(detail["regions"][0]["endpoint"], "https://storage.googleapis.com")
+        down = download.download_reports("gcs", options, client_factory=factory, window=window)
+        check = transfer.transfer_check("gcs", "down", "throughput", options, down)
+        self.assertEqual((check.name, check.status), ("internet.gcs.download.throughput", "pass"))
+        transfer.cleanup(options)
+        methods = [method for method, _ in self.server.state["requests"]]
+        self.assertIn("POST", methods)   # multipart initiate/complete
+        self.assertIn("PUT", methods)    # measured part uploads
+        self.assertIn("GET", methods)    # verified range reads
+        self.assertIn("DELETE", methods)  # owned-key cleanup
+
     def test_pool_initialiser_state_and_picklable_worker_task(self):
         import pickle
         slots = multiprocessing.Array("i", 2)
         stop = multiprocessing.Event()
-        transfer._pool_initialiser((("bucket", self.endpoint, 10, 2, 0),), stop, slots,
+        transfer._pool_initialiser((("bucket", "r2", self.endpoint, 10, 2, 0),), stop, slots,
                                    2 * 1024 * 1024, None)
         self.assertIsInstance(transfer._POOL_STATE["clients"]["bucket"], S3Client)
         self.assertIs(transfer._POOL_STATE["stop"], stop)

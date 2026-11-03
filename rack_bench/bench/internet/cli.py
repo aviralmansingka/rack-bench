@@ -64,10 +64,10 @@ def _bucket_name(provider, bucket):
     if (not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket) or
             ".." in bucket or ".-" in bucket or "-." in bucket or
             re.fullmatch(r"[0-9]+(?:\.[0-9]+){3}", bucket) or
-            provider == "s3" and "." in bucket):
+            provider in ("s3", "gcs") and "." in bucket):
         raise argparse.ArgumentTypeError(
             "expected provider=bucket pairs with DNS-compatible bucket names "
-            "(S3 virtual-hosted TLS names cannot contain dots)")
+            "(s3/gcs virtual-hosted TLS names cannot contain dots)")
     return bucket
 
 

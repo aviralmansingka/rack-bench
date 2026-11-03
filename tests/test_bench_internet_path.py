@@ -122,6 +122,40 @@ class PathTests(unittest.TestCase):
         override = targets("s3", Options(profile="certify", regions={"s3": "eu-west-1"}))
         self.assertEqual(len(override), 1)
 
+    def test_gcs_locations_map_to_global_interop_endpoint(self):
+        with self.assertRaisesRegex(ValueError, "GCS_ACCESS_KEY_ID"):
+            targets("gcs", Options())
+        env = patch.dict(os.environ, {"GCS_ACCESS_KEY_ID": "test", "GCS_SECRET_ACCESS_KEY": "test"})
+        env.start()
+        self.addCleanup(env.stop)
+        quick = targets("gcs", Options())
+        self.assertEqual([t["region"] for t in quick], ["asia-south1"])
+        self.assertEqual(quick[0]["endpoint"], "https://storage.googleapis.com")
+        self.assertEqual(quick[0]["host"], "storage.googleapis.com")
+        self.assertIsNone(quick[0]["reason"])
+        certify = targets("gcs", Options(profile="certify"))
+        self.assertEqual([t["region"] for t in certify], ["asia-south1", "asia-southeast1", "us-east1"])
+        self.assertEqual([t["band"] for t in certify], ["nearest", "light", "light"])
+        self.assertEqual([t["runs"] for t in certify], [3, 1, 1])
+        override = targets("gcs", Options(profile="certify", regions={"gcs": "asia-south2"}))
+        self.assertEqual([t["region"] for t in override], ["asia-south2"])
+
+    def test_gcs_rtt_sanity_uses_mumbai_reference_band(self):
+        env = patch.dict(os.environ, {"GCS_ACCESS_KEY_ID": "test", "GCS_SECRET_ACCESS_KEY": "test"})
+        env.start()
+        self.addCleanup(env.stop)
+        check = path.path_probe("gcs", "rtt_sanity", Options(), run=self.run,
+                                which=lambda name: "/usr/bin/" + name, resolve=self.resolve)
+        self.assertEqual(check.status, "pass")
+        self.assertIn("asia-south1: 25 ms (reference 20-35 ms)", check.value)
+        self.resolve.assert_called_once_with("storage.googleapis.com", 443,
+                                             socket.AF_INET, socket.SOCK_STREAM)
+        self.run.return_value.stdout = MTR + DEST.replace("25.0", "90.0")
+        self.options = Options()  # fresh path-report cache
+        check = path.path_probe("gcs", "rtt_sanity", self.options, run=self.run,
+                                which=lambda name: "/usr/bin/" + name, resolve=self.resolve)
+        self.assertEqual(check.status, "warn")
+
     def test_context_missing_credentials_no_io(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertIn("credentials not set", self.probe("hops").detail)

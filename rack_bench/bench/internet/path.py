@@ -24,7 +24,12 @@ from .stats import describe
 from .targets import reason, targets
 
 # Chennai-origin references: docs/internet-performance.md § regional RTTs.
-RTT_BANDS = {"ap-south-1": (20, 35), "ap-southeast-1": (35, 55), "us-east-1": (180, 250)}
+# asia-south1 is GCS Mumbai, the same metro as S3 ap-south-1, and Google
+# publishes a Chennai edge POP (research/internet-research/hyperscalers.md), so
+# the GCS nearest band shares the Mumbai reference. No measured reference
+# exists for the GCS light bands; they stay ungraded records.
+RTT_BANDS = {"ap-south-1": (20, 35), "ap-southeast-1": (35, 55), "us-east-1": (180, 250),
+             "asia-south1": (20, 35)}
 
 
 def parse_mtr(text):
@@ -145,7 +150,7 @@ def path_probe(provider, metric, options, *, run=subprocess.run, which=shutil.wh
         else:
             findings, primary_findings = [], []
             for region in records:
-                band = RTT_BANDS.get(region["region"]) if provider == "s3" else None
+                band = RTT_BANDS.get(region["region"]) if provider in ("s3", "gcs") else None
                 for report in region["reports"]:
                     if report.get("reason") or not report["hops"]:
                         continue

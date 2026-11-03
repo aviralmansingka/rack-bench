@@ -88,7 +88,7 @@ class BenchTests(unittest.TestCase):
         self.assertEqual(internet.cli.buckets("s3=one,s3=two,r2=r2bench"),
                          {"s3": ("one", "two"), "r2": ("r2bench",)})
         for value in ("", "azure=x", "s3=", "s3=bench,", "s3=bench,s3=bench",
-                      "s3=dotted.bucket", "r2=bad..bucket", "r2=127.0.0.1", "s3=a=b"):
+                      "s3=dotted.bucket", "gcs=dotted.bucket", "r2=bad..bucket", "r2=127.0.0.1", "s3=a=b"):
             with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError) as error:
                 internet.cli.buckets(value)
             self.assertIn("bucket", str(error.exception))
@@ -114,7 +114,8 @@ class BenchTests(unittest.TestCase):
             ("--regions", "s3=east,"), ("--regions", ""), ("--unknown", "x"),
             ("--buckets", ""), ("--buckets", "azure=bench"), ("--buckets", "s3="),
             ("--buckets", "s3=bench,s3=bench"), ("--buckets", "s3=ab"),
-            ("--buckets", "s3=dotted.bucket"), ("--buckets", "r2=bad..bucket"),
+            ("--buckets", "s3=dotted.bucket"), ("--buckets", "gcs=dotted.bucket"),
+            ("--buckets", "r2=bad..bucket"),
             ("--buckets", "r2=127.0.0.1"), ("--buckets", "s3=bench,"),
         ]
         for flags in cases:
