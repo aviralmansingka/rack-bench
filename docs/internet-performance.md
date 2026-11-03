@@ -138,9 +138,10 @@ Notes:
   transfer-encoding). Implemented in `bench internet` as the opt-in `gcs`
   provider: `https://storage.googleapis.com` with path-style requests,
   HMAC keys from `GCS_ACCESS_KEY_ID`/`GCS_SECRET_ACCESS_KEY`, multipart
-  part bounds identical to S3's, and no S3 CRC32 flexible checksums on
-  uploads (GCS validates CRC32C natively; downloads verify every byte
-  client-side).
+  part bounds identical to S3's, and `x-goog-hash` CRC32C upload
+  integrity (validated per part and per object) in place of S3's
+  flexible checksums, which the interop API does not implement;
+  downloads verify every byte client-side.
 
 ### Tool recommendation: Warp (MinIO), single binary, for all three
 

@@ -288,11 +288,12 @@ it.
   object), so the `--part-size 8..512` bounds stay unchanged. It honors
   single contiguous Range GETs (206 plus inclusive Content-Range) and
   requires Content-Length on non-chunked PUTs, which the client always
-  sends. GCS validates only CRC32C natively and mishandles the S3-style
-  CRC32 headers, so gcs uploads — multipart parts and single-part
-  `PutObject`s alike — omit the flexible-checksum headers and completion
-  elements and carry the signed SHA256 payload digest;
-  downloads verify every byte client-side, as for every provider.
+  sends. The S3 flexible-checksum headers are not part of the XML interop
+  API, so gcs uploads — multipart parts and single-part `PutObject`s alike —
+  omit them and the completion `ChecksumCRC32` elements, and instead carry
+  the documented `x-goog-hash` CRC32C (big-endian, base64), which GCS
+  validates per part and per object, alongside the signed SHA256 payload
+  digest; downloads verify every byte client-side, as for every provider.
 - Keys need only a scoped policy: create/delete one bench prefix + read/write
   objects in it. The doc ships the minimal IAM policy.
 - **Bucket configuration:** `--buckets s3=<name>,r2=<name>` is a provider-keyed
@@ -371,7 +372,11 @@ The following four contracts are frozen for Session 2 and later probes:
    content is a reproducible function of seed, chunk index, and size, with a
    pseudorandom hash stream to defeat compression. The client owns generation,
    bounded streaming, per-body/per-part Content-MD5 and CRC32 headers, and
-   download regeneration/comparison hooks. CRC32 means `zlib.crc32`, not CRC32c.
+   download regeneration/comparison hooks. CRC32 means `zlib.crc32`, not CRC32c —
+   except on the GCS interop path, where the S3 flexible-checksum headers are
+   unsupported and uploads carry the documented `x-goog-hash` CRC32C
+   (Castagnoli) instead; the stdlib has no CRC32C, so the client ships a
+   slicing-by-8 pure-Python digest for the one-time per-part pre-pass.
    Upload hashes are prepared before timed I/O; generation and download
    verification CPU costs still need observation by probes. Never silently retry
    measured PUTs or GETs. Control operations may retry connection errors and 5xx
