@@ -60,6 +60,8 @@ rack-bench bench internet
                                     # a provider may repeat for several buckets
     [--concurrent N]               # override parallel streams (default 32)
     [--duration 60s]               # override per-test duration
+    [--part-size MIB]              # multipart part / range GET size (default 64)
+    [--upload-mode auto|multipart] # auto: one PUT when the object fits one part
     [--tool stdlib|warp]           # default stdlib; warp for certify (§7)
     [--keep-data]                  # skip bucket cleanup
     [--yes]                        # accept cost estimate for certify
@@ -112,13 +114,20 @@ Run in this order; each is one or more `Check` entries per provider.
    Failed/invalid samples never become zero latency. Certify's nearest band
    retains three runs and drops best/worst ranked by response-TTFB p50; each
    light band has only one 20-GET run.
-4. **Sustained upload (egress)** — parallel multipart PUTs of profile-sized
+4. **Sustained upload (egress)** — parallel seeded PUTs of profile-sized
    random objects for the profile duration (32 MiB in quick so objects
    complete and feed downloads; ~1 GiB in certify for sustained streams). Random data defeats provider-side
-   compression/dedup. With several buckets configured, streams are assigned
-   round-robin across them at window start (§8). **Concurrent small-object TTFB probes** run during the
-   window → loaded-latency signal: p95 under load, inflation vs test 3's
-   baseline.
+   compression/dedup. An object that fits in one part (object size ≤
+   `--part-size`; every quick object at the 64 MiB default) is uploaded with
+   one plain `PutObject`: one request per object, with no initiate or complete
+   round trips. Larger objects stay multipart so each request is bounded by the
+   part size inside the 30 s socket timeout; the deadline still stops uploads
+   at a part boundary. `--upload-mode multipart` forces the multipart shape for
+   A/B comparison; `auto` is the default. Every upload sample records its
+   mode, and throughput detail counts both. With several buckets configured,
+   streams are assigned round-robin across them at window start (§8).
+   **Concurrent small-object TTFB probes** run during the window →
+   loaded-latency signal: p95 under load, inflation vs test 3's baseline.
 5. **Sustained download (ingress)** — parallel range GETs reading back the
    uploaded objects. Downloads read uploads; no pre-seeded data.
 6. **Single-stream** — upload + download with concurrency=1.
@@ -176,7 +185,9 @@ Throughput checks carry `detail`: single-stream MiB/s, p50/p95/p99 of the 1 s
 throughput buckets plus a steadiness ratio (p50/p95), retransmit %, TTFB
 percentiles of the measured ops, the per-request post-TTFB streaming rate,
 the ss socket-limit aggregate, and one ceiling verdict per retained window
-(below). For multi-band probes, the scalar value represents the
+(below). Upload detail also counts the upload modes used by the retained
+window (`upload_modes`: put, multipart); each upload sample records its own
+`upload_mode`. For multi-band probes, the scalar value represents the
 nearest/overridden band; JSON-encoded `detail` retains the effective region
 matrix, individual runs, unsupported-band reasons, raw path reports and timing
 samples. These survive in `bench.values.json` without a separate artifact
@@ -239,8 +250,8 @@ handling become spec surface.
 
 **Option B — stdlib S3 client (recommended).** A minimal S3 client in
 `rack_bench/bench/internet/s3client.py`: AWS SigV4 HMAC signing
-(`hmac`/`hashlib`), multipart upload + range GET over `http.client` (not
-`urllib`). Targets S3 and R2; GCS interoperability remains follow-up work. No
+(`hmac`/`hashlib`), single PUT or multipart upload + range GET over
+`http.client` (not `urllib`). Targets S3 and R2; GCS interoperability remains follow-up work. No
 dependencies or external binary; per-request timing and streaming hooks support
 later probe instrumentation without SDK retries hiding bad samples.
 
@@ -272,10 +283,11 @@ it.
   object), so the `--part-size 8..512` bounds stay unchanged. It honors
   single contiguous Range GETs (206 plus inclusive Content-Range) and
   requires Content-Length on non-chunked PUTs, which the client always
-  sends. GCS validates only CRC32C natively and mishandles the S3-style
-  CRC32 headers, so gcs uploads omit the flexible-checksum headers and
-  completion elements and carry the signed SHA256 payload digest;
-  downloads verify every byte client-side, as for every provider.
+  sends. An object that fits in one part is one plain PUT; larger objects use
+  multipart. GCS validates only CRC32C natively and mishandles the S3-style
+  CRC32 headers, so both upload shapes omit the flexible-checksum headers
+  (and multipart completion elements) and carry the signed SHA256 payload
+  digest; downloads verify every byte client-side, as for every provider.
 - Keys need only a scoped policy: create/delete one bench prefix + read/write
   objects in it. The doc ships the minimal IAM policy.
 - **Bucket configuration:** `--buckets s3=<name>,r2=<name>` is a provider-keyed
