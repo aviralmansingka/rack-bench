@@ -1,9 +1,11 @@
 # Spec: `rack-bench bench internet` — external network certification
 
 Status: **v1 probes implemented** (Session 3 Parts 1–2): context, baseline,
-bulk/loaded, single-stream, TCP and summary. Live cloud transfer
-interoperability has not been certified. Remaining limitations are listed in
-§11. Session 2 contracts are frozen (§11). Companion research:
+bulk/loaded, single-stream, TCP and summary. GCS is implemented behind
+`--providers gcs` through the S3 XML interoperability API (HMAC keys); it is
+opt-in and best-effort. Live cloud transfer interoperability has not been
+certified for any provider. Remaining limitations are listed in §11. Session 2
+contracts are frozen (§11). Companion research:
 `research/internet-performance` branch (`docs/internet-performance.md` —
 industry methodology, sources, and the full reliability-test taxonomy this
 derives from).
@@ -31,8 +33,8 @@ and S3 client unchanged.
 - Single-host, single-run measurement per provider: path audit, sustained
   upload/download throughput, single-stream throughput, small-object latency,
   TCP health.
-- Providers: **S3 + R2 primary**; GCS behind `--providers gcs` (interop
-  endpoint) as best-effort.
+- Providers: **S3 + R2 primary**; GCS behind `--providers gcs` through its S3
+  XML interoperability endpoint, opt-in and best-effort.
 - Quick (default) and certify profiles.
 
 **Out (v1):**
@@ -177,8 +179,11 @@ matrix, individual runs, unsupported-band reasons, raw path reports and timing
 samples. These survive in `bench.values.json` without a separate artifact
 writer. RTT sanity can WARN on any measured band's reference excursion; its
 value still describes the nearest band. R2 has no guaranteed regional RTT band,
-so RTT sanity SKIPs with a reason. `source` carries the exact commands/endpoint
-per check (`--show-command` parity). Missing credentials → every check for that
+so RTT sanity SKIPs with a reason. GCS grades the bucket location
+(`asia-south1` by default, the Mumbai reference band); its global anycast
+endpoint has no per-region path to grade. `source` carries the exact
+commands/endpoint per check (`--show-command` parity). Missing credentials →
+every check for that
 provider is `SKIP` with reason "credentials not set"; missing `mtr` → that check
 `SKIP`s, others proceed. `rtt_sanity` is the only WARN-grading check in v1; the
 expected-band table ships in-code (from the research doc's RTT reference) until
@@ -194,9 +199,20 @@ handling become spec surface.
 **Option B — stdlib S3 client (recommended).** A minimal S3 client in
 `rack_bench/bench/internet/s3client.py`: AWS SigV4 HMAC signing
 (`hmac`/`hashlib`), multipart upload + range GET over `http.client` (not
-`urllib`). Targets S3 and R2; GCS interoperability remains follow-up work. No
-dependencies or external binary; per-request timing and streaming hooks support
-later probe instrumentation without SDK retries hiding bad samples.
+`urllib`). Targets S3, R2, and — opt-in via `--providers gcs` — GCS's S3 XML
+interoperability API. No dependencies or external binary; per-request timing
+and streaming hooks support later probe instrumentation without SDK retries
+hiding bad samples.
+
+GCS signs the same SigV4 requests with credential-scope region `auto` and
+service `s3`; the selected bucket location is the placement and RTT-band
+reference, not a network endpoint. Requests are path-style
+(`https://storage.googleapis.com/<bucket>/<key>`). The interop API does not
+implement S3 flexible checksums, so GCS requests omit
+`x-amz-checksum-*`/`ChecksumCRC32` fields and rely on the signed
+`x-amz-content-sha256` payload digest plus local CRC32 verification. Multipart
+part bounds (5 MiB..5 GiB, up to 10,000 parts) and inclusive `Range` GETs match
+the S3 path.
 
 The certify profile can still optionally use warp (`--tool warp`) for
 cross-checking against an industry-recognized tool; quick/default never requires
@@ -206,9 +222,12 @@ it.
 
 - The S3 client reads only `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` and
   optional `AWS_SESSION_TOKEN`; R2 also requires `R2_ACCOUNT_ID` for its
-  endpoint host. Set the AWS-named variables to the selected provider's
-  credentials. No config files, IMDS, or implicit credential discovery. Provider
-  orchestration and GCS interop remain later probe work.
+  endpoint host. GCS reads `GCS_ACCESS_KEY_ID` / `GCS_SECRET_ACCESS_KEY` (the
+  HMAC key pair created for the interoperability API); it has no session token.
+  Provider credentials are provider-specific: AWS-named variables are not
+  reused for GCS. No config files, IMDS, or implicit credential discovery.
+  Missing provider credentials SKIP every check for that provider with a reason
+  and launch no I/O.
 - Keys need only a scoped policy: create/delete one bench prefix + read/write
   objects in it. The doc ships the minimal IAM policy.
 - **Bucket configuration:** `--buckets s3=<name>,r2=<name>` is a provider-keyed
@@ -216,8 +235,10 @@ it.
   A provider may name several buckets: repeat the provider key inside the
   list (`s3=one,s3=two`) or repeat the flag; occurrences merge in flag order,
   and the same name twice is rejected. Names must be DNS-compatible; S3
-  virtual-hosted TLS bucket names cannot contain dots. Flags are run
-  configuration; environment variables remain credentials-only. Path and DNS
+  virtual-hosted TLS bucket names cannot contain dots. GCS and R2 use
+  path-style addressing, so domain-named buckets are accepted for them. Flags
+  are run configuration; environment variables remain credentials-only. Path
+  and DNS
   ignore this map. Object probes without a bucket SKIP with a reason naming
   `--buckets <provider>=<name>`. No buckets are created. A bucket must be
   accessible at the selected endpoint/region: regional S3 redirects/errors are
@@ -288,14 +309,20 @@ The following four contracts are frozen for Session 2 and later probes:
    pseudorandom hash stream to defeat compression. The client owns generation,
    bounded streaming, per-body/per-part Content-MD5 and CRC32 headers, and
    download regeneration/comparison hooks. CRC32 means `zlib.crc32`, not CRC32c.
-   Upload hashes are prepared before timed I/O; generation and download
+   GCS's interop API does not support S3 flexible checksums: its requests omit
+   the CRC32 upload headers/XML fields while keeping the signed
+   `x-amz-content-sha256` payload digest and local verification. Upload hashes
+   are prepared before timed I/O; generation and download
    verification CPU costs still need observation by probes. Never silently retry
    measured PUTs or GETs. Control operations may retry connection errors and 5xx
    with bounded backoff; their timings are not throughput samples.
 4. **Tiered regions, not three full-volume certifications.** Quick uses nearest
    S3 `ap-south-1` (Mumbai) and R2 `apac`. Certify keeps Mumbai full-volume and
    adds Singapore (`ap-southeast-1`) and N. Virginia (`us-east-1`) as light
-   physics probes. `--regions` overrides this policy; record the effective
+   physics probes. GCS defaults to bucket location `asia-south1` (Mumbai) and
+   keeps one target even under certify: its endpoint is global anycast, so the
+   location pins storage placement and the RTT reference band, not a distinct
+   network path. `--regions` overrides this policy; record the effective
    matrix and volumes in artifacts and cost estimates.
 
 The region matrix is probe policy, not S3-client policy. S3 resolves to
@@ -305,7 +332,10 @@ The region matrix is probe policy, not S3-client policy. S3 resolves to
 `R2_ACCOUNT_ID` from the environment and signing region `auto`. R2 `apac` is a
 placement hint, _not_ a SigV4 region or a guarantee of a particular ingress POP.
 Do not claim Mumbai/Singapore/Virginia R2 paths without evidence; unsupported
-pinned-band measurements SKIP with a reason.
+pinned-band measurements SKIP with a reason. GCS resolves to
+`https://storage.googleapis.com` with path-style requests and signing region
+`auto`; its bucket location is recorded for comparison but is not a network
+endpoint. No GCS location is claimed as a distinct path.
 
 ### Probe × band × volume budget
 
@@ -329,13 +359,14 @@ request fees and custom overrides still belong in the eventual cost gate. The
 current estimate is a full-transfer reference, not a quote for the probes
 implemented so far.
 
-Remaining implementation residue: GCS interoperability, certification
-thresholds/profile schema, optional Warp execution, and effective matrix-aware
-cost estimates. All v1 probes are implemented; cloud transfer interoperability
-still requires a paid live exercise. Reference cost output is not a quote for
-custom runs. Missing credentials still SKIP every provider check, including
-context and summary. See README for orchestration, TCP sampling limitations,
-part-boundary duration overruns, and filtered-prerequisite behavior.
+Remaining implementation residue: certification thresholds/profile schema,
+optional Warp execution, and effective matrix-aware cost estimates. All v1
+probes are implemented; GCS is loopback-tested only and, like S3/R2, live cloud
+transfer interoperability still requires a paid live exercise with real
+credentials. Reference cost output is not a quote for custom runs. Missing
+credentials still SKIP every provider check, including context and summary. See
+README for orchestration, TCP sampling limitations, part-boundary duration
+overruns, and filtered-prerequisite behavior.
 
 ## 12. Deferred extension: self-hosted diagnostic endpoints
 

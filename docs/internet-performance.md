@@ -135,7 +135,12 @@ Notes:
 - S3: GET tests incur S3 egress + request costs.
 - GCS interop = XML API + HMAC-SHA256, supports multipart upload; some
   S3 semantics differ (V4 signing details, no chunked
-  transfer-encoding).
+  transfer-encoding). The implementation signs with credential-scope
+  region `auto`/service `s3`, uses path-style addressing, and omits S3
+  flexible-checksum headers the interop API does not implement; multipart
+  part bounds and inclusive range GETs match S3. GCS is opt-in
+  (`--providers gcs`) and loopback-tested only until live HMAC
+  credentials certify it.
 
 ### Tool recommendation: Warp (MinIO), single binary, for all three
 
@@ -180,7 +185,7 @@ review-ready spec lives in the main repo at
 
 ```text
 rack-bench bench internet
-    [--providers s3,r2]        # default all three
+    [--providers s3,r2]        # default s3,r2; gcs opt-in
     [--directions up,down]     # default both
     [--profile quick|certify]  # quick=60s/8-32 concurrent
     [--regions <map>]          # e.g. s3=us-east-1,gcs=us-east1,r2=auto
@@ -259,9 +264,10 @@ can verify it.
 **Provider scope (decided): S3 + R2 are the primary bench targets** —
 R2 because it is natively S3-compatible, has a Cloudflare Chennai POP
 (sub-10 ms edge RTT), and zero egress fees make regression testing
-free; S3 as the authoritative provider. GCS stays in this doc as a
-documented extension (S3-interop endpoint or `gcloud perfdiag`) but is
-not in the first implementation.
+free; S3 as the authoritative provider. GCS remains opt-in via
+`--providers gcs` over the S3-interop endpoint: it is implemented but
+loopback-tested only, best-effort, and not part of the default matrix
+(`gcloud perfdiag` remains an optional external cross-check).
 
 ---
 

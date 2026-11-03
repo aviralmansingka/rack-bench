@@ -368,11 +368,13 @@ usable, measured end-to-end; NIC link-up time; time-to-job-ready.
 ### Internet — external network
 
 `rack-bench bench internet` measures single-host north-south performance to S3
-and R2 using an IPv4-only, stdlib S3 client. All 13 checks per provider are
-wired: path AS/hops/RTT, DNS, idle TTFB, upload/download MiB/s and obj/s, loaded
-TTFB, PMTUD, TCP retransmits, and summary. Single-stream rates live in
-throughput detail, not a new check name. GCS interoperability and Warp execution
-remain unsupported and SKIP explicitly.
+and R2 using an IPv4-only, stdlib S3 client, with GCS available opt-in through
+its S3 XML interoperability API. All 13 checks per provider are wired: path
+AS/hops/RTT, DNS, idle TTFB, upload/download MiB/s and obj/s, loaded TTFB,
+PMTUD, TCP retransmits, and summary. Single-stream rates live in throughput
+detail, not a new check name. GCS is best-effort and loopback-tested only; live
+interop certification is pending real credentials. Warp execution remains
+unsupported and SKIPs explicitly.
 
 **PASS means observed, not certified.** `expected` stays `null` until the
 certification profile schema exists. Only path RTT sanity can WARN; instability,
@@ -401,7 +403,10 @@ operation's overrun. Incomplete multipart uploads are aborted. A slow/short run
 can measure uploaded parts without completing an object: download then SKIPs
 rather than manufacturing data.
 
-Quick targets S3 Mumbai and R2 apac. Certify adds Singapore and N. Virginia as
+Quick targets S3 Mumbai and R2 apac. GCS defaults to bucket location
+`asia-south1` (Mumbai) and keeps one target even under certify: its endpoint is
+global anycast, so the location selects storage placement and the RTT reference
+band, not a separate network path. Certify adds Singapore and N. Virginia as
 **light bands**, not two more full certifications: no sustained transfers or
 loaded probes; one object at most 32 MiB each direction per far band. Including
 the idle baseline, both far bands add at most 64 MiB uploaded and about 68 MiB
@@ -411,9 +416,13 @@ SKIP. S3 redirects at inaccessible regional endpoints also SKIP rather than
 silently changing the measured region.
 
 Supply `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` and optional
-`AWS_SESSION_TOKEN`; R2 additionally needs `R2_ACCOUNT_ID`. These AWS-named
-variables must contain the selected provider's credentials; separate provider
-invocations are usually appropriate. There is no SDK/config/IMDS discovery. Use
+`AWS_SESSION_TOKEN`; R2 additionally needs `R2_ACCOUNT_ID`; GCS needs the
+interoperability HMAC key pair in `GCS_ACCESS_KEY_ID` /
+`GCS_SECRET_ACCESS_KEY` (no session token). Credentials are provider-specific:
+AWS-named variables are not reused for GCS. There is no SDK/config/IMDS
+discovery. GCS uses path-style requests to `https://storage.googleapis.com`,
+signing scope region `auto` and service `s3`; it omits S3 flexible-checksum
+headers/XML fields that the interop API does not implement. Use
 an existing bucket with scoped read/write/delete/multipart permissions. Each
 collection owns a fresh `rack-bench/<run-id>/...` prefix. Cleanup deletes only
 exact owned keys, even when summary is filtered out; `--keep-data` retains keys
@@ -436,7 +445,7 @@ Internet flags follow `bench internet`, not the `bench` parent.
 
 | Flag                            | Description                                           |
 | ------------------------------- | ----------------------------------------------------- |
-| `--providers s3,r2`             | Unique providers: `s3`, `r2`, `gcs` (GCS unsupported) |
+| `--providers s3,r2`             | Unique providers: `s3`, `r2`, `gcs` (gcs opt-in)      |
 | `--directions up,down`          | Selected directions; down needs this run's uploads    |
 | `--profile quick\|certify`      | Default `quick`; certify requires `--yes`             |
 | `--regions s3=us-east-1,...`    | Override the tiered provider region matrix            |
@@ -447,8 +456,9 @@ Internet flags follow `bench internet`, not the `bench` parent.
 | `--keep-data`                   | Retain completed objects under the run-owned prefix   |
 | `--yes`                         | Accept the certify reference cost estimate            |
 
-The default run selects 26 checks (S3 and R2); bare `rack-bench bench` runs only
-implemented categories, currently internet. Generic flags match audit:
+The default run selects 26 checks (S3 and R2); adding `gcs` selects 13 more.
+Bare `rack-bench bench` runs only implemented categories, currently internet.
+Generic flags match audit:
 `--only`/`--skip` are repeatable globs (`--skip` wins); an empty selection
 exits 2. `--json` prints the version-1 envelope; `--json FILE` exports it
 alongside human stdout. `--run-dir DIR` receives `bench.out` and
