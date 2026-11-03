@@ -119,7 +119,9 @@ class FakeClient:
 
 class TransferTests(unittest.TestCase):
     def setUp(self):
-        env = patch.dict(os.environ, {"AWS_ACCESS_KEY_ID": "fake", "AWS_SECRET_ACCESS_KEY": "fake", "R2_ACCOUNT_ID": "fake"}, clear=True)
+        env = patch.dict(os.environ, {"AWS_ACCESS_KEY_ID": "fake", "AWS_SECRET_ACCESS_KEY": "fake",
+                                      "R2_ACCOUNT_ID": "fake", "GCS_ACCESS_KEY_ID": "fake",
+                                      "GCS_SECRET_ACCESS_KEY": "fake"}, clear=True)
         env.start()
         self.addCleanup(env.stop)
         self.options = Options(providers=("s3",), buckets={"s3": "bench-test"}, duration=1)
@@ -365,6 +367,24 @@ class TransferTests(unittest.TestCase):
         check = transfer.transfer_check("s3", "up", "throughput", self.options, records)
         self.assertEqual(json.loads(check.detail)["buckets"], ["bench-a", "bench-b"])
         self.assertIn("buckets=bench-a,bench-b", check.source[0])
+
+    def test_gcs_reports_anycast_host_and_region_label(self):
+        # gcs records label the bucket location (asia-south1) while every
+        # window anchors diagnostics to the path-style endpoint host itself.
+        self.options = Options(providers=("gcs",), buckets={"gcs": "bench-gcs"}, duration=1)
+        self.calls = []
+        records = upload.upload_reports("gcs", self.options,
+                                         client_factory=lambda *a, **k: self.client,
+                                         window=self.fake_window)
+        self.assertEqual(records[0]["region"], "asia-south1")
+        self.assertEqual(records[0]["endpoint"], "https://storage.googleapis.com")
+        self.assertTrue(records[0]["path_style"])
+        download.download_reports("gcs", self.options,
+                                  client_factory=lambda *a, **k: self.client,
+                                  window=self.fake_window)
+        self.assertTrue(all(call["host"] == "storage.googleapis.com" for call in self.calls))
+        check = transfer.transfer_check("gcs", "up", "throughput", self.options, records)
+        self.assertIn("https://storage.googleapis.com buckets=bench-gcs", check.source[0])
 
     def test_single_bucket_regression_normalized_shape(self):
         # A bare name normalizes to a 1-tuple; single-bucket runs keep today's shape.
@@ -772,6 +792,40 @@ class ProcessPoolTransferTests(unittest.TestCase):
         self.assertEqual(len(run["samples"]), 4)
         self.assertEqual(run["errors"], [])
 
+    def test_gcs_provider_worker_processes_end_to_end(self):
+        # Worker processes reconstruct gcs clients from plain config in the
+        # child, sourcing GCS_* credentials there; multipart PUTs and verified
+        # range GETs ride the loopback root through the interop request shape.
+        with patch.dict(os.environ, {"GCS_ACCESS_KEY_ID": "fake", "GCS_SECRET_ACCESS_KEY": "fake"}):
+            client = S3Client("bench-gcs", "asia-south1", provider="gcs", timeout=10, backoff=0,
+                              endpoint=self.endpoint)
+            self.addCleanup(client.close)
+            self.server.state = {"payload": s3.SeededPayload("gcs-seed", self.size), "requests": []}
+            owned = []
+            run, objects = transfer.transfer_window(client, direction="up", prefix="gcs/",
+                                                     concurrency=2, duration=.05, objects=[],
+                                                     owned=owned, size=self.size, one_object=True,
+                                                     part_size=self.part, seed="gcs-seed",
+                                                     tcp_factory=FakeTCP, host="storage.googleapis.com")
+            self.assertEqual(run["status"], "pass")
+            self.assertEqual(run["bytes"], 2 * self.size)
+            self.assertEqual(owned, [("bench-gcs", "gcs/0-0.bin"), ("bench-gcs", "gcs/1-0.bin")])
+            paths = [item for _, item in self.server.state["requests"]]
+            self.assertTrue(all(item.startswith("/bench-gcs/gcs/") for item in paths))
+            self.server.state["requests"] = []
+            objects = [{"key": f"gcs/{index}-0.bin",
+                        "payload": {"seed": "gcs-seed", "size": self.size, "chunk_size": 1024 * 1024}}
+                       for index in range(2)]
+            run, completed = transfer.transfer_window(client, direction="down", prefix="unused/",
+                                                       concurrency=2, duration=.05, objects=objects,
+                                                       owned=[], one_object=True, part_size=self.part,
+                                                       tcp_factory=FakeTCP, host="storage.googleapis.com")
+            self.assertEqual(run["status"], "pass")
+            self.assertEqual(run["bytes"], 2 * self.size)
+            gets = [item for method, item in self.server.state["requests"] if method == "GET"]
+            # Two verified ranges per object; arrival order across workers races.
+            self.assertEqual(sorted(gets), sorted([f"/bench-gcs/gcs/{index}-0.bin" for index in range(2)] * 2))
+
     def test_multi_bucket_worker_processes_route_by_recorded_bucket(self):
         # Two loopback roots, one per bucket: worker processes build a client
         # per bucket from the pool initargs, streams shard round-robin, and
@@ -845,7 +899,7 @@ class ProcessPoolTransferTests(unittest.TestCase):
         import pickle
         slots = multiprocessing.Array("i", 2)
         stop = multiprocessing.Event()
-        transfer._pool_initialiser((("bucket", self.endpoint, 10, 2, 0),), stop, slots,
+        transfer._pool_initialiser((("bucket", "s3", self.endpoint, 10, 2, 0),), stop, slots,
                                    2 * 1024 * 1024, None)
         self.assertIsInstance(transfer._POOL_STATE["clients"]["bucket"], S3Client)
         self.assertIs(transfer._POOL_STATE["stop"], stop)

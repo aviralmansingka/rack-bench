@@ -9,7 +9,7 @@ from rack_bench.common.models import Check
 from .latency import OBJECT_SIZE as LATENCY_SIZE
 from .s3client import S3Client, SeededPayload
 from .stats import describe
-from .targets import bucket_names, reason, run_prefix, run_seed
+from .targets import bucket_names, data_host, reason, run_prefix, run_seed
 from .transfer import (ERRORS, LIGHT_SIZE, MIB, OBJECT_SIZE, baseline, object_url, plan,
                        prerequisites, sample_timing, transfer_check, transfer_window)
 
@@ -71,9 +71,9 @@ def upload_reports(provider, options, *, client_factory=S3Client, window=transfe
                                       size=size, part_size=options.part_size * MIB, seed=run_seed(options),
                                       buckets=names, clients=clients,
                                       one_object=target["band"] == "light", loaded=loaded if kind == "bulk" else None,
-                                      # ss diagnostics anchor to the first bucket's virtual host;
+                                      # ss diagnostics anchor to the first bucket's request host;
                                       # sibling buckets share the endpoint IPs in practice
-                                      host=target["host"] if provider == "r2" else f'{names[0]}.{target["host"]}')
+                                      host=data_host(target, names[0]))
                 run.update(kind=kind, run=index)
                 record["runs_detail"].append(run)
                 record["objects"].extend(objects)

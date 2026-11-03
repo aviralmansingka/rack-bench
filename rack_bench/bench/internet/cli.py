@@ -51,7 +51,8 @@ def regions(value):
     for item in value.split(","):
         provider, separator, region = item.strip().partition("=")
         if not separator or provider not in PROVIDERS or not re.fullmatch(r"[A-Za-z0-9_-]+", region):
-            raise argparse.ArgumentTypeError("expected provider=region pairs, e.g. s3=us-east-1,r2=auto")
+            raise argparse.ArgumentTypeError(
+                "expected provider=region pairs, e.g. s3=us-east-1,r2=auto,gcs=asia-south1")
         if provider in result:
             raise argparse.ArgumentTypeError(f"duplicate region for {provider}")
         result[provider] = region

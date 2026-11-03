@@ -24,7 +24,12 @@ from .stats import describe
 from .targets import reason, targets
 
 # Chennai-origin references: docs/internet-performance.md § regional RTTs.
-RTT_BANDS = {"ap-south-1": (20, 35), "ap-southeast-1": (35, 55), "us-east-1": (180, 250)}
+# The gcs band grades the GLOBAL ANYCAST endpoint's edge distance (Google edge
+# POPs sit in Chennai/Mumbai per the hyperscaler corpus; observed ~13-15 ms
+# ICMP from the Chennai dev host, 2026-11-03), with S3 Mumbai's 35 ms ceiling.
+# The record's region label names the bucket location, not the edge POP.
+RTT_BANDS = {"ap-south-1": (20, 35), "ap-southeast-1": (35, 55), "us-east-1": (180, 250),
+             "asia-south1": (10, 35)}
 
 
 def parse_mtr(text):
@@ -130,6 +135,9 @@ def path_probe(provider, metric, options, *, run=subprocess.run, which=shutil.wh
     detail = {"regions": records, "interpretation": "Context only; intermediate loss with clean continuation is ICMP rate limiting. "
               "Unanswered hops still count; a single snapshot cannot establish route flapping.",
               "rtt_reference": "Chennai-origin bands, not location-independent certification thresholds"}
+    if provider == "gcs":
+        detail["endpoint_semantics"] = ("global anycast endpoint: the band grades Google edge-POP distance, "
+                                        "not the record's bucket location")
     status, value = "pass", None
     failure = primary["reason"] or next((r.get("reason") for r in reports if r.get("reason")), None)
     if not failure:
@@ -145,7 +153,10 @@ def path_probe(provider, metric, options, *, run=subprocess.run, which=shutil.wh
         else:
             findings, primary_findings = [], []
             for region in records:
-                band = RTT_BANDS.get(region["region"]) if provider == "s3" else None
+                # S3 regional hosts and the GCS anycast host have reference
+                # bands; R2 placement hints (and unlisted gcs bucket locations)
+                # do not, and stay ungradable rather than guessed.
+                band = RTT_BANDS.get(region["region"]) if provider in ("s3", "gcs") else None
                 for report in region["reports"]:
                     if report.get("reason") or not report["hops"]:
                         continue

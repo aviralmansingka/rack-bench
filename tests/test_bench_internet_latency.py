@@ -13,7 +13,8 @@ from rack_bench.bench import runner
 from rack_bench.bench.internet import CHECKS, Options, before_run
 from rack_bench.bench.internet import latency, s3client as s3
 
-ENV = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test", "R2_ACCOUNT_ID": "test"}
+ENV = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test", "R2_ACCOUNT_ID": "test",
+       "GCS_ACCESS_KEY_ID": "test", "GCS_SECRET_ACCESS_KEY": "test"}
 
 
 class MemoryS3:
@@ -171,8 +172,37 @@ class LatencyTests(unittest.TestCase):
         self.assertEqual([r["status"] for r in regions], ["pass", "skip", "skip"])
         self.assertIn("https://test.r2.cloudflarestorage.com/bench-r2/", check.source[0])
 
-    def test_gcs_and_warp_are_explicitly_unsupported(self):
-        self.assertEqual(self.probe("gcs").status, "skip")
+    def test_gcs_baseline_roundtrip_via_anycast_endpoint(self):
+        # The gcs provider rides the same probe: path-style URL, one PUT, 20
+        # fresh-connection GETs, owned-key cleanup.
+        self.options = Options(buckets={"gcs": "bench-gcs"})
+        check = self.probe("gcs")
+        self.assertEqual(check.status, "pass")
+        self.assertEqual(check.value, 2)
+        self.assertIn("https://storage.googleapis.com/bench-gcs/", check.source[0])
+        self.assertIn('"region": "asia-south1"', check.detail)
+        self.assertEqual(self.client.gets, 20)
+        self.assertEqual(self.client.deleted, self.client.puts)
+        self.factory.reset_mock()
+        with patch.dict(os.environ, {}, clear=True):
+            check = self.probe("gcs")
+        self.assertIn("GCS_ACCESS_KEY_ID", check.detail)
+        self.factory.assert_not_called()
+
+    def test_gcs_certify_far_bands_skip_as_anycast_remeasurement(self):
+        self.options = Options(buckets={"gcs": "bench-gcs"}, profile="certify")
+        check = self.probe("gcs")
+        self.assertEqual(check.status, "pass")
+        regions = json.loads(check.detail)["regions"]
+        self.assertEqual([r["region"] for r in regions],
+                         ["asia-south1", "asia-southeast1", "us-east1"])
+        self.assertEqual([r["status"] for r in regions], ["pass", "skip", "skip"])
+        self.assertIn("global anycast endpoint", regions[1]["reason"])
+        self.assertEqual([len(r["runs_detail"]) for r in regions], [3, 0, 0])
+        self.assertEqual(self.client.gets, 60)  # nearest band only
+        self.assertEqual(len(self.client.puts), 1)
+
+    def test_warp_is_explicitly_unsupported(self):
         self.options.tool = "warp"
         self.assertIn("Warp execution not implemented", self.probe().detail)
         self.factory.assert_not_called()

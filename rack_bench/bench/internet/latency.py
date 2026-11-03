@@ -7,7 +7,7 @@ from rack_bench.common.host import _echo
 from rack_bench.common.models import Check
 from .s3client import CredentialError, ProtocolError, S3Client, S3Error, SeededPayload
 from .stats import describe
-from .targets import bucket_names, reason, run_prefix, targets
+from .targets import bucket_names, data_host, reason, run_prefix, targets
 
 OBJECT_SIZE = 100 * 1024
 SAMPLES = 20  # Also the hard per-far-band GET budget.
@@ -53,8 +53,8 @@ def latency_probe(provider, options, *, client_factory=S3Client, cpu_clock=time.
         key = f'{prefix}{provider}/{target["region"]}/latency.bin'
         payload = SeededPayload(key, OBJECT_SIZE)
         record.update(key=key, seed=payload.seed, size=payload.size, chunk_size=payload.chunk_size)
-        host = target["host"] if provider == "r2" else f'{bucket}.{target["host"]}'
-        url = f'https://{host}/' + (f'{bucket}/' if provider == "r2" else "") + key
+        host = data_host(target, bucket)
+        url = f'https://{host}/' + (f'{bucket}/' if target["path_style"] else "") + key
         sources.append(f"PUT {url}; {target['runs']} x {SAMPLES} sequential GETs; " +
                        ("retain (--keep-data)" if options.keep_data else f"DELETE {url}"))
         client = None
