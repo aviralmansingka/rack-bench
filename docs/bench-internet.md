@@ -60,6 +60,8 @@ rack-bench bench internet
                                     # a provider may repeat for several buckets
     [--concurrent N]               # override parallel streams (default 32)
     [--duration 60s]               # override per-test duration
+    [--part-size 64]               # multipart part / range GET size in MiB
+    [--upload-mode auto|multipart] # auto: one PUT for single-part objects
     [--tool stdlib|warp]           # default stdlib; warp for certify (§7)
     [--keep-data]                  # skip bucket cleanup
     [--yes]                        # accept cost estimate for certify
@@ -112,13 +114,19 @@ Run in this order; each is one or more `Check` entries per provider.
    Failed/invalid samples never become zero latency. Certify's nearest band
    retains three runs and drops best/worst ranked by response-TTFB p50; each
    light band has only one 20-GET run.
-4. **Sustained upload (egress)** — parallel multipart PUTs of profile-sized
-   random objects for the profile duration (32 MiB in quick so objects
-   complete and feed downloads; ~1 GiB in certify for sustained streams). Random data defeats provider-side
+4. **Sustained upload (egress)** — parallel PUTs of profile-sized random
+   objects for the profile duration (32 MiB in quick so objects complete and
+   feed downloads; ~1 GiB in certify for sustained streams). When an object
+   fits one part (`object_size <= part_size`), the client sends one plain
+   `PutObject`: one request per object instead of initiate + part + complete.
+   Larger objects keep multipart, because one request at low single-stream
+   rates would outlive the 30 s socket timeout; multipart bounds each request
+   to one part. `--upload-mode multipart` forces the legacy path for A/B
+   comparisons; `auto` is the default. Random data defeats provider-side
    compression/dedup. With several buckets configured, streams are assigned
    round-robin across them at window start (§8). **Concurrent small-object TTFB probes** run during the
    window → loaded-latency signal: p95 under load, inflation vs test 3's
-   baseline.
+   baseline. Each upload sample records `upload_mode` (`put` or `multipart`).
 5. **Sustained download (ingress)** — parallel range GETs reading back the
    uploaded objects. Downloads read uploads; no pre-seeded data.
 6. **Single-stream** — upload + download with concurrency=1.
@@ -176,7 +184,8 @@ Throughput checks carry `detail`: single-stream MiB/s, p50/p95/p99 of the 1 s
 throughput buckets plus a steadiness ratio (p50/p95), retransmit %, TTFB
 percentiles of the measured ops, the per-request post-TTFB streaming rate,
 the ss socket-limit aggregate, and one ceiling verdict per retained window
-(below). For multi-band probes, the scalar value represents the
+(below). Upload detail also counts completed objects by `upload_mode` (`put`
+or `multipart`). For multi-band probes, the scalar value represents the
 nearest/overridden band; JSON-encoded `detail` retains the effective region
 matrix, individual runs, unsupported-band reasons, raw path reports and timing
 samples. These survive in `bench.values.json` without a separate artifact
