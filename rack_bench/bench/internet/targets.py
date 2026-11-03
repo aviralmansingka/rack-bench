@@ -3,22 +3,34 @@ from uuid import uuid4
 
 from .s3client import Credentials, CredentialError, resolve_endpoint
 
+# Nearest bands: S3 Mumbai, R2 apac placement hint, GCS asia-south1 (Mumbai).
+# Certify adds far-band light physics probes: Singapore and N. Virginia per
+# provider (GCS location codes, not S3 region names).
+DEFAULT_REGIONS = {"s3": "ap-south-1", "r2": "apac", "gcs": "asia-south1"}
+FAR_BANDS = {"s3": ("ap-southeast-1", "us-east-1"),
+             "r2": ("ap-southeast-1", "us-east-1"),
+             "gcs": ("asia-southeast1", "us-east4")}
+
 
 def targets(provider, options):
     """Nearest band first; unsupported providers/bands remain explicit records."""
-    Credentials.from_env()  # Spec §6: even context probes require provider credentials.
-    if provider == "gcs":
-        raise ValueError("GCS interoperability not implemented")
-    nearest = options.regions.get(provider, "ap-south-1" if provider == "s3" else "apac")
+    Credentials.from_env(provider)  # Spec §6: even context probes require provider credentials.
+    nearest = options.regions.get(provider) or DEFAULT_REGIONS[provider]
     regions = [nearest]
     if options.profile == "certify" and provider not in options.regions:
-        regions += ["ap-southeast-1", "us-east-1"]
+        regions += FAR_BANDS[provider]
     result = []
     for index, region in enumerate(regions):
         endpoint = resolve_endpoint(provider, region)
         reason = None
         if provider == "r2" and region not in {"apac", "auto"}:
             reason = "unsupported pinned R2 band: placement hint does not establish a regional path"
+        if provider == "gcs" and index:
+            # One global anycast endpoint serves every bucket location: a pinned
+            # far band would repeat the identical path under another label. An
+            # operator --regions gcs=<location> override (index 0) stays real:
+            # it declares the bucket's location for records and RTT sanity.
+            reason = "unsupported pinned GCS band: the global endpoint does not establish a per-location path"
         result.append({"region": region, "endpoint": f"https://{endpoint.host}",
                        "host": endpoint.host, "band": "nearest" if index == 0 else "light",
                        "runs": 3 if options.profile == "certify" and index == 0 else 1,

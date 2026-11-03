@@ -3,7 +3,9 @@
 import base64
 from collections import Counter
 import hashlib
+import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
 import os
 import socket
 import threading
@@ -90,6 +92,38 @@ class SigningVectors(unittest.TestCase):
                          "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/"
                          "s3/aws4_request,SignedHeaders=host;range;x-amz-content-sha256;x-amz-date,"
                          "Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41")
+
+    def test_gcs_interop_scope_signs_location_with_s3_service(self):
+        # GCS S3 interop accepts any LOCATION in the credential scope (Google's
+        # signatures doc recommends the resource's location); service stays s3,
+        # the terminator aws4_request, and the key chain keeps the AWS4 prefix.
+        # The expected signature is derived here by hand, then pinned literal.
+        credentials = s3.Credentials("GOOG1EXAMPLEACCESSKEY",
+                                     "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+        key = b"AWS4wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+        for value in ("20130524", "asia-south1", "s3", "aws4_request"):
+            key = hmac.new(key, value.encode(), hashlib.sha256).digest()
+        headers = {"host": "storage.googleapis.com", "range": "bytes=0-9"}
+        signed = s3.sign_headers(credentials, "GET", "/bench-gcs/test.txt", (), headers,
+                                 EMPTY_HASH, "asia-south1", "20130524T000000Z")
+        canonical = s3.canonical_request("GET", "/bench-gcs/test.txt", (),
+                                         {"host": "storage.googleapis.com", "range": "bytes=0-9",
+                                          "x-amz-content-sha256": EMPTY_HASH,
+                                          "x-amz-date": "20130524T000000Z"}, EMPTY_HASH)
+        string_to_sign = ("AWS4-HMAC-SHA256\n20130524T000000Z\n"
+                          "20130524/asia-south1/s3/aws4_request\n"
+                          + hashlib.sha256(canonical.encode()).hexdigest())
+        signature = hmac.new(key, string_to_sign.encode(), hashlib.sha256).hexdigest()
+        self.assertEqual(signed["authorization"],
+                         "AWS4-HMAC-SHA256 Credential=GOOG1EXAMPLEACCESSKEY/20130524/"
+                         "asia-south1/s3/aws4_request, SignedHeaders=host;range;"
+                         f"x-amz-content-sha256;x-amz-date, Signature={signature}")
+        # Golden literal of the same string (fixed inputs; computed once):
+        self.assertEqual(signed["authorization"],
+                         "AWS4-HMAC-SHA256 Credential=GOOG1EXAMPLEACCESSKEY/20130524/"
+                         "asia-south1/s3/aws4_request, SignedHeaders=host;range;"
+                         "x-amz-content-sha256;x-amz-date, Signature="
+                         "2f01a499baab359c96648d9a0957b4f517305bbcef5834ae92a0ec47c697844b")
 
     def test_s3_path_not_normalized_and_query_encoded_once(self):
         canonical = s3.canonical_request("GET", "/a//.././% +/ሴ", (
@@ -221,12 +255,27 @@ class PayloadTests(unittest.TestCase):
             os.environ["R2_ACCOUNT_ID"] = "account"
             self.assertEqual(s3.resolve_endpoint("r2", "apac"),
                              s3.Endpoint("account.r2.cloudflarestorage.com", "auto", True))
+            # GCS interop HMAC keys are their own pair: no AWS fallback, no token.
+            with self.assertRaisesRegex(s3.CredentialError, "GCS_ACCESS_KEY_ID"):
+                s3.Credentials.from_env("gcs")
+            os.environ["GCS_ACCESS_KEY_ID"] = "GOOG1TEST"
+            with self.assertRaisesRegex(s3.CredentialError, "GCS_SECRET_ACCESS_KEY"):
+                s3.Credentials.from_env("gcs")
+            os.environ["GCS_SECRET_ACCESS_KEY"] = "gcs-secret"
+            gcs = s3.Credentials.from_env("gcs")
+            self.assertEqual((gcs.access_key, gcs.secret_key, gcs.token),
+                             ("GOOG1TEST", "gcs-secret", None))
         self.assertEqual(s3.resolve_endpoint("s3", "ap-south-1"),
                          s3.Endpoint("s3.ap-south-1.amazonaws.com", "ap-south-1", False))
         with self.assertRaises(ValueError):
             s3.resolve_endpoint("s3", "bad/region")
+        # Global path-style endpoint; the location is the signing scope region.
+        self.assertEqual(s3.resolve_endpoint("gcs", "asia-south1"),
+                         s3.Endpoint("storage.googleapis.com", "asia-south1", True))
         with self.assertRaises(ValueError):
-            s3.resolve_endpoint("gcs", "auto")
+            s3.resolve_endpoint("gcs", "bad/location")
+        with self.assertRaises(ValueError):
+            s3.resolve_endpoint("gcs", "")
 
     def test_ipv4_connection_uses_local_timeout(self):
         with patch.object(s3.socket, "getaddrinfo", return_value=[
@@ -305,7 +354,8 @@ class MockS3(BaseHTTPRequestHandler):
             expected_crc = base64.b64encode(crc.to_bytes(4, "big")).decode()
             record["crc32"] = expected_crc
             if ("content-md5" in headers or
-                    self.command == "PUT" and headers.get("x-amz-checksum-crc32") != expected_crc or
+                    self.command == "PUT" and not state.get("no_flexible_checksums")
+                    and headers.get("x-amz-checksum-crc32") != expected_crc or
                     state.get("reject_digest")):
                 self.reply(400, b"<Error><Code>InvalidDigest</Code></Error>")
                 return
@@ -338,6 +388,10 @@ class MockS3(BaseHTTPRequestHandler):
             self.reply(body=state.get("list_body", body))
         elif self.command == "GET":
             source = state["payload"]
+            if state.get("derive_payload_from_path"):
+                # Probe-level tests cannot predict the run-prefix key: serve the
+                # same seeded bytes the probe's client expects for THIS key.
+                source = s3.SeededPayload(self.path.split("/", 2)[2], 100 * 1024)
             start, end = 0, source.size - 1
             response_headers = {}
             status = 200
@@ -684,6 +738,85 @@ class TransportTests(unittest.TestCase):
         self.assertLessEqual(self.state["max_read"], 8192)
         self.assertLess(peak, 40 * 1024**2)
         self.assertLessEqual(s3._CHUNK_CACHE.total, s3.CHUNK_CACHE_LIMIT)
+
+
+class GcsLoopbackTests(unittest.TestCase):
+    """The gcs provider path against the loopback server: global-endpoint
+    path-style requests, the interop signing scope, and the when_required
+    checksum profile (no x-amz-checksum-* headers), end to end over HTTP."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), MockS3)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join()
+
+    def setUp(self):
+        self.env = patch.dict(os.environ, {"GCS_ACCESS_KEY_ID": "GOOG1TESTKEY",
+                                           "GCS_SECRET_ACCESS_KEY": "gcs-secret"}, clear=True)
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.state = {"counts": Counter(), "requests": [], "max_read": 0, "failures": 0,
+                      "payload": s3.SeededPayload("gcs-down", 200000),
+                      "no_flexible_checksums": True}
+        self.server.state = self.state
+        self.client = self.factory("bench-gcs", "asia-south1", "gcs")
+        self.addCleanup(self.client.close)
+
+    def factory(self, bucket, region, provider):
+        # The loopback endpoint seam: gcs resolution (host/scope/path-style)
+        # is pinned by the unit tests; transport runs against 127.0.0.1.
+        return s3.S3Client(bucket, region, provider=provider, timeout=2, backoff=0,
+                           endpoint=s3.Endpoint("127.0.0.1", region, True,
+                                                self.server.server_port, False))
+
+    def test_multipart_up_and_range_down_omit_flexible_checksums(self):
+        self.client.multipart_upload("multi", s3.SeededPayload("gcs-up", 5 * 1024**2 + 99),
+                                     part_size=5 * 1024**2)
+        chunks = []
+        response = self.client.get_object("multi", byte_range=(65000, 140000),
+                                          payload=self.state["payload"],
+                                          consume=lambda data, offset: chunks.append(offset))
+        self.assertEqual(response.status, 206)
+        requests = self.state["requests"]
+        self.assertEqual([r["method"] for r in requests], ["POST", "PUT", "PUT", "POST", "GET"])
+        self.assertEqual(requests[0]["path"], "/bench-gcs/multi?uploads=")
+        self.assertEqual(chunks, [65000, 65001])  # absolute offsets preserved
+        for request in requests:
+            headers = request["headers"]
+            # The interop scope: bucket location, s3 service, aws4_request.
+            self.assertIn("Credential=GOOG1TESTKEY/", headers["authorization"])
+            self.assertIn("/asia-south1/s3/aws4_request", headers["authorization"])
+            # when_required profile: only the signed payload hash remains.
+            self.assertFalse(any(name.startswith("x-amz-checksum") for name in headers))
+            self.assertRegex(headers["x-amz-content-sha256"], r"^[0-9a-f]{64}$")
+        completion = ET.fromstring(requests[3]["body"])
+        self.assertEqual([part.findtext("PartNumber") for part in completion], ["1", "2"])
+        self.assertEqual([part.findtext("ETag") for part in completion], ['"part-etag"'] * 2)
+        self.assertTrue(all(part.find("ChecksumCRC32") is None for part in completion))
+
+    def test_completion_rejects_checksum_slots_for_gcs(self):
+        with self.assertRaises(ValueError):
+            self.client.complete_multipart("key", "id", [(1, '"etag"', "AAAAAA==")])
+        with self.assertRaises(ValueError):
+            self.client.complete_multipart("key", "id", [(1, '"etag"', None), (3, '"etag"', None)])
+
+    def test_gcs_probe_skips_with_reason_without_gcs_credentials(self):
+        from rack_bench.bench.internet import latency
+        from rack_bench.bench.internet.cli import Options
+        with patch.dict(os.environ, {}, clear=True):
+            check = latency.latency_probe("gcs", Options(buckets={"gcs": "bench-gcs"}),
+                                          client_factory=self.factory)
+        self.assertEqual(check.status, "skip")
+        self.assertEqual(check.detail,
+                         "credentials not set: missing environment variable: GCS_ACCESS_KEY_ID")
+        self.assertEqual(self.state["requests"], [])  # no partial run, no I/O
 
 
 if __name__ == "__main__":

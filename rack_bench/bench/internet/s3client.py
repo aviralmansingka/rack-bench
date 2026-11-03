@@ -35,7 +35,13 @@ class Credentials:
     token: str | None = None
 
     @classmethod
-    def from_env(cls) -> Credentials:
+    def from_env(cls, provider: str = "s3") -> Credentials:
+        # GCS interop HMAC keys (console Interoperability tab) use their own
+        # pair, following the AWS_* naming precedent; they are not OAuth and
+        # have no session token. S3 and R2 share the AWS-named pair.
+        if provider == "gcs":
+            return cls(required_env("GCS_ACCESS_KEY_ID"),
+                       required_env("GCS_SECRET_ACCESS_KEY"))
         return cls(required_env("AWS_ACCESS_KEY_ID"),
                    required_env("AWS_SECRET_ACCESS_KEY"),
                    os.environ.get("AWS_SESSION_TOKEN") or None)
@@ -360,7 +366,13 @@ class Endpoint:
 
 
 def resolve_endpoint(provider: str, region: str) -> Endpoint:
-    """Region selection is the caller's policy; R2 always signs with auto."""
+    """Region selection is the caller's policy; R2 always signs with auto.
+
+    GCS serves one global path-style endpoint for every bucket location.
+    Its S3 interop accepts any LOCATION in the credential scope (the docs
+    recommend the resource's location), with service s3 and aws4_request:
+    docs.cloud.google.com/storage/docs/authentication/signatures#credential-scope
+    """
     if provider == "s3":
         if not re.fullmatch(r"[a-z0-9-]+", region):
             raise ValueError("invalid S3 region")
@@ -370,6 +382,10 @@ def resolve_endpoint(provider: str, region: str) -> Endpoint:
         if not re.fullmatch(r"[A-Za-z0-9-]+", account):
             raise ValueError("invalid R2_ACCOUNT_ID")
         return Endpoint(f"{account}.r2.cloudflarestorage.com", "auto", True)
+    if provider == "gcs":
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", region):
+            raise ValueError("invalid GCS location")
+        return Endpoint("storage.googleapis.com", region, True)
     raise ValueError(f"unsupported provider: {provider}")
 
 
@@ -407,12 +423,20 @@ class S3Client:
     Initiate/complete/abort/list/HEAD/DELETE retry bounded 5xx/connection errors.
     A timed HEAD probe should pass measurement=True to disable control retries.
     The optional Endpoint is also the loopback-test seam, not credential config.
+
+    flexible_checksums: S3/R2 requests carry x-amz-checksum-crc32 digests (the
+    AWS default-integrity profile). GCS interop rides the AWS when_required
+    profile instead: no x-amz-checksum-* headers and no ChecksumCRC32 elements
+    (GCS rejects the aws-chunked/trailer checksum defaults; header-form support
+    is unverified). The signed x-amz-content-sha256 payload hash always stays,
+    and downloads still verify every byte against the seeded payload.
     """
 
     def __init__(self, bucket: str, region: str, *, provider: str = "s3",
                  timeout: float = 30, control_retries: int = 2,
                  backoff: float = 0.1, endpoint: Endpoint | None = None):
-        self.credentials = Credentials.from_env()
+        self.provider = provider
+        self.credentials = Credentials.from_env(provider)
         self.endpoint = endpoint or resolve_endpoint(provider, region)
         if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket):
             raise ValueError("bucket must be a DNS-compatible name")
@@ -424,6 +448,7 @@ class S3Client:
         self.timeout = timeout
         self.control_retries = control_retries
         self.backoff = backoff
+        self.flexible_checksums = provider != "gcs"
         self._connections = threading.local()
 
     def _pooled(self, host, port, cls):
@@ -615,11 +640,13 @@ class S3Client:
                 query=(), on_progress=None) -> Response:
         body = lambda: payload.iter_chunks(offset, size)
         headers = part_checksum_headers(payload, offset, size)
+        if not self.flexible_checksums:
+            headers = {"x-amz-content-sha256": headers["x-amz-content-sha256"]}
         result = self._request("PUT", key, query=query, headers=headers,
                                body=body, size=size, measurement=True, on_progress=on_progress)
-        result.upload_crc32 = headers["x-amz-checksum-crc32"]
+        result.upload_crc32 = headers.get("x-amz-checksum-crc32")
         returned = result.headers.get("x-amz-checksum-crc32")
-        if returned is not None and returned != headers["x-amz-checksum-crc32"]:
+        if self.flexible_checksums and returned is not None and returned != headers["x-amz-checksum-crc32"]:
             raise ChecksumError("server CRC32 differs from upload", timing=result.timing,
                                 status=result.status)
         return result
@@ -630,9 +657,9 @@ class S3Client:
         return self._upload(key, payload, 0, payload.size, on_progress=on_progress)
 
     def initiate_multipart(self, key: str) -> str:
-        response = self._request("POST", key, query=(("uploads", ""),),
-                                 headers={"x-amz-checksum-algorithm": "CRC32",
-                                          "x-amz-checksum-type": "COMPOSITE"})
+        headers = {"x-amz-checksum-algorithm": "CRC32",
+                   "x-amz-checksum-type": "COMPOSITE"} if self.flexible_checksums else {}
+        response = self._request("POST", key, query=(("uploads", ""),), headers=headers)
         upload_id = self._text(self._xml(response, "InitiateMultipartUploadResult"), "UploadId")
         if not upload_id:
             raise ProtocolError("missing UploadId", timing=response.timing)
@@ -651,19 +678,27 @@ class S3Client:
         return response
 
     def complete_multipart(self, key: str, upload_id: str,
-                           parts: Iterable[tuple[int, str, str]]) -> Response:
-        """Parts are (number, ETag, base64 CRC32), preserving server-side checksums."""
+                           parts: Iterable[tuple[int, str, str | None]]) -> Response:
+        """Parts are (number, ETag, base64 CRC32), preserving server-side checksums.
+
+        The CRC32 slot is None without flexible checksums (GCS): the completion
+        XML then carries part numbers and ETags only, and no composite digest
+        comparison is possible against the completion response.
+        """
         root = ET.Element("CompleteMultipartUpload")
         parts = sorted(parts)
         if not 1 <= len(parts) <= 10000 or [part[0] for part in parts] != list(range(1, len(parts) + 1)):
             raise ValueError("completion requires 1..10000 consecutive parts from 1")
         for number, etag, crc32 in parts:
-            if not etag or len(base64.b64decode(crc32, validate=True)) != 4:
-                raise ValueError("completion requires ETags and base64 CRC32 digests")
+            if not etag or (crc32 is None) == self.flexible_checksums:
+                raise ValueError("completion requires ETags; CRC32 digests iff flexible checksums")
+            if crc32 is not None and len(base64.b64decode(crc32, validate=True)) != 4:
+                raise ValueError("completion requires base64 CRC32 digests")
             part = ET.SubElement(root, "Part")
             ET.SubElement(part, "PartNumber").text = str(number)
             ET.SubElement(part, "ETag").text = etag
-            ET.SubElement(part, "ChecksumCRC32").text = crc32
+            if crc32 is not None:
+                ET.SubElement(part, "ChecksumCRC32").text = crc32
         body = ET.tostring(root, encoding="utf-8")
         headers = checksum_headers((body,))
         # Complete's CRC32 header describes the assembled object, NOT this XML.
@@ -676,7 +711,7 @@ class S3Client:
         if not self._text(result, "ETag"):
             raise ProtocolError("missing completion ETag", timing=response.timing)
         returned = self._text(result, "ChecksumCRC32")
-        if returned is not None:
+        if self.flexible_checksums and returned is not None:
             crc = zlib.crc32(b"".join(base64.b64decode(part[2], validate=True) for part in parts))
             expected = base64.b64encode(crc.to_bytes(4, "big")).decode() + f"-{len(parts)}"
             if returned != expected:
