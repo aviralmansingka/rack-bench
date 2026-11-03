@@ -120,7 +120,9 @@ def part_size_mib(value):
     except ValueError:
         raise argparse.ArgumentTypeError("expected a positive integer") from None
     if not 8 <= number <= 512:
-        raise argparse.ArgumentTypeError("expected 8..512 (MiB); every non-final part must stay above S3's 5 MiB minimum")
+        raise argparse.ArgumentTypeError(
+            "expected 8..512 (MiB); every non-final part must stay above "
+            "S3/GCS's 5 MiB minimum")
     return number
 
 
@@ -149,7 +151,8 @@ def add_arguments(parser):
     parser.add_argument("--object-size", type=positive_int, metavar="MIB",
                         help="uploaded object size in MiB (default: quick 32, certify 1024)")
     parser.add_argument("--part-size", type=part_size_mib, metavar="MIB",
-                        help="multipart part / range GET size in MiB (default: 64; 8..512)")
+                        help="multipart part / range GET size in MiB (default: 64; 8..512; "
+                             "S3 and GCS document a 5 MiB..5 GiB part range)")
     parser.add_argument("--tool", choices=("stdlib", "warp"), default="stdlib")
     parser.add_argument("--keep-data", action="store_true", help="retain objects under this run's rack-bench/ prefix")
     parser.add_argument("--yes", action="store_true", help="accept the certify reference cost estimate")

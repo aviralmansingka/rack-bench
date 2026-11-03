@@ -35,7 +35,11 @@ class Credentials:
     token: str | None = None
 
     @classmethod
-    def from_env(cls) -> Credentials:
+    def from_env(cls, provider: str = "s3") -> Credentials:
+        """HMAC credentials for one provider; GCS has no session token."""
+        if provider == "gcs":
+            return cls(required_env("GCS_ACCESS_KEY_ID"),
+                       required_env("GCS_SECRET_ACCESS_KEY"))
         return cls(required_env("AWS_ACCESS_KEY_ID"),
                    required_env("AWS_SECRET_ACCESS_KEY"),
                    os.environ.get("AWS_SESSION_TOKEN") or None)
@@ -360,7 +364,14 @@ class Endpoint:
 
 
 def resolve_endpoint(provider: str, region: str) -> Endpoint:
-    """Region selection is the caller's policy; R2 always signs with auto."""
+    """Region selection is the caller's policy; R2 and GCS always sign with auto.
+
+    GCS's XML interoperability API is global and anycast. The caller's region
+    is the bucket location used for pinning and RTT bands, not a network
+    endpoint. Google's S3-compatible SDK samples sign with credential-scope
+    region auto and service s3, so the endpoint carries auto as its signing
+    region. Path-style addressing also works for domain-named buckets.
+    """
     if provider == "s3":
         if not re.fullmatch(r"[a-z0-9-]+", region):
             raise ValueError("invalid S3 region")
@@ -370,6 +381,10 @@ def resolve_endpoint(provider: str, region: str) -> Endpoint:
         if not re.fullmatch(r"[A-Za-z0-9-]+", account):
             raise ValueError("invalid R2_ACCOUNT_ID")
         return Endpoint(f"{account}.r2.cloudflarestorage.com", "auto", True)
+    if provider == "gcs":
+        if not re.fullmatch(r"[a-z0-9-]+", region):
+            raise ValueError("invalid GCS bucket location")
+        return Endpoint("storage.googleapis.com", "auto", True)
     raise ValueError(f"unsupported provider: {provider}")
 
 
@@ -412,7 +427,8 @@ class S3Client:
     def __init__(self, bucket: str, region: str, *, provider: str = "s3",
                  timeout: float = 30, control_retries: int = 2,
                  backoff: float = 0.1, endpoint: Endpoint | None = None):
-        self.credentials = Credentials.from_env()
+        self.provider = provider
+        self.credentials = Credentials.from_env(provider)
         self.endpoint = endpoint or resolve_endpoint(provider, region)
         if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket):
             raise ValueError("bucket must be a DNS-compatible name")
@@ -611,15 +627,29 @@ class S3Client:
         raise cls(f"S3 response {response.status}: {code or 'unknown error'}",
                   timing=response.timing, status=response.status, code=code)
 
+    def _upload_digests(self, payload: SeededPayload, offset: int,
+                        size: int) -> tuple[dict[str, str], str]:
+        """Signed SHA256 always; S3 flexible CRC32 only where the API supports it.
+
+        GCS's XML interoperability API does not implement S3 flexible checksums
+        and rejects a signed x-amz-checksum-* upload header (SignatureDoesNotMatch).
+        x-amz-content-sha256 still authenticates and verifies the payload.
+        """
+        headers = part_checksum_headers(payload, offset, size)
+        crc32 = headers["x-amz-checksum-crc32"]
+        if self.provider == "gcs":
+            headers = {"x-amz-content-sha256": headers["x-amz-content-sha256"]}
+        return headers, crc32
+
     def _upload(self, key: str, payload: SeededPayload, offset: int, size: int,
                 query=(), on_progress=None) -> Response:
         body = lambda: payload.iter_chunks(offset, size)
-        headers = part_checksum_headers(payload, offset, size)
+        headers, crc32 = self._upload_digests(payload, offset, size)
         result = self._request("PUT", key, query=query, headers=headers,
                                body=body, size=size, measurement=True, on_progress=on_progress)
-        result.upload_crc32 = headers["x-amz-checksum-crc32"]
+        result.upload_crc32 = crc32
         returned = result.headers.get("x-amz-checksum-crc32")
-        if returned is not None and returned != headers["x-amz-checksum-crc32"]:
+        if returned is not None and returned != crc32:
             raise ChecksumError("server CRC32 differs from upload", timing=result.timing,
                                 status=result.status)
         return result
@@ -630,9 +660,10 @@ class S3Client:
         return self._upload(key, payload, 0, payload.size, on_progress=on_progress)
 
     def initiate_multipart(self, key: str) -> str:
-        response = self._request("POST", key, query=(("uploads", ""),),
-                                 headers={"x-amz-checksum-algorithm": "CRC32",
-                                          "x-amz-checksum-type": "COMPOSITE"})
+        # GCS does not implement the S3 flexible-checksum negotiation headers.
+        headers = {} if self.provider == "gcs" else {
+            "x-amz-checksum-algorithm": "CRC32", "x-amz-checksum-type": "COMPOSITE"}
+        response = self._request("POST", key, query=(("uploads", ""),), headers=headers)
         upload_id = self._text(self._xml(response, "InitiateMultipartUploadResult"), "UploadId")
         if not upload_id:
             raise ProtocolError("missing UploadId", timing=response.timing)
@@ -663,7 +694,9 @@ class S3Client:
             part = ET.SubElement(root, "Part")
             ET.SubElement(part, "PartNumber").text = str(number)
             ET.SubElement(part, "ETag").text = etag
-            ET.SubElement(part, "ChecksumCRC32").text = crc32
+            # GCS documents only PartNumber and ETag in its completion schema.
+            if self.provider != "gcs":
+                ET.SubElement(part, "ChecksumCRC32").text = crc32
         body = ET.tostring(root, encoding="utf-8")
         headers = checksum_headers((body,))
         # Complete's CRC32 header describes the assembled object, NOT this XML.
