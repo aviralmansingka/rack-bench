@@ -658,6 +658,8 @@ class WorkerProcessS3(BaseHTTPRequestHandler):
 
     def _record(self):
         self.server.state.setdefault("requests", []).append((self.command, self.path))
+        self.server.state.setdefault("authorizations", []).append(
+            self.headers.get("Authorization", ""))
 
     def do_POST(self):
         self._record()
@@ -824,6 +826,37 @@ class ProcessPoolTransferTests(unittest.TestCase):
         self.assertEqual(deletes["alpha"], [f"/alpha/{prefix}a.bin"])
         self.assertEqual(deletes["beta"], [f"/beta/{prefix}b.bin"])
 
+    def test_gcs_provider_process_pool_upload_and_download_scope(self):
+        # Worker processes rebuild clients from the pool config, so this proves
+        # the GCS provider and its HMAC credentials survive the process hop.
+        with patch.dict(os.environ, {"GCS_ACCESS_KEY_ID": "gcs-key",
+                                     "GCS_SECRET_ACCESS_KEY": "gcs-secret"}, clear=True):
+            endpoint = s3.Endpoint("127.0.0.1", "asia-south1", True,
+                                   self.server.server_port, False)
+            client = S3Client("bucket", "asia-south1", provider="gcs", timeout=10,
+                              backoff=0, endpoint=endpoint)
+            self.addCleanup(client.close)
+            self.server.state = {"payload": s3.SeededPayload("proc-seed", self.size),
+                                 "loaded_payload": s3.SeededPayload("proc-seed", LATENCY_SIZE),
+                                 "requests": [], "authorizations": []}
+            run, objects = transfer.transfer_window(client, direction="up", prefix="gcs/",
+                                                    concurrency=2, duration=.05, objects=[],
+                                                    owned=[], size=self.size, one_object=True,
+                                                    part_size=self.part, seed="proc-seed",
+                                                    tcp_factory=FakeTCP, host="127.0.0.1")
+            self.assertEqual(run["status"], "pass")
+            run, completed = transfer.transfer_window(client, direction="down", prefix="unused/",
+                                                      concurrency=2, duration=.05, objects=objects,
+                                                      owned=[], one_object=True, part_size=self.part,
+                                                      tcp_factory=FakeTCP, host="127.0.0.1")
+            self.assertEqual(run["status"], "pass")
+            self.assertEqual(len(completed), 2)
+            authorizations = list(self.server.state["authorizations"])
+        self.assertTrue(authorizations)
+        self.assertTrue(all("Credential=gcs-key/" in value and
+                            "/asia-south1/s3/aws4_request" in value
+                            for value in authorizations))
+
     def test_worker_error_sets_cross_process_stop_and_siblings_drain_out(self):
         self.server.state = {"payload": s3.SeededPayload("proc-seed", self.size),
                              "fail_prefix": "0-0", "requests": []}
@@ -845,7 +878,7 @@ class ProcessPoolTransferTests(unittest.TestCase):
         import pickle
         slots = multiprocessing.Array("i", 2)
         stop = multiprocessing.Event()
-        transfer._pool_initialiser((("bucket", self.endpoint, 10, 2, 0),), stop, slots,
+        transfer._pool_initialiser((("bucket", "s3", self.endpoint, 10, 2, 0),), stop, slots,
                                    2 * 1024 * 1024, None)
         self.assertIsInstance(transfer._POOL_STATE["clients"]["bucket"], S3Client)
         self.assertIs(transfer._POOL_STATE["stop"], stop)

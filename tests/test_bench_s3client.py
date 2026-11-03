@@ -91,6 +91,34 @@ class SigningVectors(unittest.TestCase):
                          "s3/aws4_request,SignedHeaders=host;range;x-amz-content-sha256;x-amz-date,"
                          "Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41")
 
+    def test_gcs_interop_scope_uses_bucket_location_and_s3_service(self):
+        # Google accepts any SigV4 LOCATION value and recommends the resource
+        # location; x-amz extensions require the s3 service name. The bench
+        # therefore signs the GCS bucket location with service "s3".
+        credentials = s3.Credentials("GCSACCESSKEYEXAMPLE", "gcs-secret-example")
+        path = "/bench-bucket/rack-bench/example.bin"
+        canonical = s3.canonical_request(
+            "GET", path, (),
+            {"host": "storage.googleapis.com", "x-amz-content-sha256": EMPTY_HASH,
+             "x-amz-date": "20251103T000000Z"}, EMPTY_HASH)
+        self.assertEqual(canonical, (
+            "GET\n/bench-bucket/rack-bench/example.bin\n\n"
+            "host:storage.googleapis.com\n"
+            "x-amz-content-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+            "x-amz-date:20251103T000000Z\n\n"
+            "host;x-amz-content-sha256;x-amz-date\n"
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"))
+        self.assertEqual(s3.string_to_sign(canonical, "20251103T000000Z", "asia-south1"), (
+            "AWS4-HMAC-SHA256\n20251103T000000Z\n"
+            "20251103/asia-south1/s3/aws4_request\n"
+            "c7090c1d8c04fb5ae3c291bc93e4d921e8c310c586439eb03b0ce9af4d5fd2e9"))
+        signed = s3.sign_headers(credentials, "GET", path, (), {"host": "storage.googleapis.com"},
+                                 EMPTY_HASH, "asia-south1", "20251103T000000Z")
+        self.assertEqual(signed["authorization"], (
+            "AWS4-HMAC-SHA256 Credential=GCSACCESSKEYEXAMPLE/20251103/asia-south1/"
+            "s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, "
+            "Signature=91c98618392edcc46448216677832dc4dc09016df0c4e99a73368d4708e4ea43"))
+
     def test_s3_path_not_normalized_and_query_encoded_once(self):
         canonical = s3.canonical_request("GET", "/a//.././% +/ሴ", (
             ("z", ""), ("a", "+ %"), ("a", "/")), {}, EMPTY_HASH)
@@ -216,17 +244,32 @@ class PayloadTests(unittest.TestCase):
             os.environ["AWS_SECRET_ACCESS_KEY"] = "secret"
             os.environ["AWS_SESSION_TOKEN"] = "session"
             self.assertEqual(s3.Credentials.from_env().token, "session")
+            self.assertEqual(s3.Credentials.from_env("s3"), s3.Credentials("key", "secret", "session"))
+            self.assertEqual(s3.Credentials.from_env("r2"), s3.Credentials("key", "secret", "session"))
             with self.assertRaisesRegex(s3.CredentialError, "R2_ACCOUNT_ID"):
                 s3.resolve_endpoint("r2", "apac")
             os.environ["R2_ACCOUNT_ID"] = "account"
             self.assertEqual(s3.resolve_endpoint("r2", "apac"),
                              s3.Endpoint("account.r2.cloudflarestorage.com", "auto", True))
+            # GCS interop is a separate HMAC pair: AWS-named keys never satisfy it.
+            with self.assertRaisesRegex(s3.CredentialError, "GCS_ACCESS_KEY_ID"):
+                s3.Credentials.from_env("gcs")
+            os.environ["GCS_ACCESS_KEY_ID"] = "gcs-key"
+            with self.assertRaisesRegex(s3.CredentialError, "GCS_SECRET_ACCESS_KEY"):
+                s3.Credentials.from_env("gcs")
+            os.environ["GCS_SECRET_ACCESS_KEY"] = "gcs-secret"
+            self.assertEqual(s3.Credentials.from_env("gcs"),
+                             s3.Credentials("gcs-key", "gcs-secret"))
         self.assertEqual(s3.resolve_endpoint("s3", "ap-south-1"),
                          s3.Endpoint("s3.ap-south-1.amazonaws.com", "ap-south-1", False))
+        self.assertEqual(s3.resolve_endpoint("gcs", "asia-south1"),
+                         s3.Endpoint("storage.googleapis.com", "asia-south1", True))
         with self.assertRaises(ValueError):
             s3.resolve_endpoint("s3", "bad/region")
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "bucket location"):
             s3.resolve_endpoint("gcs", "auto")
+        with self.assertRaises(ValueError):
+            s3.resolve_endpoint("gcs", "asia/south")
 
     def test_ipv4_connection_uses_local_timeout(self):
         with patch.object(s3.socket, "getaddrinfo", return_value=[
@@ -418,6 +461,30 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(request["path"], "/key")
         self.assertEqual(request["headers"]["host"], f"bucket.localhost:{self.server.server_port}")
         self.assertIn("/us-east-1/s3/aws4_request", request["headers"]["authorization"])
+
+    def test_gcs_provider_path_loopback_multipart_upload_and_range_get(self):
+        # The loopback server is provider-agnostic; this exercises the real GCS
+        # provider path: GCS HMAC credentials, path-style bucket addressing, and
+        # the bucket-location SigV4 scope over multipart PUT and range GET.
+        with patch.dict(os.environ, {"GCS_ACCESS_KEY_ID": "gcs-key",
+                                     "GCS_SECRET_ACCESS_KEY": "gcs-secret"}, clear=True):
+            endpoint = s3.Endpoint("127.0.0.1", "asia-south1", True,
+                                   self.server.server_port, False)
+            client = s3.S3Client("bucket", "asia-south1", provider="gcs", timeout=2,
+                                 backoff=0, endpoint=endpoint)
+            self.addCleanup(client.close)
+            payload = s3.SeededPayload("gcs-loopback", 5 * 1024**2 + 99)
+            client.multipart_upload("gcs/key", payload, part_size=5 * 1024**2)
+            self.state["payload"] = payload  # GET serves state["payload"], not PUT bodies.
+            response = client.get_object("gcs/key", byte_range=(1000, 9999), payload=payload)
+        self.assertEqual(response.status, 206)
+        requests = self.state["requests"]
+        self.assertEqual(requests[0]["path"], "/bucket/gcs/key?uploads=")
+        self.assertTrue(all("Credential=gcs-key/" in request["headers"]["authorization"]
+                            and "/asia-south1/s3/aws4_request" in request["headers"]["authorization"]
+                            for request in requests))
+        self.assertEqual([r["method"] for r in requests], ["POST", "PUT", "PUT", "POST", "GET"])
+        self.assertEqual(requests[-1]["headers"]["range"], "bytes=1000-9999")
 
     def test_multipart_sequence_etags_checksums_and_completion_xml(self):
         parts = []

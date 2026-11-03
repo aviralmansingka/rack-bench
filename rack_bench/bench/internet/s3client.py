@@ -28,6 +28,16 @@ class CredentialError(ValueError):
     """A required environment variable is absent."""
 
 
+# Provider-specific credential variables. S3 and R2 share the AWS names;
+# GCS interop uses its own HMAC key pair so one collection can select several
+# providers without one provider's key leaking into another's requests.
+CREDENTIAL_ENV = {
+    "s3": ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"),
+    "r2": ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"),
+    "gcs": ("GCS_ACCESS_KEY_ID", "GCS_SECRET_ACCESS_KEY", None),
+}
+
+
 @dataclass(frozen=True, repr=False)
 class Credentials:
     access_key: str
@@ -35,10 +45,13 @@ class Credentials:
     token: str | None = None
 
     @classmethod
-    def from_env(cls) -> Credentials:
-        return cls(required_env("AWS_ACCESS_KEY_ID"),
-                   required_env("AWS_SECRET_ACCESS_KEY"),
-                   os.environ.get("AWS_SESSION_TOKEN") or None)
+    def from_env(cls, provider: str = "s3") -> Credentials:
+        try:
+            access, secret, token = CREDENTIAL_ENV[provider]
+        except KeyError:
+            raise ValueError(f"unsupported provider: {provider}") from None
+        return cls(required_env(access), required_env(secret),
+                   (os.environ.get(token) or None) if token else None)
 
 
 def required_env(name: str) -> str:
@@ -360,7 +373,12 @@ class Endpoint:
 
 
 def resolve_endpoint(provider: str, region: str) -> Endpoint:
-    """Region selection is the caller's policy; R2 always signs with auto."""
+    """Region selection is the caller's policy; R2 always signs with auto.
+
+    GCS XML interoperability is a global, anycast endpoint. The region is the
+    bucket's location: Google accepts any SigV4 LOCATION value, recommends the
+    resource location, and requires the s3 service name with x-amz extensions.
+    """
     if provider == "s3":
         if not re.fullmatch(r"[a-z0-9-]+", region):
             raise ValueError("invalid S3 region")
@@ -370,6 +388,11 @@ def resolve_endpoint(provider: str, region: str) -> Endpoint:
         if not re.fullmatch(r"[A-Za-z0-9-]+", account):
             raise ValueError("invalid R2_ACCOUNT_ID")
         return Endpoint(f"{account}.r2.cloudflarestorage.com", "auto", True)
+    if provider == "gcs":
+        if region == "auto" or not re.fullmatch(r"[A-Za-z0-9_-]+", region):
+            raise ValueError("GCS requires a bucket location, e.g. asia-south1")
+        # Path-style avoids virtual-host TLS problems for dotted bucket names.
+        return Endpoint("storage.googleapis.com", region, True)
     raise ValueError(f"unsupported provider: {provider}")
 
 
@@ -412,7 +435,8 @@ class S3Client:
     def __init__(self, bucket: str, region: str, *, provider: str = "s3",
                  timeout: float = 30, control_retries: int = 2,
                  backoff: float = 0.1, endpoint: Endpoint | None = None):
-        self.credentials = Credentials.from_env()
+        self.provider = provider
+        self.credentials = Credentials.from_env(provider)
         self.endpoint = endpoint or resolve_endpoint(provider, region)
         if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket):
             raise ValueError("bucket must be a DNS-compatible name")

@@ -145,6 +145,24 @@ class BenchTests(unittest.TestCase):
         result = runner.collect("internet", options=internet.Options(providers=("gcs", "r2")))[0]
         self.assertEqual([c.name for c in result.checks], names(("r2", "gcs")))
 
+    def test_gcs_is_opt_in_and_missing_hmac_credentials_skip_with_reason(self):
+        self.assertEqual(internet.Options().providers, ("s3", "r2"))
+        result = runner.collect("internet", options=internet.Options(providers=("gcs",)))[0]
+        self.assertEqual([c.name for c in result.checks], names(("gcs",)))
+        self.assertTrue(all(c.status == "skip" and
+                            "credentials not set: missing environment variable: GCS_ACCESS_KEY_ID"
+                            in c.detail for c in result.checks))
+
+    def test_gcs_cli_regions_buckets_and_provider_list(self):
+        with patch.object(runner, "run", return_value=0) as run:
+            self.assertEqual(main(["bench", "internet", "--providers", "gcs,s3",
+                                   "--regions", "gcs=asia-south1,s3=ap-south-1",
+                                   "--buckets", "gcs=bench-gcs"]), 0)
+        options = run.call_args.kwargs["options"]
+        self.assertEqual(options.providers, ("gcs", "s3"))
+        self.assertEqual(options.regions, {"gcs": "asia-south1", "s3": "ap-south-1"})
+        self.assertEqual(options.buckets, {"gcs": ("bench-gcs",)})
+
     def test_filters_prevent_probe_calls(self):
         checks = {name: Mock(return_value=Check(name, "skip")) for name in internet.CHECKS}
         with patch.dict(internet.CHECKS, checks, clear=True):
