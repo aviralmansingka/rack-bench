@@ -21,6 +21,7 @@ class Options:
     duration: int | None = None  # seconds per test; defaults depend on profile
     object_size: int | None = None  # MiB per uploaded object; default depends on profile
     part_size: int | None = None  # MiB per multipart part / range GET; default 64
+    upload_mode: str = "auto"  # auto: single-part-sized objects use one plain PutObject
     tool: str = "stdlib"
     keep_data: bool = False
     yes: bool = False
@@ -33,6 +34,8 @@ class Options:
             self.duration = 300 if self.profile == "certify" else 60
         if self.part_size is None:
             self.part_size = 64  # MiB; see transfer.PART_SIZE for the timeout rationale
+        if self.upload_mode not in ("auto", "multipart"):
+            raise ValueError("upload_mode must be auto or multipart")
         # Library callers may pass a bare name; normalize to the ordered tuple
         # every consumer reads (targets.bucket_names).
         self.buckets = {provider: (names,) if isinstance(names, str) else tuple(names)
@@ -151,6 +154,10 @@ def add_arguments(parser):
                         help="uploaded object size in MiB (default: quick 32, certify 1024)")
     parser.add_argument("--part-size", type=part_size_mib, metavar="MIB",
                         help="multipart part / range GET size in MiB (default: 64; 8..512)")
+    parser.add_argument("--upload-mode", choices=("auto", "multipart"), default="auto",
+                        help="auto (default): an object that fits in one part uploads as one "
+                             "plain PutObject; multipart forces multipart for every object "
+                             "(request-pattern comparisons)")
     parser.add_argument("--tool", choices=("stdlib", "warp"), default="stdlib")
     parser.add_argument("--keep-data", action="store_true", help="retain objects under this run's rack-bench/ prefix")
     parser.add_argument("--yes", action="store_true", help="accept the certify reference cost estimate")
