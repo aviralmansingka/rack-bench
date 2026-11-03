@@ -69,7 +69,7 @@ def upload_reports(provider, options, *, client_factory=S3Client, window=transfe
                 run, objects = window(client, direction="up", prefix=f"{prefix}{kind}-{concurrency}-{index}/",
                                       concurrency=concurrency, duration=options.duration, objects=[], owned=record["owned"],
                                       size=size, part_size=options.part_size * MIB, seed=run_seed(options),
-                                      buckets=names, clients=clients,
+                                      buckets=names, clients=clients, upload_mode=options.upload_mode,
                                       one_object=target["band"] == "light", loaded=loaded if kind == "bulk" else None,
                                       provider=provider,
                                       # ss diagnostics anchor to the first bucket's virtual host;
