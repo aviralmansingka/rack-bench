@@ -24,7 +24,9 @@ from .stats import describe
 from .targets import reason, targets
 
 # Chennai-origin references: docs/internet-performance.md § regional RTTs.
-RTT_BANDS = {"ap-south-1": (20, 35), "ap-southeast-1": (35, 55), "us-east-1": (180, 250)}
+# asia-south1 is GCS Mumbai: same metro as ap-south-1, same reference band.
+RTT_BANDS = {"ap-south-1": (20, 35), "ap-southeast-1": (35, 55), "us-east-1": (180, 250),
+             "asia-south1": (20, 35)}
 
 
 def parse_mtr(text):
@@ -145,7 +147,7 @@ def path_probe(provider, metric, options, *, run=subprocess.run, which=shutil.wh
         else:
             findings, primary_findings = [], []
             for region in records:
-                band = RTT_BANDS.get(region["region"]) if provider == "s3" else None
+                band = RTT_BANDS.get(region["region"]) if provider in ("s3", "gcs") else None
                 for report in region["reports"]:
                     if report.get("reason") or not report["hops"]:
                         continue

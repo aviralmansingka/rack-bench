@@ -4,12 +4,16 @@ from uuid import uuid4
 from .s3client import Credentials, CredentialError, resolve_endpoint
 
 
+DEFAULT_REGIONS = {"s3": "ap-south-1", "r2": "apac", "gcs": "asia-south1"}
+# The gcs default matches the S3/R2 nearest band: asia-south1 (Mumbai) sits in
+# the same metro as ap-south-1, and Google's Chennai edge POP terminates the
+# anycast interop endpoint close to the node (docs/internet-performance.md §3).
+
+
 def targets(provider, options):
     """Nearest band first; unsupported providers/bands remain explicit records."""
-    Credentials.from_env()  # Spec §6: even context probes require provider credentials.
-    if provider == "gcs":
-        raise ValueError("GCS interoperability not implemented")
-    nearest = options.regions.get(provider, "ap-south-1" if provider == "s3" else "apac")
+    Credentials.from_env(provider)  # Spec §6: even context probes require provider credentials.
+    nearest = options.regions.get(provider, DEFAULT_REGIONS[provider])
     regions = [nearest]
     if options.profile == "certify" and provider not in options.regions:
         regions += ["ap-southeast-1", "us-east-1"]
@@ -19,6 +23,10 @@ def targets(provider, options):
         reason = None
         if provider == "r2" and region not in {"apac", "auto"}:
             reason = "unsupported pinned R2 band: placement hint does not establish a regional path"
+        elif provider == "gcs" and index > 0:
+            # The interop endpoint is one global anycast host: far bands would
+            # measure the same edge path, so only the pinned location runs.
+            reason = "unsupported pinned GCS band: global anycast endpoint; pin --regions gcs=<location> to move the measured location"
         result.append({"region": region, "endpoint": f"https://{endpoint.host}",
                        "host": endpoint.host, "band": "nearest" if index == 0 else "light",
                        "runs": 3 if options.profile == "certify" and index == 0 else 1,
