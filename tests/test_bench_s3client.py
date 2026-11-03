@@ -465,6 +465,21 @@ class TransportTests(unittest.TestCase):
         self.assertEqual([r["method"] for r in self.state["requests"]], ["POST", "PUT", "DELETE"])
         self.assertIn("uploadId=", self.state["requests"][-1]["path"])
 
+    def test_plain_put_signs_the_same_digests_as_a_part_upload(self):
+        # The single-part-sized upload path reuses today's part-request
+        # signing byte for byte: same payload, same signed SHA256 and CRC32
+        # headers, same Content-Length and identical body bytes server-side;
+        # only the partNumber/uploadId query disappears.
+        payload = s3.SeededPayload("same-digest", 300000)
+        self.client.put_object("plain", payload)
+        self.client.upload_part("multi", "id-1", 1, payload, 0, payload.size)
+        put, part = self.state["requests"]
+        self.assertEqual(put["path"], "/bucket/plain")
+        self.assertEqual(part["path"], "/bucket/multi?partNumber=1&uploadId=id-1")
+        for header in ("x-amz-content-sha256", "x-amz-checksum-crc32", "content-length"):
+            self.assertEqual(put["headers"][header], part["headers"][header])
+        self.assertEqual(put["crc32"], part["crc32"])  # server-computed CRC32: identical bytes
+
     def test_returned_checksum_mismatch_is_typed(self):
         self.state["bad_returned_crc"] = True
         with self.assertRaises(s3.ChecksumError):
