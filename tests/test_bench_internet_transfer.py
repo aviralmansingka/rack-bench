@@ -88,14 +88,19 @@ class FakeClient:
         self.endpoint = SimpleNamespace(host="example.invalid", path_style=False)
         self.bucket = "bench-test"
         self.objects, self.deleted, self.calls = {}, [], []
+        self.uploads = []  # ("put" | "multipart", key): the mode each object used
         self.invalid = invalid or {}
 
-    def put_object(self, key, payload):
+    def put_object(self, key, payload, on_progress=None):
+        self.uploads.append(("put", key))
+        if on_progress:
+            on_progress(payload.size, .001)
         self.objects[key] = payload
         return response(payload.size)
 
     def multipart_upload(self, key, payload, part_size, on_part, on_progress):
         self.calls.append(("up", key))
+        self.uploads.append(("multipart", key))
         for offset in range(0, payload.size, part_size):
             size = min(part_size, payload.size - offset)
             on_progress(size // 2, .001)
@@ -133,9 +138,11 @@ class TransferTests(unittest.TestCase):
         self.clock = Clock()
 
     def window(self, **kwargs):
+        kwargs.setdefault("size", 16)
+        kwargs.setdefault("one_object", True)
         with patch.object(transfer, "PART_SIZE", 8):
             return transfer.transfer_window(self.client, direction="up", prefix="rack-bench/test/", concurrency=2,
-                                          duration=.1, objects=[], owned=[], size=16, one_object=True,
+                                          duration=.1, objects=[], owned=[],
                                           clock=self.clock, tcp_factory=FakeTCP,
                                           pool_factory=transfer._thread_pool_factory, **kwargs)
 
@@ -149,6 +156,10 @@ class TransferTests(unittest.TestCase):
         self.assertEqual(sum(b["bytes"] for b in run["buckets"]), 32)
         self.assertAlmostEqual(run["mib_per_sec"], 32 / transfer.MIB / run["elapsed_seconds"])
         self.assertTrue(all(s["cpu_ms"] >= 0 for s in run["samples"]))
+        # 16-byte objects against an 8-byte part size: still multipart, and
+        # every sample and completed record names its mode.
+        self.assertTrue(all(s["upload_mode"] == "multipart" for s in run["samples"]))
+        self.assertTrue(all(obj["upload_mode"] == "multipart" for obj in objects))
 
     def test_range_gets_read_uploaded_objects_and_single_stream(self):
         _, objects = self.window()
@@ -183,6 +194,20 @@ class TransferTests(unittest.TestCase):
         run, _ = self.window()
         self.assertEqual(run["status"], "skip")
         self.assertIn("broken socket", run["errors"][0]["reason"])
+
+    def test_put_mode_deadline_stops_between_whole_objects(self):
+        # Scheduling is unchanged in put mode: workers keep starting whole
+        # objects until the deadline; a plain PUT is atomic, so no object is
+        # ever half-uploaded and nothing needs aborting.
+        with patch.object(transfer, "PART_SIZE", 8):
+            run, objects = transfer.transfer_window(self.client, direction="up", prefix="rack-bench/test/",
+                                                    concurrency=1, duration=.1, objects=[], owned=[],
+                                                    size=8, clock=self.clock, tcp_factory=FakeTCP)
+        self.assertEqual(run["status"], "pass")
+        self.assertTrue(objects)
+        self.assertEqual(run["incomplete_objects"], 0)
+        self.assertEqual(run["bytes"], 8 * len(objects))
+        self.assertTrue(all(obj["upload_mode"] == "put" for obj in objects))
 
     def test_deadline_stops_at_part_boundary_without_forcing_gib_objects(self):
         with patch.object(transfer, "PART_SIZE", 8):
@@ -220,29 +245,48 @@ class TransferTests(unittest.TestCase):
         self.assertEqual(failed["status"], "skip")
         self.assertIn("abort denied", failed["errors"][0]["reason"])
 
-    def test_quick_object_smaller_than_part_is_valid_single_part_upload(self):
-        # Default 64 MiB parts against a 32 MiB quick-profile object: one part,
-        # still legal S3 (only non-final parts must reach 5 MiB).
+    def test_quick_object_smaller_than_part_uploads_as_one_plain_put(self):
+        # Default 64 MiB parts against a 32 MiB quick-profile object: the object
+        # fits in a single part, so auto mode sends ONE PutObject -- no initiate,
+        # no part, no complete (3 requests/object was the R2 502 trigger).
         client = S3Client("bench-test", "us-east-1")
-        client.initiate_multipart = Mock(return_value="single-upload-id")
-        client.complete_multipart = Mock(return_value=response(0))
-        client.abort_multipart = Mock()
-        def part(key, upload_id, number, payload, offset, size, on_progress):
-            on_progress(size, .01)
-            result = response(size)
-            result.headers = {"etag": "part-tag"}
-            result.upload_crc32 = "AAAAAA=="
-            return result
-        client.upload_part = part
+        client.initiate_multipart = Mock()
+        def put(key, payload, on_progress=None):
+            on_progress(payload.size, .01)
+            return response(payload.size)
+        client.put_object = put
         run = transfer.transfer_window(client, direction="up", prefix="rack-bench/test/", concurrency=1,
                                        duration=.1, objects=[], owned=[], size=transfer.LIGHT_SIZE,
                                        clock=Clock(), tcp_factory=FakeTCP)[0]
         self.assertEqual(run["status"], "pass")
         self.assertEqual(run["bytes"], transfer.LIGHT_SIZE)
-        self.assertEqual([s["part"] for s in run["samples"]], [0])
-        client.complete_multipart.assert_called_once()
-        self.assertEqual(client.complete_multipart.call_args.args[2], [(1, "part-tag", "AAAAAA==")])
-        client.abort_multipart.assert_not_called()
+        self.assertEqual(run["incomplete_objects"], 0)  # a plain PUT is atomic
+        self.assertEqual([(s["part"], s["upload_mode"]) for s in run["samples"]], [(0, "put")])
+        client.initiate_multipart.assert_not_called()
+
+    def test_upload_mode_selection_at_the_size_boundary(self):
+        # Equal size/part_size is one PUT; one byte more is multipart. The
+        # multipart override forces the three-request pattern either way.
+        for size, override, expected in ((8, "auto", "put"), (8, "multipart", "multipart"),
+                                         (9, "auto", "multipart"), (9, "multipart", "multipart")):
+            with self.subTest(size=size, override=override):
+                self.client.uploads.clear()
+                run, objects = self.window(size=size, part_size=8, upload_mode=override)
+                self.assertEqual(run["status"], "pass")
+                self.assertEqual([mode for mode, _ in self.client.uploads], [expected] * 2)
+                self.assertTrue(all(s["upload_mode"] == expected for s in run["samples"]))
+                self.assertTrue(all(obj["upload_mode"] == expected for obj in objects))
+
+    def test_upload_mode_flag_reaches_every_upload_window(self):
+        self.reports()
+        self.assertTrue(all(c["upload_mode"] == "auto" for c in self.calls if c["direction"] == "up"))
+        self.options = Options(providers=("s3",), buckets={"s3": "bench-test"}, duration=1,
+                               part_size=64, upload_mode="multipart")
+        self.reports()
+        self.assertTrue(all(c["upload_mode"] == "multipart" for c in self.calls if c["direction"] == "up"))
+        self.assertEqual(Options().upload_mode, "auto")
+        with self.assertRaises(ValueError):
+            Options(upload_mode="put")
 
     def test_part_size_kwarg_sizes_multipart_and_range_gets(self):
         seen = {}
@@ -259,18 +303,20 @@ class TransferTests(unittest.TestCase):
                 consume(b"x" * (byte_range[1] - byte_range[0] + 1), byte_range[0])
             return response(byte_range[1] - byte_range[0] + 1, "down")
         self.client.multipart_upload, self.client.get_object = multipart, get
-        run, objects = self.window(part_size=16)
+        # 32-byte objects with a 16-byte part size: two parts per object, so
+        # the part-size kwarg (not the size rule) picks multipart.
+        run, objects = self.window(size=32, part_size=16)
         self.assertEqual(run["status"], "pass")
-        self.assertEqual(run["bytes"], 32)
-        self.assertEqual([s["part"] for s in run["samples"]], [0, 0])  # one part per 16-byte object
+        self.assertEqual(run["bytes"], 64)
+        self.assertEqual([s["part"] for s in run["samples"]], [0, 1, 0, 1])  # two parts per 32-byte object
         self.assertEqual(seen["upload"], 16)
         with patch.object(transfer, "PART_SIZE", 8):
             run, _ = transfer.transfer_window(self.client, direction="down", prefix="unused/", concurrency=1,
                                               duration=.1, objects=objects, owned=[], one_object=True,
                                               clock=self.clock, tcp_factory=FakeTCP, part_size=16)
-        self.assertEqual(run["bytes"], 16)
-        self.assertEqual([s["part"] for s in run["samples"]], [0])
-        self.assertEqual(seen["ranges"], [(0, 15)])  # explicit kwarg beats the patched module default
+        self.assertEqual(run["bytes"], 32)
+        self.assertEqual([s["part"] for s in run["samples"]], [0, 1])
+        self.assertEqual(seen["ranges"], [(0, 15), (16, 31)])  # explicit kwarg beats the patched module default
 
     def test_default_part_size_is_64_mib_and_module_constant_matches(self):
         self.assertEqual(transfer.PART_SIZE, 64 * transfer.MIB)
@@ -490,6 +536,22 @@ class TransferTests(unittest.TestCase):
         # Envelope shape is unchanged; only detail fields were added.
         self.assertEqual(detail["selection"], "nearest; median of 3 by MiB/s per concurrency, scalar is largest concurrency; all runs retained")
         self.assertTrue(all("runs_detail" in region for region in detail["regions"]))
+
+    def test_transfer_check_reports_upload_mode_counts_additively(self):
+        self.reports()
+        records = self.options._transfer_reports["s3"]["up"]
+        chosen = next(r for r in records[0]["runs_detail"] if r["kind"] == "bulk")
+        chosen["samples"] = [{"upload_mode": "put"}, {"upload_mode": "put"}, {"upload_mode": "multipart"}]
+        check = transfer.transfer_check("s3", "up", "throughput", self.options, records)
+        detail = json.loads(check.detail)
+        self.assertEqual(detail["upload_modes"], {"put": 2, "multipart": 1})
+        # Check name and the runs_detail envelope stay stable for ab_quick compare.
+        self.assertEqual(check.name, "internet.s3.upload.throughput")
+        self.assertTrue(all("runs_detail" in region for region in detail["regions"]))
+        # The census is upload-only: download detail never carries it.
+        downloads = download.download_reports("s3", self.options, client_factory=lambda *a, **k: self.client, window=self.fake_window)
+        check = transfer.transfer_check("s3", "down", "throughput", self.options, downloads)
+        self.assertNotIn("upload_modes", json.loads(check.detail))
 
     def test_concurrent_loaded_gets_are_inside_upload_window(self):
         started, twice = threading.Event(), threading.Event()
@@ -778,6 +840,9 @@ class WorkerProcessS3(BaseHTTPRequestHandler):
 
     def _record(self):
         self.server.state.setdefault("requests", []).append((self.command, self.path))
+        # Header evidence for provider-semantics assertions (checksum policy).
+        self.server.state.setdefault("request_headers", []).append(
+            (self.command, self.path, {key.lower(): value for key, value in self.headers.items()}))
 
     def do_POST(self):
         self._record()
@@ -872,6 +937,8 @@ class ProcessPoolTransferTests(unittest.TestCase):
         self.assertEqual(run["errors"], [])
         self.assertTrue(all(obj["payload"]["seed"] == "proc-seed" for obj in objects))
         self.assertTrue(all(obj["bucket"] == "bucket" for obj in objects))  # records name their bucket
+        self.assertTrue(all(sample["upload_mode"] == "multipart" for sample in run["samples"]))
+        self.assertTrue(all(obj["upload_mode"] == "multipart" for obj in objects))
         self.assertEqual({sample["bucket"] for sample in run["samples"]}, {"bucket"})
         # Loaded-latency stays a parent-side probe with fresh-connection semantics.
         self.assertTrue(run["loaded_samples"])
@@ -1009,6 +1076,90 @@ class ProcessPoolTransferTests(unittest.TestCase):
                       {"service-paced", "receive-window limited", "congestion or loss", "send-buffer limited",
                        "flat ceiling, clean sockets", "bursty", "no dominant ceiling signature"})
 
+    def test_single_part_sized_object_uploads_as_one_plain_put(self):
+        # An 8 MiB object with an 8 MiB part size: ONE plain PutObject per
+        # object. The loopback root must see exactly one request per object --
+        # no initiate, no part query, no complete -- and the signed request
+        # keeps today's s3 checksum semantics (SHA256 + CRC32).
+        size = 8 * transfer.MIB
+        self.server.state = {"payload": s3.SeededPayload("proc-seed", size),
+                             "requests": [], "request_headers": []}
+        owned = []
+        run, objects = transfer.transfer_window(self.client, direction="up", prefix="proc/", concurrency=2,
+                                                duration=.05, objects=[], owned=owned, size=size,
+                                                one_object=True, part_size=size, seed="proc-seed",
+                                                tcp_factory=FakeTCP, host="127.0.0.1")
+        self.assertEqual(run["status"], "pass")
+        self.assertEqual(run["bytes"], 2 * size)
+        self.assertEqual(run["objects"], 2)
+        self.assertEqual(run["incomplete_objects"], 0)  # a plain PUT is atomic
+        self.assertEqual([s["upload_mode"] for s in run["samples"]], ["put", "put"])
+        self.assertTrue(all(obj["upload_mode"] == "put" for obj in objects))
+        requests = self.server.state["requests"]
+        self.assertEqual(len(requests), 2)  # one request per object, not three
+        self.assertTrue(all(method == "PUT" and "?" not in path for method, path in requests))
+        for _, _, headers in self.server.state["request_headers"]:
+            self.assertIn("x-amz-checksum-crc32", headers)
+            self.assertIn("authorization", headers)
+        # Downloads verify ranges of the PUT objects unchanged; same envelope.
+        self.server.state["requests"] = []
+        run, completed = transfer.transfer_window(self.client, direction="down", prefix="unused/",
+                                                  concurrency=2, duration=.05, objects=objects,
+                                                  owned=[], one_object=True, part_size=size,
+                                                  tcp_factory=FakeTCP, host="127.0.0.1")
+        self.assertEqual(run["status"], "pass")
+        self.assertEqual(run["bytes"], 2 * size)
+        self.assertEqual(run["errors"], [])
+
+    def test_forced_multipart_mode_reproduces_three_request_pattern(self):
+        # --upload-mode multipart forces initiate + part + complete even for
+        # single-part-sized objects: the pre-change 3-requests-per-object
+        # pattern, kept available for forced A/B comparisons.
+        size = 8 * transfer.MIB
+        self.server.state = {"payload": s3.SeededPayload("proc-seed", size), "requests": []}
+        run, objects = transfer.transfer_window(self.client, direction="up", prefix="proc/", concurrency=2,
+                                                duration=.05, objects=[], owned=[], size=size,
+                                                one_object=True, part_size=size, seed="proc-seed",
+                                                upload_mode="multipart", tcp_factory=FakeTCP, host="127.0.0.1")
+        self.assertEqual(run["status"], "pass")
+        self.assertEqual(run["bytes"], 2 * size)
+        self.assertTrue(all(s["upload_mode"] == "multipart" for s in run["samples"]))
+        self.assertTrue(all(obj["upload_mode"] == "multipart" for obj in objects))
+        methods = sorted(method for method, _ in self.server.state["requests"])
+        self.assertEqual(methods, ["POST", "POST", "POST", "POST", "PUT", "PUT"])  # 2 x (initiate, part, complete)
+        posts = [path for method, path in self.server.state["requests"] if method == "POST"]
+        self.assertTrue(any("uploads" in path for path in posts))      # initiate
+        self.assertTrue(any("uploadId" in path for path in posts))     # complete
+
+    def test_gcs_single_part_put_omits_checksum_headers(self):
+        # The gcs provider path through the real worker processes with a
+        # single-part-sized object: one plain PutObject, path-style, signed
+        # SHA256 digest aboard, and no S3 flexible-checksum header.
+        env = patch.dict(os.environ, {"GCS_ACCESS_KEY_ID": "fake", "GCS_SECRET_ACCESS_KEY": "fake"})
+        env.start()
+        self.addCleanup(env.stop)
+        endpoint = s3.Endpoint("127.0.0.1", "asia-south1", True, self.server.server_port, False)
+        client = S3Client("bucket", "asia-south1", provider="gcs", timeout=10, backoff=0,
+                          endpoint=endpoint)
+        self.addCleanup(client.close)
+        size = 8 * transfer.MIB
+        self.server.state = {"payload": s3.SeededPayload("gcs-seed", size),
+                             "requests": [], "request_headers": []}
+        run, objects = transfer.transfer_window(client, direction="up", prefix="gcs/", concurrency=2,
+                                                duration=.05, objects=[], owned=[], size=size,
+                                                one_object=True, part_size=size, seed="gcs-seed",
+                                                tcp_factory=FakeTCP, host="127.0.0.1", provider="gcs")
+        self.assertEqual(run["status"], "pass")
+        self.assertEqual(run["bytes"], 2 * size)
+        self.assertEqual(run["errors"], [])
+        self.assertTrue(all(s["upload_mode"] == "put" for s in run["samples"]))
+        self.assertTrue(all(method == "PUT" and "?" not in path
+                            for method, path in self.server.state["requests"]))
+        for _, _, headers in self.server.state["request_headers"]:
+            self.assertNotIn("x-amz-checksum-crc32", headers)  # gcs: no CRC32 headers
+            self.assertIn("x-amz-content-sha256", headers)     # signed digest still rides
+            self.assertIn("authorization", headers)
+
     def test_worker_error_sets_cross_process_stop_and_siblings_drain_out(self):
         self.server.state = {"payload": s3.SeededPayload("proc-seed", self.size),
                              "fail_prefix": "0-0", "requests": []}
@@ -1043,6 +1194,7 @@ class ProcessPoolTransferTests(unittest.TestCase):
         self.assertIs(pickle.loads(pickle.dumps(transfer._transfer_worker)), transfer._transfer_worker)
         task = {"direction": "up", "prefix": "p/", "index": 3, "objects": [], "size": 8,
                 "one_object": True, "deadline": 1.5, "start": .5, "part_size": 8, "seed": None,
+                "upload_mode": "auto",
                 "clock": time.monotonic, "bucket": "bucket", "clients": None, "stop": None, "active": None}
         self.assertEqual(pickle.loads(pickle.dumps(task)), task)  # the process-mode task payload
 
