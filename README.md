@@ -389,9 +389,11 @@ run containing SKIPs can exit 0; inspect the checks, not just the exit code.
 #### Workload and ownership
 
 Path/DNS and a verified 100 KiB idle-TTFB baseline run first. Uploads use
-seeded, checksummed multipart objects (32 MiB quick, ~1 GiB certify) with
+seeded, checksummed objects (32 MiB quick, ~1 GiB certify) with
 concurrent small-object GETs
-for loaded TTFB. Downloads verify ranges from this run's completed uploads; they
+for loaded TTFB. An object that fits in one part goes up as one plain
+`PutObject`; larger objects keep multipart, so each request stays bounded by
+the part size. Downloads verify ranges from this run's completed uploads; they
 never use pre-seeded data. All upload windows, including a separate unloaded
 concurrency-1 test, finish before download windows start. TCP socket sampling
 brackets these windows — retransmit deltas plus per-socket
@@ -466,6 +468,7 @@ Internet flags follow `bench internet`, not the `bench` parent.
 | `--buckets s3=<n1>,s3=<n2>,...` | Existing buckets; a provider may repeat for sharding   |
 | `--concurrent N`                | Override quick's 32 streams or certify's sweep        |
 | `--duration 60s`                | Per-window duration; defaults: quick 60s, certify 5m  |
+| `--upload-mode auto\|multipart` | Default `auto`: one PutObject when the object fits a part |
 | `--tool stdlib\|warp`           | Default `stdlib`; Warp execution unsupported          |
 | `--keep-data`                   | Retain completed objects under the run-owned prefix   |
 | `--yes`                         | Accept the certify reference cost estimate            |
@@ -477,8 +480,8 @@ exits 2. `--json` prints the version-1 envelope; `--json FILE` exports it
 alongside human stdout. `--run-dir DIR` receives `bench.out` and
 `bench.values.json`. JSON-encoded detail retains all regions/runs, per-operation
 timings, per-second throughput buckets, byte accounting, TTFB percentiles,
-post-TTFB streaming rates, ss socket-limit shares, ceiling verdicts, per-bucket
-evidence, diagnostic signals, and cleanup results. `--show-command` traces real operations; `--quiet` suppresses
+post-TTFB streaming rates, ss socket-limit shares, ceiling verdicts, upload-mode
+counts, per-bucket evidence, diagnostic signals, and cleanup results. `--show-command` traces real operations; `--quiet` suppresses
 traces and PASS rows, not SKIPs.
 
 **Transfers incur charges.** Certify always prints its reference estimate to
