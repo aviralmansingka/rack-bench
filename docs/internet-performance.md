@@ -259,9 +259,9 @@ can verify it.
 **Provider scope (decided): S3 + R2 are the primary bench targets** —
 R2 because it is natively S3-compatible, has a Cloudflare Chennai POP
 (sub-10 ms edge RTT), and zero egress fees make regression testing
-free; S3 as the authoritative provider. GCS stays in this doc as a
-documented extension (S3-interop endpoint or `gcloud perfdiag`) but is
-not in the first implementation.
+free; S3 as the authoritative provider. GCS is implemented behind
+`--providers gcs` (S3-interop endpoint + HMAC keys) as a best-effort
+opt-in: loopback-tested only, pending a live certification run.
 
 ---
 
