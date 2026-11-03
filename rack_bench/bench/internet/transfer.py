@@ -327,6 +327,11 @@ def _transfer_worker(spec):
         iteration += 1
         if spec["one_object"]:
             break
+    # Threads own their pooled sockets (threading.local): close them before
+    # the worker thread exits so no socket dies in the garbage collector at
+    # thread teardown. Each close touches only the calling thread's entry.
+    for client in clients.values():
+        client.close()
     return samples, points, completed, errors, owned_keys, incomplete_objects, attempted_bytes
 
 
