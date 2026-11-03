@@ -590,7 +590,7 @@ def transfer_check(provider, direction, metric, options, records):
     detail = {"regions": records, "buckets": list(bucket_names(provider, options)),
               "selection": "nearest; median of 3 by MiB/s per concurrency, scalar is largest concurrency; all runs retained",
               "single_stream_mib_per_sec": singles["mib_per_sec"] if singles else None,
-              "timing_semantics": "schedule for duration, drain current part/range; abort incomplete multipart; actual elapsed denominator includes hashing/verification/control; per-op CPU is thread CPU",
+              "timing_semantics": "schedule for duration, drain current part/range or whole single PUT; abort incomplete multipart; actual elapsed denominator includes hashing/verification/control; per-op CPU is thread CPU",
               "single_stream": {}}
     for region in records:
         single = reduce_runs([r for r in region["runs_detail"] if r["kind"] == "single"])
