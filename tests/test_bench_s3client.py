@@ -91,6 +91,21 @@ class SigningVectors(unittest.TestCase):
                          "s3/aws4_request,SignedHeaders=host;range;x-amz-content-sha256;x-amz-date,"
                          "Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41")
 
+    def test_gcs_interop_signs_hmac_key_in_auto_scope(self):
+        # GCS S3 interop: AWS4-HMAC-SHA256 with the GCS HMAC access ID and an
+        # unchanged S3-style scope; Google's samples pin the scope region to
+        # "auto" for the global endpoint (docs.cloud.google.com/storage/docs/
+        # aws-simple-migration). Golden signature from this signer, which the
+        # AWS vectors above validate independently.
+        credentials = s3.Credentials("GOOG1EXAMPLE", "gcs-secret-example")
+        headers = {"host": "bench.storage.googleapis.com", "range": "bytes=0-1048575"}
+        signed = s3.sign_headers(credentials, "GET", "/rack-bench/latency.bin", (),
+                                 headers, EMPTY_HASH, "auto", "20250101T000000Z")
+        self.assertEqual(signed["authorization"],
+                         "AWS4-HMAC-SHA256 Credential=GOOG1EXAMPLE/20250101/auto/s3/aws4_request, "
+                         "SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, "
+                         "Signature=b96b8f0e5348c170131af89242c2c229d48c1205d3eb8a990f2a180d73452ce7")
+
     def test_s3_path_not_normalized_and_query_encoded_once(self):
         canonical = s3.canonical_request("GET", "/a//.././% +/ሴ", (
             ("z", ""), ("a", "+ %"), ("a", "/")), {}, EMPTY_HASH)
@@ -221,12 +236,41 @@ class PayloadTests(unittest.TestCase):
             os.environ["R2_ACCOUNT_ID"] = "account"
             self.assertEqual(s3.resolve_endpoint("r2", "apac"),
                              s3.Endpoint("account.r2.cloudflarestorage.com", "auto", True))
+            with self.assertRaisesRegex(s3.CredentialError, "GCS_ACCESS_KEY_ID"):
+                s3.Credentials.from_env("gcs")
+            os.environ["GCS_ACCESS_KEY_ID"] = "GOOG1EXAMPLE"
+            with self.assertRaisesRegex(s3.CredentialError, "GCS_SECRET_ACCESS_KEY"):
+                s3.Credentials.from_env("gcs")
+            os.environ["GCS_SECRET_ACCESS_KEY"] = "gcs-secret"
+            # GCS HMAC keys are long-lived: no session-token variable exists.
+            self.assertIsNone(s3.Credentials.from_env("gcs").token)
         self.assertEqual(s3.resolve_endpoint("s3", "ap-south-1"),
                          s3.Endpoint("s3.ap-south-1.amazonaws.com", "ap-south-1", False))
         with self.assertRaises(ValueError):
             s3.resolve_endpoint("s3", "bad/region")
+        # Global anycast endpoint, virtual-hosted; the SigV4 scope region is
+        # "auto" (Google's own SDK samples), not the bucket's location.
+        self.assertEqual(s3.resolve_endpoint("gcs", "asia-south1"),
+                         s3.Endpoint("storage.googleapis.com", "auto", False))
         with self.assertRaises(ValueError):
-            s3.resolve_endpoint("gcs", "auto")
+            s3.resolve_endpoint("gcs", "bad/location")
+        with self.assertRaises(ValueError):
+            s3.Credentials.from_env("az")
+
+    def test_gcs_client_resolves_endpoint_and_credentials_by_provider(self):
+        env = {"GCS_ACCESS_KEY_ID": "GOOG1EXAMPLE", "GCS_SECRET_ACCESS_KEY": "gcs-secret"}
+        with patch.dict(os.environ, env, clear=True):
+            client = s3.S3Client("bench", "asia-south1", provider="gcs")
+        self.assertEqual((client.provider, client.bucket),
+                         ("gcs", "bench"))
+        self.assertEqual(client.endpoint, s3.Endpoint("storage.googleapis.com", "auto", False))
+        self.assertEqual(client.credentials.access_key, "GOOG1EXAMPLE")
+        self.assertIsNone(client.credentials.token)
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaisesRegex(ValueError, "dots"):
+                s3.S3Client("bench.dotted", "asia-south1", provider="gcs")
+            with self.assertRaisesRegex(s3.CredentialError, "AWS_ACCESS_KEY_ID"):
+                s3.S3Client("bench", "ap-south-1")  # s3 keeps the AWS names
 
     def test_ipv4_connection_uses_local_timeout(self):
         with patch.object(s3.socket, "getaddrinfo", return_value=[

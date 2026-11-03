@@ -28,6 +28,16 @@ class CredentialError(ValueError):
     """A required environment variable is absent."""
 
 
+# Provider -> (access key, secret key, session token) environment variables.
+# S3 and R2 share the AWS names (boto precedent); GCS uses its own pair because
+# an operator may hold both credential sets in one environment. GCS HMAC keys
+# (Cloud Storage console > Settings > Interoperability) are long-lived and have
+# no session-token concept, so the third entry is None.
+CREDENTIAL_ENV = {"s3": ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"),
+                  "r2": ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"),
+                  "gcs": ("GCS_ACCESS_KEY_ID", "GCS_SECRET_ACCESS_KEY", None)}
+
+
 @dataclass(frozen=True, repr=False)
 class Credentials:
     access_key: str
@@ -35,10 +45,13 @@ class Credentials:
     token: str | None = None
 
     @classmethod
-    def from_env(cls) -> Credentials:
-        return cls(required_env("AWS_ACCESS_KEY_ID"),
-                   required_env("AWS_SECRET_ACCESS_KEY"),
-                   os.environ.get("AWS_SESSION_TOKEN") or None)
+    def from_env(cls, provider: str = "s3") -> Credentials:
+        names = CREDENTIAL_ENV.get(provider)
+        if names is None:
+            raise ValueError(f"unsupported provider: {provider}")
+        access, secret, token = names
+        return cls(required_env(access), required_env(secret),
+                   (os.environ.get(token) or None) if token else None)
 
 
 def required_env(name: str) -> str:
@@ -370,6 +383,15 @@ def resolve_endpoint(provider: str, region: str) -> Endpoint:
         if not re.fullmatch(r"[A-Za-z0-9-]+", account):
             raise ValueError("invalid R2_ACCOUNT_ID")
         return Endpoint(f"{account}.r2.cloudflarestorage.com", "auto", True)
+    if provider == "gcs":
+        # The XML interop endpoint is global and anycast; the caller's region
+        # names the bucket's location for band policy, not the request path.
+        # Virtual-hosted addressing and an unchanged S3-style SigV4 scope are
+        # documented in Google's S3 simple-migration guide; Google's own SDK
+        # samples sign with region "auto" against this endpoint.
+        if not re.fullmatch(r"[a-z0-9-]+", region):
+            raise ValueError("invalid GCS location")
+        return Endpoint("storage.googleapis.com", "auto", False)
     raise ValueError(f"unsupported provider: {provider}")
 
 
@@ -412,7 +434,8 @@ class S3Client:
     def __init__(self, bucket: str, region: str, *, provider: str = "s3",
                  timeout: float = 30, control_retries: int = 2,
                  backoff: float = 0.1, endpoint: Endpoint | None = None):
-        self.credentials = Credentials.from_env()
+        self.credentials = Credentials.from_env(provider)
+        self.provider = provider
         self.endpoint = endpoint or resolve_endpoint(provider, region)
         if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket):
             raise ValueError("bucket must be a DNS-compatible name")
