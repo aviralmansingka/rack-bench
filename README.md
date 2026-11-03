@@ -367,12 +367,13 @@ usable, measured end-to-end; NIC link-up time; time-to-job-ready.
 
 ### Internet — external network
 
-`rack-bench bench internet` measures single-host north-south performance to S3
-and R2 using an IPv4-only, stdlib S3 client. All 13 checks per provider are
+`rack-bench bench internet` measures single-host north-south performance to S3,
+R2, and GCS using an IPv4-only, stdlib S3 client. All 13 checks per provider are
 wired: path AS/hops/RTT, DNS, idle TTFB, upload/download MiB/s and obj/s, loaded
 TTFB, PMTUD, TCP retransmits, and summary. Single-stream rates live in
-throughput detail, not a new check name. GCS interoperability and Warp execution
-remain unsupported and SKIP explicitly.
+throughput detail, not a new check name. GCS is opt-in (`--providers gcs`) and
+uses the S3 XML interoperability API with HMAC keys. Warp execution remains
+unsupported and SKIPs explicitly.
 
 **PASS means observed, not certified.** `expected` stays `null` until the
 certification profile schema exists. Only path RTT sanity can WARN; instability,
@@ -410,10 +411,18 @@ matrix. R2 placement hints do not prove a regional path, so unpinnable far bands
 SKIP. S3 redirects at inaccessible regional endpoints also SKIP rather than
 silently changing the measured region.
 
+GCS targets a bucket location (default `asia-south1`) at the global
+`storage.googleapis.com` interop endpoint. Certify adds `asia-southeast1` and
+`us-east4` as light bands. The interop host is anycast, not a regional endpoint,
+so location RTT bands are references only. GCS uses path-style bucket URLs and
+the bucket location as the SigV4 credential-scope region. GCS transfers are
+loopback-tested only; live certification is pending credentials.
+
 Supply `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` and optional
-`AWS_SESSION_TOKEN`; R2 additionally needs `R2_ACCOUNT_ID`. These AWS-named
-variables must contain the selected provider's credentials; separate provider
-invocations are usually appropriate. There is no SDK/config/IMDS discovery. Use
+`AWS_SESSION_TOKEN` for S3 and R2; R2 additionally needs `R2_ACCOUNT_ID`. GCS
+uses `GCS_ACCESS_KEY_ID` / `GCS_SECRET_ACCESS_KEY` for its HMAC key pair. The
+selected provider reads only its own variables, so one collection can run
+several providers without mixing keys. There is no SDK/config/IMDS discovery. Use
 an existing bucket with scoped read/write/delete/multipart permissions. Each
 collection owns a fresh `rack-bench/<run-id>/...` prefix. Cleanup deletes only
 exact owned keys, even when summary is filtered out; `--keep-data` retains keys
@@ -436,7 +445,7 @@ Internet flags follow `bench internet`, not the `bench` parent.
 
 | Flag                            | Description                                           |
 | ------------------------------- | ----------------------------------------------------- |
-| `--providers s3,r2`             | Unique providers: `s3`, `r2`, `gcs` (GCS unsupported) |
+| `--providers s3,r2`             | Unique providers: `s3`, `r2`, `gcs` (gcs opt-in)      |
 | `--directions up,down`          | Selected directions; down needs this run's uploads    |
 | `--profile quick\|certify`      | Default `quick`; certify requires `--yes`             |
 | `--regions s3=us-east-1,...`    | Override the tiered provider region matrix            |
@@ -554,7 +563,8 @@ the first implementation:
 
 Internet egress/ingress performance to public object stores (S3, R2, GCS) is
 outside ClusterMAX's scope entirely. `bench internet` now measures it for S3 and
-R2; the longer `smoke internet` soak remains future work.
+R2, with GCS available opt-in through the S3 interoperability API; the longer
+`smoke internet` soak remains future work.
 
 ## Certification flow
 

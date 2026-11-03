@@ -133,9 +133,13 @@ Notes:
 - R2: **zero egress fee** ⇒ download tests cost nothing; upload ingress
   is free.
 - S3: GET tests incur S3 egress + request costs.
-- GCS interop = XML API + HMAC-SHA256, supports multipart upload; some
-  S3 semantics differ (V4 signing details, no chunked
-  transfer-encoding).
+- GCS interop = XML API + HMAC-SHA256, supports multipart upload and range
+  GET. `bench internet` implements it as opt-in `--providers gcs`: the
+  endpoint is the global `storage.googleapis.com`, the SigV4 LOCATION is the
+  bucket location (the service stays `s3` for `x-amz-*` extensions), and
+  bucket URLs are path-style. Some S3 semantics differ (V4 signing details,
+  no chunked transfer-encoding). Loopback-tested only; live certification is
+  pending HMAC credentials.
 
 ### Tool recommendation: Warp (MinIO), single binary, for all three
 
