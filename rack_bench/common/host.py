@@ -24,6 +24,8 @@ class Unavailable(Exception):
     def __init__(self, source: str, detail: str):
         super().__init__(detail)
         self.source = source
+        # tcp.py reads .detail directly; str(exc) stays the same value.
+        self.detail = detail
 
 
 def _stop(proc):
