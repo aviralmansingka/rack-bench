@@ -22,7 +22,8 @@ from rack_bench.bench.internet import path
 from rack_bench.bench.internet.targets import targets
 
 FIXTURES = Path(__file__).parent / "fixtures"
-ENV = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test", "R2_ACCOUNT_ID": "test"}
+ENV = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test", "R2_ACCOUNT_ID": "test",
+       "GCS_ACCESS_KEY_ID": "test", "GCS_SECRET_ACCESS_KEY": "test"}
 MTR = (FIXTURES / "internet-mtr.txt").read_text()
 TRACE = (FIXTURES / "internet-traceroute.txt").read_text()
 DEST = "  4. AS16509 strange.aws-name.example (192.0.2.4) 0.0% 10 25.0 25.0 20.0 30.0 1.0\n"
@@ -121,6 +122,48 @@ class PathTests(unittest.TestCase):
         self.assertTrue(all(t["reason"] for t in r2[1:]))
         override = targets("s3", Options(profile="certify", regions={"s3": "eu-west-1"}))
         self.assertEqual(len(override), 1)
+
+    def test_gcs_targets_global_endpoint_and_far_band_reasons(self):
+        quick = targets("gcs", Options())
+        self.assertEqual([(t["region"], t["band"], t["runs"], t["reason"]) for t in quick],
+                         [("asia-south1", "nearest", 1, None)])
+        self.assertEqual(quick[0]["endpoint"], "https://storage.googleapis.com")
+        self.assertEqual(quick[0]["host"], "storage.googleapis.com")
+        certify = targets("gcs", Options(profile="certify"))
+        self.assertEqual([t["region"] for t in certify], ["asia-south1", "asia-southeast1", "us-east4"])
+        self.assertEqual([t["runs"] for t in certify], [3, 1, 1])
+        self.assertIsNone(certify[0]["reason"])
+        self.assertTrue(all("global endpoint" in t["reason"] for t in certify[1:]))
+        # An operator-pinned location declares the bucket's location and stays real.
+        override = targets("gcs", Options(profile="certify", regions={"gcs": "asia-south2"}))
+        self.assertEqual([(t["region"], t["reason"]) for t in override], [("asia-south2", None)])
+
+    def test_gcs_rtt_sanity_grades_asia_south1_band(self):
+        def probe(options):
+            return path.path_probe("gcs", "rtt_sanity", options, run=self.run,
+                                   which=lambda name: "/usr/bin/" + name, resolve=self.resolve)
+        check = probe(Options(providers=("gcs",)))
+        self.assertEqual(check.status, "pass")
+        self.assertIn("asia-south1: 25 ms (reference 2-35 ms)", check.detail)
+        self.run.return_value.stdout = MTR + DEST.replace("25.0", "300.0")
+        self.assertEqual(probe(Options(providers=("gcs",))).status, "warn")
+        # Unlisted GCS locations are unknown bands: SKIP, never an invented band.
+        self.run.return_value.stdout = MTR + DEST
+        check = probe(Options(providers=("gcs",), regions={"gcs": "asia-south2"}))
+        self.assertEqual(check.status, "skip")
+        self.assertIn("RTT ungradable", check.detail)
+
+    def test_gcs_context_probes_skip_without_gcs_credentials(self):
+        with patch.dict(os.environ, {}, clear=True):
+            check = path.path_probe("gcs", "hops", Options(), run=self.run,
+                                    which=lambda name: "/usr/bin/" + name, resolve=self.resolve)
+            self.assertEqual(check.detail,
+                             "credentials not set: missing environment variable: GCS_ACCESS_KEY_ID")
+            resolver = Mock()
+            self.assertIn("GCS_ACCESS_KEY_ID",
+                          path.dns_probe("gcs", Options(), resolver=resolver).detail)
+            resolver.assert_not_called()
+        self.run.assert_not_called()
 
     def test_context_missing_credentials_no_io(self):
         with patch.dict(os.environ, {}, clear=True):

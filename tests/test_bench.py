@@ -47,6 +47,15 @@ class BenchTests(unittest.TestCase):
             for name in names(("s3", "r2"))])
         self.assertEqual([r.checks for r in runner.collect()], [result.checks])
 
+    def test_gcs_missing_own_credentials_envelope(self):
+        # GCS uses its own HMAC pair; a host with only AWS/R2 vars still SKIPs
+        # every gcs check with the GCS-named reason, and no probe does I/O.
+        result = runner.collect("internet", options=internet.Options(providers=("gcs",)))[0]
+        self.assertEqual([c.name for c in result.checks], names(("gcs",)))
+        self.assertEqual(result.checks, [Check(name, "skip", detail=
+            "credentials not set: missing environment variable: GCS_ACCESS_KEY_ID")
+            for name in names(("gcs",))])
+
     def test_default_flags(self):
         with patch.object(runner, "run", return_value=0) as run:
             self.assertEqual(main(["bench", "internet"]), 0)

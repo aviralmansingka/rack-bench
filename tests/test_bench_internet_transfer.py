@@ -366,6 +366,27 @@ class TransferTests(unittest.TestCase):
         self.assertEqual(json.loads(check.detail)["buckets"], ["bench-a", "bench-b"])
         self.assertIn("buckets=bench-a,bench-b", check.source[0])
 
+    def test_gcs_reports_use_global_endpoint_and_path_style_host(self):
+        # Provider plumbing: gcs targets resolve the global endpoint, and the
+        # ss anchor host stays the bare endpoint host (path-style addressing).
+        gcs_env = patch.dict(os.environ, {"GCS_ACCESS_KEY_ID": "fake",
+                                          "GCS_SECRET_ACCESS_KEY": "fake"})
+        gcs_env.start()
+        self.addCleanup(gcs_env.stop)
+        self.options = Options(providers=("gcs",), buckets={"gcs": "bench-gcs"}, duration=1)
+        self.calls = []
+        records = upload.upload_reports("gcs", self.options,
+                                        client_factory=lambda *a, **k: self.client, window=self.fake_window)
+        self.assertEqual(records[0]["region"], "asia-south1")
+        self.assertEqual(records[0]["endpoint"], "https://storage.googleapis.com")
+        self.assertTrue(all(c["host"] == "storage.googleapis.com" for c in self.calls))
+        download.download_reports("gcs", self.options,
+                                  client_factory=lambda *a, **k: self.client, window=self.fake_window)
+        self.assertTrue(all(c["host"] == "storage.googleapis.com" for c in self.calls))
+        self.assertEqual([c["direction"] for c in self.calls], ["up", "up", "down", "down"])
+        check = transfer.transfer_check("gcs", "up", "throughput", self.options, records)
+        self.assertEqual((check.name, check.status), ("internet.gcs.upload.throughput", "pass"))
+
     def test_single_bucket_regression_normalized_shape(self):
         # A bare name normalizes to a 1-tuple; single-bucket runs keep today's shape.
         self.assertEqual(self.options.buckets, {"s3": ("bench-test",)})
@@ -845,7 +866,7 @@ class ProcessPoolTransferTests(unittest.TestCase):
         import pickle
         slots = multiprocessing.Array("i", 2)
         stop = multiprocessing.Event()
-        transfer._pool_initialiser((("bucket", self.endpoint, 10, 2, 0),), stop, slots,
+        transfer._pool_initialiser((("bucket", "s3", self.endpoint, 10, 2, 0),), stop, slots,
                                    2 * 1024 * 1024, None)
         self.assertIsInstance(transfer._POOL_STATE["clients"]["bucket"], S3Client)
         self.assertIs(transfer._POOL_STATE["stop"], stop)

@@ -807,6 +807,22 @@ class GcsLoopbackTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.client.complete_multipart("key", "id", [(1, '"etag"', None), (3, '"etag"', None)])
 
+    def test_latency_probe_gcs_end_to_end_over_loopback(self):
+        from rack_bench.bench.internet import latency
+        from rack_bench.bench.internet.cli import Options
+        self.state["derive_payload_from_path"] = True
+        options = Options(buckets={"gcs": "bench-gcs"})
+        check = latency.latency_probe("gcs", options, client_factory=self.factory)
+        self.assertEqual(check.status, "pass")
+        self.assertIsNotNone(check.value)
+        detail = json.loads(check.detail)
+        self.assertEqual(detail["regions"][0]["region"], "asia-south1")
+        self.assertEqual(detail["regions"][0]["endpoint"], "https://storage.googleapis.com")
+        self.assertEqual(detail["regions"][0]["cleanup"], "deleted owned key")
+        self.assertIn("https://storage.googleapis.com/bench-gcs/", check.source[0])
+        counts = self.state["counts"]
+        self.assertEqual((counts["PUT"], counts["GET"], counts["DELETE"]), (1, 20, 1))
+
     def test_gcs_probe_skips_with_reason_without_gcs_credentials(self):
         from rack_bench.bench.internet import latency
         from rack_bench.bench.internet.cli import Options

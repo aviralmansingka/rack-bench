@@ -24,7 +24,14 @@ from .stats import describe
 from .targets import reason, targets
 
 # Chennai-origin references: docs/internet-performance.md § regional RTTs.
-RTT_BANDS = {"ap-south-1": (20, 35), "ap-southeast-1": (35, 55), "us-east-1": (180, 250)}
+# asia-south1 (GCS, Mumbai) spans Chennai edge-POP termination (~2 ms;
+# docs/research/internet-research/hyperscalers.md notes Google's Chennai edge
+# presence) through a Mumbai hairpin (the ap-south-1 inter-city band): the
+# global anycast endpoint terminates at the nearest Google front end, so low
+# values are expected, never an error. Other GCS locations grade as unknown
+# bands: RTT sanity SKIPs with a reason, matching unlisted S3 regions.
+RTT_BANDS = {"ap-south-1": (20, 35), "ap-southeast-1": (35, 55), "us-east-1": (180, 250),
+             "asia-south1": (2, 35)}
 
 
 def parse_mtr(text):
@@ -145,7 +152,7 @@ def path_probe(provider, metric, options, *, run=subprocess.run, which=shutil.wh
         else:
             findings, primary_findings = [], []
             for region in records:
-                band = RTT_BANDS.get(region["region"]) if provider == "s3" else None
+                band = RTT_BANDS.get(region["region"]) if provider in ("s3", "gcs") else None
                 for report in region["reports"]:
                     if report.get("reason") or not report["hops"]:
                         continue

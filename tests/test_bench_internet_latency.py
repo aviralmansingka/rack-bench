@@ -171,8 +171,26 @@ class LatencyTests(unittest.TestCase):
         self.assertEqual([r["status"] for r in regions], ["pass", "skip", "skip"])
         self.assertIn("https://test.r2.cloudflarestorage.com/bench-r2/", check.source[0])
 
-    def test_gcs_and_warp_are_explicitly_unsupported(self):
-        self.assertEqual(self.probe("gcs").status, "skip")
+    def test_gcs_skips_without_its_own_credentials(self):
+        # GCS HMAC keys are a separate env pair; AWS/R2 variables do not count.
+        check = self.probe("gcs")
+        self.assertEqual(check.status, "skip")
+        self.assertEqual(check.detail,
+                         "credentials not set: missing environment variable: GCS_ACCESS_KEY_ID")
+        self.factory.assert_not_called()
+
+    def test_gcs_probe_passes_with_memory_client(self):
+        gcs_env = patch.dict(os.environ, {"GCS_ACCESS_KEY_ID": "test", "GCS_SECRET_ACCESS_KEY": "test"})
+        gcs_env.start()
+        self.addCleanup(gcs_env.stop)
+        self.options.buckets = {"gcs": "bench-gcs"}
+        check = self.probe("gcs")
+        self.assertEqual(check.status, "pass")
+        self.assertEqual(check.name, "internet.gcs.latency.ttfb")
+        self.assertIn("https://storage.googleapis.com/bench-gcs/", check.source[0])
+        self.factory.assert_called_with("bench-gcs", "asia-south1", provider="gcs")
+
+    def test_warp_is_explicitly_unsupported(self):
         self.options.tool = "warp"
         self.assertIn("Warp execution not implemented", self.probe().detail)
         self.factory.assert_not_called()
