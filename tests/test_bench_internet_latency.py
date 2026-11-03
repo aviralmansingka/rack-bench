@@ -13,7 +13,8 @@ from rack_bench.bench import runner
 from rack_bench.bench.internet import CHECKS, Options, before_run
 from rack_bench.bench.internet import latency, s3client as s3
 
-ENV = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test", "R2_ACCOUNT_ID": "test"}
+ENV = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test", "R2_ACCOUNT_ID": "test",
+       "GCS_ACCESS_KEY_ID": "test", "GCS_SECRET_ACCESS_KEY": "test"}
 
 
 class MemoryS3:
@@ -171,11 +172,24 @@ class LatencyTests(unittest.TestCase):
         self.assertEqual([r["status"] for r in regions], ["pass", "skip", "skip"])
         self.assertIn("https://test.r2.cloudflarestorage.com/bench-r2/", check.source[0])
 
-    def test_gcs_and_warp_are_explicitly_unsupported(self):
-        self.assertEqual(self.probe("gcs").status, "skip")
+    def test_gcs_interop_path_and_warp_still_explicitly_unsupported(self):
+        # GCS is implemented: the probe resolves the interop endpoint, signs
+        # with the bucket location, and virtual-hosts the bucket.
+        self.options.buckets = {"gcs": "bench-gcs"}
+        check = self.probe("gcs")
+        self.assertEqual(check.status, "pass")
+        self.assertEqual([call[0] for call in self.factory.call_args_list],
+                         [("bench-gcs", "asia-south1")])
+        self.assertEqual(self.factory.call_args_list[0].kwargs, {"provider": "gcs"})
+        self.assertIn("https://bench-gcs.storage.googleapis.com/", check.source[0])
+        with patch.dict(os.environ, {}, clear=True):
+            check = self.probe("gcs")
+        self.assertEqual(check.status, "skip")
+        self.assertIn("credentials not set: missing environment variable: GCS_ACCESS_KEY_ID",
+                      check.detail)
+        self.options.buckets = {"s3": "bench-bucket"}
         self.options.tool = "warp"
         self.assertIn("Warp execution not implemented", self.probe().detail)
-        self.factory.assert_not_called()
 
     def test_part_two_dependencies_do_not_launch_hidden_uploads(self):
         for suffix, needed in (("download.throughput", "upload objects"),

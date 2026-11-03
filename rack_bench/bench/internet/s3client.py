@@ -35,7 +35,17 @@ class Credentials:
     token: str | None = None
 
     @classmethod
-    def from_env(cls) -> Credentials:
+    def from_env(cls, provider: str = "s3") -> Credentials:
+        """Provider-keyed env credentials; GCS HMAC keys use their own variables.
+
+        S3 and R2 share the AWS-named variables (set them to the selected
+        provider's keys, per the spec). GCS HMAC access IDs start with GOOG and
+        have no session-token concept, so the GCS pair is named separately and
+        never reads a token.
+        """
+        if provider == "gcs":
+            return cls(required_env("GCS_ACCESS_KEY_ID"),
+                       required_env("GCS_SECRET_ACCESS_KEY"))
         return cls(required_env("AWS_ACCESS_KEY_ID"),
                    required_env("AWS_SECRET_ACCESS_KEY"),
                    os.environ.get("AWS_SESSION_TOKEN") or None)
@@ -370,6 +380,15 @@ def resolve_endpoint(provider: str, region: str) -> Endpoint:
         if not re.fullmatch(r"[A-Za-z0-9-]+", account):
             raise ValueError("invalid R2_ACCOUNT_ID")
         return Endpoint(f"{account}.r2.cloudflarestorage.com", "auto", True)
+    if provider == "gcs":
+        # XML API S3 interop: one global anycast endpoint, virtual-hosted
+        # buckets (BUCKET.storage.googleapis.com). The location string enters
+        # only the SigV4 credential scope (service stays "s3"); GCS accepts
+        # the scope as presented, so signing with the bucket location is
+        # self-consistent. Dual/multi-region location codes are uppercase.
+        if not re.fullmatch(r"[A-Za-z0-9-]+", region):
+            raise ValueError("invalid GCS location")
+        return Endpoint("storage.googleapis.com", region, False)
     raise ValueError(f"unsupported provider: {provider}")
 
 
@@ -412,7 +431,8 @@ class S3Client:
     def __init__(self, bucket: str, region: str, *, provider: str = "s3",
                  timeout: float = 30, control_retries: int = 2,
                  backoff: float = 0.1, endpoint: Endpoint | None = None):
-        self.credentials = Credentials.from_env()
+        self.provider = provider  # Worker processes rebuild clients from it.
+        self.credentials = Credentials.from_env(provider)
         self.endpoint = endpoint or resolve_endpoint(provider, region)
         if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket):
             raise ValueError("bucket must be a DNS-compatible name")

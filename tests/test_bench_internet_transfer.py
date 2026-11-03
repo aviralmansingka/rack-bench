@@ -119,7 +119,9 @@ class FakeClient:
 
 class TransferTests(unittest.TestCase):
     def setUp(self):
-        env = patch.dict(os.environ, {"AWS_ACCESS_KEY_ID": "fake", "AWS_SECRET_ACCESS_KEY": "fake", "R2_ACCOUNT_ID": "fake"}, clear=True)
+        env = patch.dict(os.environ, {"AWS_ACCESS_KEY_ID": "fake", "AWS_SECRET_ACCESS_KEY": "fake",
+                                      "R2_ACCOUNT_ID": "fake",
+                                      "GCS_ACCESS_KEY_ID": "fake", "GCS_SECRET_ACCESS_KEY": "fake"}, clear=True)
         env.start()
         self.addCleanup(env.stop)
         self.options = Options(providers=("s3",), buckets={"s3": "bench-test"}, duration=1)
@@ -464,6 +466,36 @@ class TransferTests(unittest.TestCase):
         records = self.reports()
         self.assertEqual(len(records), 1)
         self.assertEqual([c["concurrency"] for c in self.calls], [8, 8, 8, 1, 1, 1])
+
+    def test_gcs_provider_targets_region_endpoint_and_client_factory(self):
+        # The gcs path with fakes: the default band is the bucket location
+        # (asia-south1), the endpoint is the global interop host, and the
+        # provider keyword reaches the client factory. Certify adds no far
+        # bands: the anycast endpoint would measure the same path.
+        self.options = Options(profile="certify", providers=("gcs",), buckets={"gcs": "bench-gcs"})
+        self.calls = []
+        made = []
+
+        def factory(*args, **kwargs):
+            made.append((args, kwargs))
+            return self.client
+
+        records = upload.upload_reports("gcs", self.options, client_factory=factory, window=self.fake_window)
+        self.assertEqual(len(records), 1)  # no far-band expansion for gcs
+        self.assertEqual(records[0]["region"], "asia-south1")
+        self.assertEqual(records[0]["endpoint"], "https://storage.googleapis.com")
+        self.assertEqual(records[0]["host"], "storage.googleapis.com")
+        self.assertEqual(records[0]["runs"], 3)
+        self.assertIsNone(records[0]["reason"])
+        self.assertEqual(made[0], (("bench-gcs", "asia-south1"), {"provider": "gcs"}))
+        self.assertTrue(all(call["host"] == "bench-gcs.storage.googleapis.com" for call in self.calls))
+        check = upload.upload_probe("gcs", "throughput", self.options)
+        self.assertEqual((check.name, check.status), ("internet.gcs.upload.throughput", "pass"))
+        with patch.dict(os.environ, {}, clear=True):
+            check = upload.upload_probe("gcs", "throughput",
+                                        Options(providers=("gcs",), buckets={"gcs": "bench-gcs"}))
+        self.assertEqual(check.status, "skip")
+        self.assertIn("GCS_ACCESS_KEY_ID", check.detail)
 
     def test_run_shared_seed_records_reproduce_bytes_and_share_digests(self):
         # A run-shared seed keeps keys unique while every object derives the
@@ -824,6 +856,33 @@ class ProcessPoolTransferTests(unittest.TestCase):
         self.assertEqual(deletes["alpha"], [f"/alpha/{prefix}a.bin"])
         self.assertEqual(deletes["beta"], [f"/beta/{prefix}b.bin"])
 
+    def test_gcs_worker_processes_read_gcs_credentials_from_initargs(self):
+        # provider travels in the pool initargs: worker processes rebuild the
+        # client and resolve the GCS-named variables in-child, even with the
+        # AWS-named variables absent. The loopback endpoint stays path-style;
+        # virtual-hosted GCS request shape is covered by in-process loopback.
+        gcs_endpoint = s3.Endpoint("127.0.0.1", "asia-south1", True,
+                                   self.server.server_port, False)
+        with patch.dict(os.environ, {"GCS_ACCESS_KEY_ID": "gcs-key",
+                                     "GCS_SECRET_ACCESS_KEY": "gcs-secret"}, clear=True):
+            client = S3Client("bucket", "asia-south1", provider="gcs", timeout=10,
+                              backoff=0, endpoint=gcs_endpoint)
+            self.addCleanup(client.close)
+            self.server.state = {"payload": s3.SeededPayload("gcs-seed", self.size),
+                                 "requests": []}
+            owned = []
+            run, objects = transfer.transfer_window(client, direction="up", prefix="proc/",
+                                                     concurrency=2, duration=.05, objects=[],
+                                                     owned=owned, size=self.size,
+                                                     one_object=True, part_size=self.part,
+                                                     seed="gcs-seed",
+                                                     tcp_factory=FakeTCP, host="127.0.0.1")
+        self.assertEqual(run["status"], "pass")
+        self.assertEqual(run["bytes"], 2 * self.size)
+        self.assertEqual(run["errors"], [])
+        self.assertEqual([obj["key"] for obj in objects], ["proc/0-0.bin", "proc/1-0.bin"])
+        self.assertEqual(owned, [("bucket", obj["key"]) for obj in objects])
+
     def test_worker_error_sets_cross_process_stop_and_siblings_drain_out(self):
         self.server.state = {"payload": s3.SeededPayload("proc-seed", self.size),
                              "fail_prefix": "0-0", "requests": []}
@@ -845,9 +904,11 @@ class ProcessPoolTransferTests(unittest.TestCase):
         import pickle
         slots = multiprocessing.Array("i", 2)
         stop = multiprocessing.Event()
-        transfer._pool_initialiser((("bucket", self.endpoint, 10, 2, 0),), stop, slots,
+        transfer._pool_initialiser((("bucket", "s3", self.endpoint, 10, 2, 0),), stop, slots,
                                    2 * 1024 * 1024, None)
-        self.assertIsInstance(transfer._POOL_STATE["clients"]["bucket"], S3Client)
+        client = transfer._POOL_STATE["clients"]["bucket"]
+        self.assertIsInstance(client, S3Client)
+        self.assertEqual(client.provider, "s3")
         self.assertIs(transfer._POOL_STATE["stop"], stop)
         self.assertIn(os.getpid(), list(slots))
         s3.clear_payload_caches()

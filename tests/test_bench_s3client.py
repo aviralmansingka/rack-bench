@@ -226,7 +226,48 @@ class PayloadTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             s3.resolve_endpoint("s3", "bad/region")
         with self.assertRaises(ValueError):
-            s3.resolve_endpoint("gcs", "auto")
+            s3.resolve_endpoint("azure", "auto")
+
+    def test_gcs_credentials_and_interop_endpoint(self):
+        # GCS rides the XML API interop endpoint with HMAC keys held in
+        # GCS-named variables; the location string is the SigV4 scope region.
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(s3.CredentialError, "GCS_ACCESS_KEY_ID"):
+                s3.Credentials.from_env("gcs")
+            os.environ["GCS_ACCESS_KEY_ID"] = "GOOG1EXAMPLE"
+            with self.assertRaisesRegex(s3.CredentialError, "GCS_SECRET_ACCESS_KEY"):
+                s3.Credentials.from_env("gcs")
+            os.environ["GCS_SECRET_ACCESS_KEY"] = "secret"
+            os.environ["AWS_SESSION_TOKEN"] = "ignored"  # HMAC keys have no token
+            credentials = s3.Credentials.from_env("gcs")
+            self.assertEqual((credentials.access_key, credentials.secret_key),
+                             ("GOOG1EXAMPLE", "secret"))
+            self.assertIsNone(credentials.token)
+        endpoint = s3.resolve_endpoint("gcs", "asia-south1")
+        self.assertEqual(endpoint,
+                         s3.Endpoint("storage.googleapis.com", "asia-south1", False))
+        self.assertEqual(s3.resolve_endpoint("gcs", "NAM4").region, "NAM4")  # dual-region code
+        with self.assertRaises(ValueError):
+            s3.resolve_endpoint("gcs", "bad/location")
+
+    def test_gcs_signing_scope_is_location_region_and_s3_service(self):
+        # Golden string, golden-value style: the GCS interop path signs
+        # AWS4-HMAC-SHA256 with the bucket location as the scope region and
+        # service "s3" (Google's simple-migration doc: the credential scope
+        # passes through unchanged). Same canonical request as the S3 vector.
+        credentials = s3.Credentials("GOOG1EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+        headers = {"host": "bench.storage.googleapis.com", "range": "bytes=0-9",
+                   "x-amz-content-sha256": EMPTY_HASH, "x-amz-date": "20130524T000000Z"}
+        canonical = s3.canonical_request("GET", "/test.txt", (), headers, EMPTY_HASH)
+        self.assertEqual(s3.string_to_sign(canonical, "20130524T000000Z", "asia-south1"),
+                         "AWS4-HMAC-SHA256\n20130524T000000Z\n20130524/asia-south1/s3/aws4_request\n"
+                         "b062b84a145e78f3a640fc7509023b27c2e28615170716d1459bfbce23d40b26")
+        signed = s3.sign_headers(credentials, "GET", "/test.txt", (), headers,
+                                 EMPTY_HASH, "asia-south1", "20130524T000000Z")
+        self.assertEqual(signed["authorization"].replace(", ", ","),
+                         "AWS4-HMAC-SHA256 Credential=GOOG1EXAMPLE/20130524/asia-south1/"
+                         "s3/aws4_request,SignedHeaders=host;range;x-amz-content-sha256;x-amz-date,"
+                         "Signature=e63dfb16f87a436539d6d68f5038b994699520eb430052bcada1c160752a5ad8")
 
     def test_ipv4_connection_uses_local_timeout(self):
         with patch.object(s3.socket, "getaddrinfo", return_value=[
@@ -437,6 +478,39 @@ class TransportTests(unittest.TestCase):
                          [r["crc32"] for r in requests[1:3]])
         self.assertEqual(len(parts), 2)
         self.assertTrue(all(part.timing.attempts == 1 for part in parts))
+
+    def test_gcs_provider_path_loopback_end_to_end(self):
+        # The gcs provider path over loopback: GCS-named credentials (AWS
+        # variables absent), the location string as SigV4 scope region, and
+        # virtual-hosted addressing, driving multipart PUT + range GET + DELETE.
+        with patch.dict(os.environ, {"GCS_ACCESS_KEY_ID": "GOOG1EXAMPLE",
+                                     "GCS_SECRET_ACCESS_KEY": "gcs-secret"}, clear=True):
+            client = s3.S3Client("bucket", "asia-south1", provider="gcs", timeout=2, backoff=0,
+                                 endpoint=s3.Endpoint("127.0.0.1", "asia-south1", False,
+                                                      self.server.server_port, False))
+            self.addCleanup(client.close)
+            original = s3.connect_ipv4
+            with patch.object(s3, "connect_ipv4", side_effect=lambda address, timeout, source=None:
+                              original(("127.0.0.1", address[1]), timeout, source)):
+                source = s3.SeededPayload("gcs-seed", 5 * 1024**2 + 99)
+                client.multipart_upload("gcs/multi.bin", source, part_size=5 * 1024**2)
+                self.state["payload"] = source  # the loopback server serves state payloads
+                downloaded = bytearray()
+                client.get_object("gcs/multi.bin", byte_range=(100, 199), payload=source,
+                                  consume=lambda data, offset: downloaded.extend(data))
+                client.delete_object("gcs/multi.bin")
+        requests = self.state["requests"]
+        self.assertEqual([r["method"] for r in requests],
+                         ["POST", "PUT", "PUT", "POST", "GET", "DELETE"])
+        # Virtual-hosted: the bucket moves into Host, the path is object-only.
+        self.assertEqual(requests[1]["path"].split("?")[0], "/gcs/multi.bin")
+        self.assertEqual(requests[1]["headers"]["host"],
+                         f"bucket.127.0.0.1:{self.server.server_port}")
+        authorization = requests[1]["headers"]["authorization"]
+        self.assertIn("Credential=GOOG1EXAMPLE/", authorization)
+        self.assertIn("/asia-south1/s3/aws4_request", authorization)
+        self.assertNotIn("x-amz-security-token", requests[1]["headers"])  # HMAC: no token
+        self.assertEqual(bytes(downloaded), b"".join(source.iter_chunks(100, 100)))
 
     def test_checksum_rejection_is_typed_and_aborts_without_retry(self):
         self.state["reject_digest"] = True

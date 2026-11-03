@@ -3,15 +3,20 @@ from uuid import uuid4
 
 from .s3client import Credentials, CredentialError, resolve_endpoint
 
+# Provider default bands: S3 Mumbai, R2 apac placement hint, GCS Mumbai
+# (asia-south1, the bucket location, matching the S3/R2 Chennai-origin band).
+DEFAULT_REGION = {"s3": "ap-south-1", "r2": "apac", "gcs": "asia-south1"}
+
 
 def targets(provider, options):
     """Nearest band first; unsupported providers/bands remain explicit records."""
-    Credentials.from_env()  # Spec §6: even context probes require provider credentials.
-    if provider == "gcs":
-        raise ValueError("GCS interoperability not implemented")
-    nearest = options.regions.get(provider, "ap-south-1" if provider == "s3" else "apac")
+    Credentials.from_env(provider)  # Spec §6: even context probes require provider credentials.
+    nearest = options.regions.get(provider, DEFAULT_REGION[provider])
     regions = [nearest]
-    if options.profile == "certify" and provider not in options.regions:
+    # Certify far bands stay S3/R2 policy. The GCS endpoint is global anycast:
+    # a second "band" would sign with another location string but measure the
+    # same path, so gcs runs its bucket location only (opt-in, best-effort).
+    if provider != "gcs" and options.profile == "certify" and provider not in options.regions:
         regions += ["ap-southeast-1", "us-east-1"]
     result = []
     for index, region in enumerate(regions):

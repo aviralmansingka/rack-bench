@@ -134,12 +134,14 @@ def _pool_initialiser(client_configs, stop, pid_slots, chunk_limit, echo):
     S3Client is not picklable (its connection pool is threading.local), so each
     child constructs its own from plain config and thereby keeps its own warm
     pooled TLS connection across objects. client_configs carries one
-    (bucket, endpoint, timeout, control_retries, backoff) tuple per bucket in
-    the window: multi-bucket windows give every worker process a client for
-    every bucket, and each stream uses only its assigned bucket, so only one
-    pooled connection per worker materializes. The stop event and pid slots
-    arrive through the pool initargs, which travel via Process construction
-    rather than the task queue, so synchronization primitives remain shareable.
+    (bucket, provider, endpoint, timeout, control_retries, backoff) tuple per
+    bucket in the window: multi-bucket windows give every worker process a
+    client for every bucket, and each stream uses only its assigned bucket, so
+    only one pooled connection per worker materializes. provider feeds
+    Credentials.from_env so GCS workers read the GCS-named variables. The stop
+    event and pid slots arrive through the pool initargs, which travel via
+    Process construction rather than the task queue, so synchronization
+    primitives remain shareable.
     chunk_limit re-caps this process's chunk cache: bulk workers each cache the
     same run-shared payload bytes, so N processes must not each hold the
     parent-side cap; one part's worth of chunks keeps the current part hot.
@@ -147,9 +149,9 @@ def _pool_initialiser(client_configs, stop, pid_slots, chunk_limit, echo):
     parent's callback is passed in and re-installed explicitly.
     """
     _POOL_STATE["clients"] = {
-        bucket: S3Client(bucket, endpoint.region, endpoint=endpoint, timeout=timeout,
-                         control_retries=control_retries, backoff=backoff)
-        for bucket, endpoint, timeout, control_retries, backoff in client_configs}
+        bucket: S3Client(bucket, endpoint.region, provider=provider, endpoint=endpoint,
+                         timeout=timeout, control_retries=control_retries, backoff=backoff)
+        for bucket, provider, endpoint, timeout, control_retries, backoff in client_configs}
     _POOL_STATE["stop"] = stop
     set_chunk_cache_limit(chunk_limit)
     operation_echo.set(echo)
@@ -310,10 +312,11 @@ def transfer_window(client, *, direction, prefix, concurrency, duration, objects
         pid_slots = context.Array("i", concurrency)
         initializer = _pool_initialiser
         # One plain config per bucket; each worker process builds a client for
-        # every bucket, then streams only to its assigned one.
-        initargs = (tuple((name, in_process[name].endpoint, in_process[name].timeout,
-                           in_process[name].control_retries, in_process[name].backoff)
-                          for name in names),
+        # every bucket, then streams only to its assigned one. provider travels
+        # with it: Credentials.from_env is provider-keyed (GCS-named variables).
+        initargs = (tuple((name, client.provider, client.endpoint, client.timeout,
+                           client.control_retries, client.backoff)
+                          for name, client in in_process.items()),
                     stop, pid_slots, part_size, operation_echo.get())
 
     def pids():

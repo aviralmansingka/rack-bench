@@ -47,6 +47,13 @@ class BenchTests(unittest.TestCase):
             for name in names(("s3", "r2"))])
         self.assertEqual([r.checks for r in runner.collect()], [result.checks])
 
+    def test_gcs_missing_credentials_skip_with_gcs_reason(self):
+        # GCS is opt-in; its checks name the GCS variables, never AWS ones.
+        result = runner.collect("internet", options=internet.Options(providers=("gcs",)))[0]
+        self.assertEqual(result.checks, [Check(name, "skip", detail=
+            "credentials not set: missing environment variable: GCS_ACCESS_KEY_ID")
+            for name in names(("gcs",))])
+
     def test_default_flags(self):
         with patch.object(runner, "run", return_value=0) as run:
             self.assertEqual(main(["bench", "internet"]), 0)
@@ -88,7 +95,8 @@ class BenchTests(unittest.TestCase):
         self.assertEqual(internet.cli.buckets("s3=one,s3=two,r2=r2bench"),
                          {"s3": ("one", "two"), "r2": ("r2bench",)})
         for value in ("", "azure=x", "s3=", "s3=bench,", "s3=bench,s3=bench",
-                      "s3=dotted.bucket", "r2=bad..bucket", "r2=127.0.0.1", "s3=a=b"):
+                      "s3=dotted.bucket", "gcs=dotted.bucket", "r2=bad..bucket",
+                      "r2=127.0.0.1", "s3=a=b"):
             with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError) as error:
                 internet.cli.buckets(value)
             self.assertIn("bucket", str(error.exception))
