@@ -135,7 +135,10 @@ Notes:
 - S3: GET tests incur S3 egress + request costs.
 - GCS interop = XML API + HMAC-SHA256, supports multipart upload; some
   S3 semantics differ (V4 signing details, no chunked
-  transfer-encoding).
+  transfer-encoding). Implemented in `bench internet` behind
+  `--providers gcs` (opt-in, best-effort): global
+  `storage.googleapis.com` endpoint, SigV4 scope region `auto`, HMAC keys
+  from the environment, bucket location as the bench region.
 
 ### Tool recommendation: Warp (MinIO), single binary, for all three
 

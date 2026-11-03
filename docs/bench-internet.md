@@ -1,8 +1,9 @@
 # Spec: `rack-bench bench internet` — external network certification
 
 Status: **v1 probes implemented** (Session 3 Parts 1–2): context, baseline,
-bulk/loaded, single-stream, TCP and summary. Live cloud transfer
-interoperability has not been certified. Remaining limitations are listed in
+bulk/loaded, single-stream, TCP and summary. GCS is implemented behind
+`--providers gcs` (§2) and loopback-tested; no live cloud run has certified
+S3, R2, or GCS transfer interoperability. Remaining limitations are listed in
 §11. Session 2 contracts are frozen (§11). Companion research:
 `research/internet-performance` branch (`docs/internet-performance.md` —
 industry methodology, sources, and the full reliability-test taxonomy this
@@ -31,8 +32,8 @@ and S3 client unchanged.
 - Single-host, single-run measurement per provider: path audit, sustained
   upload/download throughput, single-stream throughput, small-object latency,
   TCP health.
-- Providers: **S3 + R2 primary**; GCS behind `--providers gcs` (interop
-  endpoint) as best-effort.
+- Providers: **S3 + R2 primary**; GCS implemented behind `--providers gcs`
+  (interop endpoint) as best-effort.
 - Quick (default) and certify profiles.
 
 **Out (v1):**
@@ -194,7 +195,7 @@ handling become spec surface.
 **Option B — stdlib S3 client (recommended).** A minimal S3 client in
 `rack_bench/bench/internet/s3client.py`: AWS SigV4 HMAC signing
 (`hmac`/`hashlib`), multipart upload + range GET over `http.client` (not
-`urllib`). Targets S3 and R2; GCS interoperability remains follow-up work. No
+`urllib`). Targets S3, R2, and the GCS XML interop endpoint. No
 dependencies or external binary; per-request timing and streaming hooks support
 later probe instrumentation without SDK retries hiding bad samples.
 
@@ -207,8 +208,11 @@ it.
 - The S3 client reads only `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` and
   optional `AWS_SESSION_TOKEN`; R2 also requires `R2_ACCOUNT_ID` for its
   endpoint host. Set the AWS-named variables to the selected provider's
-  credentials. No config files, IMDS, or implicit credential discovery. Provider
-  orchestration and GCS interop remain later probe work.
+  credentials. GCS reads `GCS_ACCESS_KEY_ID` / `GCS_SECRET_ACCESS_KEY`: an
+  HMAC key from the Google Cloud console (Cloud Storage Settings >
+  Interoperability), not OAuth. GCS has no session-token variable. No config
+  files, IMDS, or implicit credential discovery. Missing credentials SKIP
+  every check for that provider with a reason, context and summary included.
 - Keys need only a scoped policy: create/delete one bench prefix + read/write
   objects in it. The doc ships the minimal IAM policy.
 - **Bucket configuration:** `--buckets s3=<name>,r2=<name>` is a provider-keyed
@@ -307,6 +311,18 @@ placement hint, _not_ a SigV4 region or a guarantee of a particular ingress POP.
 Do not claim Mumbai/Singapore/Virginia R2 paths without evidence; unsupported
 pinned-band measurements SKIP with a reason.
 
+GCS rides the XML interop API at the global anycast endpoint
+`https://storage.googleapis.com` with virtual-hosted bucket requests
+(`https://<bucket>.storage.googleapis.com/<key>`). The bench's
+`--regions gcs=<location>` names the BUCKET's location (default `asia-south1`,
+Mumbai), not the request path. Requests carry S3-style `AWS4-HMAC-SHA256` signatures
+with an unchanged credential scope; the scope region is `auto`, following
+Google's own SDK samples. Multipart part bounds (5 MiB–5 GiB, 10,000 parts)
+match S3, so `--part-size` validation is unchanged. Known interop gaps stay
+best-effort: GCS answers `x-amz-checksum-*` headers and completion CRC32
+elements only where it has an equivalent, so checksum cross-checks apply when
+the service returns them.
+
 ### Probe × band × volume budget
 
 Full-volume rows use §5's profile durations, sweeps, and repetitions. Light rows
@@ -329,9 +345,10 @@ request fees and custom overrides still belong in the eventual cost gate. The
 current estimate is a full-transfer reference, not a quote for the probes
 implemented so far.
 
-Remaining implementation residue: GCS interoperability, certification
-thresholds/profile schema, optional Warp execution, and effective matrix-aware
-cost estimates. All v1 probes are implemented; cloud transfer interoperability
+Remaining implementation residue: live GCS certification (the provider is
+implemented and loopback-tested; a credentialed live run is pending),
+certification thresholds/profile schema, optional Warp execution, and
+effective matrix-aware cost estimates. All v1 probes are implemented; cloud transfer interoperability
 still requires a paid live exercise. Reference cost output is not a quote for
 custom runs. Missing credentials still SKIP every provider check, including
 context and summary. See README for orchestration, TCP sampling limitations,

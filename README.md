@@ -371,8 +371,11 @@ usable, measured end-to-end; NIC link-up time; time-to-job-ready.
 and R2 using an IPv4-only, stdlib S3 client. All 13 checks per provider are
 wired: path AS/hops/RTT, DNS, idle TTFB, upload/download MiB/s and obj/s, loaded
 TTFB, PMTUD, TCP retransmits, and summary. Single-stream rates live in
-throughput detail, not a new check name. GCS interoperability and Warp execution
-remain unsupported and SKIP explicitly.
+throughput detail, not a new check name. GCS is opt-in via `--providers gcs`
+through the S3-interop XML endpoint (`GCS_ACCESS_KEY_ID` /
+`GCS_SECRET_ACCESS_KEY` HMAC keys); it is loopback-tested and best-effort until
+a credentialed live run certifies it. Warp execution remains unsupported and
+SKIPs explicitly.
 
 **PASS means observed, not certified.** `expected` stays `null` until the
 certification profile schema exists. Only path RTT sanity can WARN; instability,
@@ -436,7 +439,7 @@ Internet flags follow `bench internet`, not the `bench` parent.
 
 | Flag                            | Description                                           |
 | ------------------------------- | ----------------------------------------------------- |
-| `--providers s3,r2`             | Unique providers: `s3`, `r2`, `gcs` (GCS unsupported) |
+| `--providers s3,r2`             | Unique providers: `s3`, `r2`, `gcs` (GCS opt-in, best-effort) |
 | `--directions up,down`          | Selected directions; down needs this run's uploads    |
 | `--profile quick\|certify`      | Default `quick`; certify requires `--yes`             |
 | `--regions s3=us-east-1,...`    | Override the tiered provider region matrix            |
@@ -554,7 +557,8 @@ the first implementation:
 
 Internet egress/ingress performance to public object stores (S3, R2, GCS) is
 outside ClusterMAX's scope entirely. `bench internet` now measures it for S3 and
-R2; the longer `smoke internet` soak remains future work.
+R2, with GCS opt-in via `--providers gcs`; the longer `smoke internet` soak
+remains future work.
 
 ## Certification flow
 
