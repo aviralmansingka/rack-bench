@@ -1068,6 +1068,31 @@ class ProcessPoolTransferTests(unittest.TestCase):
             self.assertIn("x-amz-content-sha256", headers)  # signed digest still rides
             self.assertEqual(headers["x-goog-hash"], expected)  # CRC32C integrity rides instead
 
+    def test_thread_window_worker_closes_its_own_pooled_connection(self):
+        # Single-stream (concurrency=1) windows run in-process worker threads.
+        # Pooled connections are threading.local, so only the worker thread can
+        # release its own; without that close the executor discards the thread
+        # and the socket leaks to GC finalization (ResourceWarning).
+        closes = []
+
+        class CloseTrackingClient(S3Client):
+            def close(self):
+                closes.append(threading.get_ident())
+                super().close()
+
+        endpoint = s3.Endpoint("127.0.0.1", "auto", True, self.server.server_port, False)
+        client = CloseTrackingClient("bucket", "auto", timeout=10, backoff=0, endpoint=endpoint)
+        self.addCleanup(client.close)
+        self.server.state = {"payload": s3.SeededPayload("thread-seed", self.size), "requests": []}
+        run, _ = transfer.transfer_window(client, direction="up", prefix="thread/", concurrency=1,
+                                           duration=.05, objects=[], owned=[], size=self.size,
+                                           one_object=True, part_size=self.part, seed="thread-seed",
+                                           tcp_factory=FakeTCP, host="127.0.0.1")
+        self.assertEqual(run["status"], "pass")
+        main = threading.get_ident()
+        self.assertTrue(any(ident != main for ident in closes),
+                        "worker thread must close its own thread-local connection")
+
     def test_download_worker_processes_stream_verified_ranges(self):
         self.server.state = {"payload": s3.SeededPayload("proc-seed", self.size), "requests": []}
         objects = [{"key": f"proc/{index}-0.bin",

@@ -258,7 +258,9 @@ def _transfer_worker(spec):
     parent merges. owned_keys are (bucket, key) pairs collected before each
     upload attempt so ambiguous PUTs stay cleanable even when the worker
     reports them only at completion. A failing worker sets the shared stop
-    event so sibling workers exit at their next check.
+    event so sibling workers exit at their next check. In-process workers close
+    their thread-local pooled connections on exit: the executor discards its
+    threads at window end, so only the worker thread itself can release them.
     """
     clients = spec["clients"] if spec["clients"] is not None else _POOL_STATE["clients"]
     stop = spec["stop"] if spec["stop"] is not None else _POOL_STATE["stop"]
@@ -266,94 +268,105 @@ def _transfer_worker(spec):
     samples, points, completed, errors, owned_keys = [], [], [], [], []
     attempted_bytes = incomplete_objects = 0
     index, iteration = spec["index"], 0
-    while not stop.is_set() and (iteration == 0 or clock() < deadline):
-        direction = spec["direction"]
-        if direction == "up":
-            bucket = spec["bucket"]
-            key = f'{spec["prefix"]}{index}-{iteration}.bin'
-            payload = SeededPayload(spec["seed"] if spec["seed"] is not None else key, spec["size"])
-        else:
-            record = spec["objects"][index % len(spec["objects"])]
-            bucket = record.get("bucket") or spec["bucket"]  # recorded bucket; fallback for bare manifests
-            key = record["key"]
-            payload = SeededPayload(**record["payload"])
-        client = clients[bucket]
-        pending, last, part_number, upload_mode = {}, 0, 0, None
-        cpu_start = time.thread_time()
-
-        def progress(count, _seconds):
-            nonlocal last, attempted_bytes
-            delta = count - last
-            if delta < 0:
-                raise ProtocolError("non-monotonic transfer progress")
-            last = count
-            timestamp = clock() - start
-            bucket = math.floor(timestamp)
-            pending[bucket] = pending.get(bucket, 0) + delta
-            attempted_bytes += delta
-            if delta and active is not None:
-                active.set()
-
-        def accept(response, count):
-            nonlocal last, part_number, cpu_start
-            sample = sample_timing(response.timing, count, direction)
-            if sum(pending.values()) != count:
-                raise ProtocolError("progress bytes differ from measured transfer", timing=response.timing)
-            sample.update(bytes=count, key=key, part=part_number, bucket=bucket, cpu_ms=(time.thread_time() - cpu_start) * 1000)
-            if upload_mode is not None:  # up only: how this object went up
-                sample["upload_mode"] = upload_mode
-            samples.append(sample)
-            points.extend(pending.items())
-            pending.clear()
-            last = 0
-            part_number += 1
+    try:
+        while not stop.is_set() and (iteration == 0 or clock() < deadline):
+            direction = spec["direction"]
+            if direction == "up":
+                bucket = spec["bucket"]
+                key = f'{spec["prefix"]}{index}-{iteration}.bin'
+                payload = SeededPayload(spec["seed"] if spec["seed"] is not None else key, spec["size"])
+            else:
+                record = spec["objects"][index % len(spec["objects"])]
+                bucket = record.get("bucket") or spec["bucket"]  # recorded bucket; fallback for bare manifests
+                key = record["key"]
+                payload = SeededPayload(**record["payload"])
+            client = clients[bucket]
+            pending, last, part_number, upload_mode = {}, 0, 0, None
             cpu_start = time.thread_time()
 
-        try:
-            if direction == "up":
-                owned_keys.append((bucket, key))
-                upload_mode = select_upload_mode(payload.size, spec["part_size"],
-                                                  spec.get("upload_mode", "auto"))
-                if upload_mode == "put":
-                    # One deadline boundary around one request: the object either
-                    # completes whole or fails the window; there is no multipart
-                    # session to abort and no hidden retry.
-                    _echo(f"PUT {object_url(client, key)} ({payload.size} bytes)")
-                    accept(client.put_object(key, payload, on_progress=progress), payload.size)
+            def progress(count, _seconds):
+                nonlocal last, attempted_bytes
+                delta = count - last
+                if delta < 0:
+                    raise ProtocolError("non-monotonic transfer progress")
+                last = count
+                timestamp = clock() - start
+                bucket = math.floor(timestamp)
+                pending[bucket] = pending.get(bucket, 0) + delta
+                attempted_bytes += delta
+                if delta and active is not None:
+                    active.set()
+
+            def accept(response, count):
+                nonlocal last, part_number, cpu_start
+                sample = sample_timing(response.timing, count, direction)
+                if sum(pending.values()) != count:
+                    raise ProtocolError("progress bytes differ from measured transfer", timing=response.timing)
+                sample.update(bytes=count, key=key, part=part_number, bucket=bucket, cpu_ms=(time.thread_time() - cpu_start) * 1000)
+                if upload_mode is not None:  # up only: how this object went up
+                    sample["upload_mode"] = upload_mode
+                samples.append(sample)
+                points.extend(pending.items())
+                pending.clear()
+                last = 0
+                part_number += 1
+                cpu_start = time.thread_time()
+
+            try:
+                if direction == "up":
+                    owned_keys.append((bucket, key))
+                    upload_mode = select_upload_mode(payload.size, spec["part_size"],
+                                                      spec.get("upload_mode", "auto"))
+                    if upload_mode == "put":
+                        # One deadline boundary around one request: the object either
+                        # completes whole or fails the window; there is no multipart
+                        # session to abort and no hidden retry.
+                        _echo(f"PUT {object_url(client, key)} ({payload.size} bytes)")
+                        accept(client.put_object(key, payload, on_progress=progress), payload.size)
+                    else:
+                        _echo(f"multipart PUT {object_url(client, key)} ({payload.size} bytes)")
+                        def on_part(response):
+                            accept(response, min(spec["part_size"], payload.size - part_number * spec["part_size"]))
+                            if part_number * spec["part_size"] < payload.size and (stop.is_set() or not spec["one_object"] and clock() >= deadline):
+                                raise _WindowEnded("profile window ended; abort incomplete multipart")
+                        client.multipart_upload(key, payload, part_size=spec["part_size"], on_part=on_part, on_progress=progress)
+                    completed.append({"key": key, "bucket": bucket, "upload_mode": upload_mode,
+                                      "payload": {"seed": payload.seed, "size": payload.size, "chunk_size": payload.chunk_size}})
                 else:
-                    _echo(f"multipart PUT {object_url(client, key)} ({payload.size} bytes)")
-                    def on_part(response):
-                        accept(response, min(spec["part_size"], payload.size - part_number * spec["part_size"]))
-                        if part_number * spec["part_size"] < payload.size and (stop.is_set() or not spec["one_object"] and clock() >= deadline):
-                            raise _WindowEnded("profile window ended; abort incomplete multipart")
-                    client.multipart_upload(key, payload, part_size=spec["part_size"], on_part=on_part, on_progress=progress)
-                completed.append({"key": key, "bucket": bucket, "upload_mode": upload_mode,
-                                  "payload": {"seed": payload.seed, "size": payload.size, "chunk_size": payload.chunk_size}})
-            else:
-                # One stream reads one uploaded object in bounded, verified ranges.
-                for offset in range(0, payload.size, spec["part_size"]):
-                    count = min(spec["part_size"], payload.size - offset)
-                    _echo(f"GET {object_url(client, key)} Range: bytes={offset}-{offset + count - 1}")
-                    def consume(data, _offset):
-                        progress(last + len(data), 0)
-                    response = client.get_object(key, byte_range=(offset, offset + count - 1), payload=payload, consume=consume)
-                    accept(response, count)
-                    if offset + count < payload.size and (stop.is_set() or not spec["one_object"] and clock() >= deadline):
-                        raise _WindowEnded("profile window ended at range boundary")
-                completed.append({"key": key, "bucket": bucket})
-        except _WindowEnded as exc:
-            incomplete_objects += 1
-            if exc.cleanup_error:
-                errors.append({"type": "AbortError", "reason": str(exc.cleanup_error)})
-            break
-        except ERRORS as exc:
-            errors.append({"type": type(exc).__name__, "reason": reason(exc),
-                           "cleanup_error": str(getattr(exc, "cleanup_error", None) or "")})
-            stop.set()
-            break
-        iteration += 1
-        if spec["one_object"]:
-            break
+                    # One stream reads one uploaded object in bounded, verified ranges.
+                    for offset in range(0, payload.size, spec["part_size"]):
+                        count = min(spec["part_size"], payload.size - offset)
+                        _echo(f"GET {object_url(client, key)} Range: bytes={offset}-{offset + count - 1}")
+                        def consume(data, _offset):
+                            progress(last + len(data), 0)
+                        response = client.get_object(key, byte_range=(offset, offset + count - 1), payload=payload, consume=consume)
+                        accept(response, count)
+                        if offset + count < payload.size and (stop.is_set() or not spec["one_object"] and clock() >= deadline):
+                            raise _WindowEnded("profile window ended at range boundary")
+                    completed.append({"key": key, "bucket": bucket})
+            except _WindowEnded as exc:
+                incomplete_objects += 1
+                if exc.cleanup_error:
+                    errors.append({"type": "AbortError", "reason": str(exc.cleanup_error)})
+                break
+            except ERRORS as exc:
+                errors.append({"type": type(exc).__name__, "reason": reason(exc),
+                               "cleanup_error": str(getattr(exc, "cleanup_error", None) or "")})
+                stop.set()
+                break
+            iteration += 1
+            if spec["one_object"]:
+                break
+
+    finally:
+        if spec["clients"] is not None:
+            # In-process worker thread: pooled keep-alive connections are
+            # threading.local, so only this thread can release its own — the
+            # executor discards threads at window end, and client.close() in
+            # the parent cannot reach them. Process workers keep their warm
+            # connection across tasks and die with the process instead.
+            for pooled_client in clients.values():
+                pooled_client.close()
     return samples, points, completed, errors, owned_keys, incomplete_objects, attempted_bytes
 
 
@@ -507,6 +520,10 @@ def transfer_window(client, *, direction, prefix, concurrency, duration, objects
             if thread:
                 thread.join()
     elapsed = end - start
+    # The loaded thread can pass its stop check and stamp a sample between the
+    # window's end timestamp and stop.set() reaching it; such a probe began
+    # outside the window and does not qualify as wholly inside it.
+    loaded_samples = [sample for sample in loaded_samples if sample["at_seconds"] <= elapsed]
     buckets = throughput_buckets(points, elapsed) if elapsed > 0 else []
     stats = describe([b["mib_per_sec"] for b in buckets])
     rates = [rate for rate in (post_ttfb_mib_per_sec(s, direction) for s in samples) if rate is not None]
