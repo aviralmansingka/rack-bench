@@ -112,9 +112,20 @@ Run in this order; each is one or more `Check` entries per provider.
    Failed/invalid samples never become zero latency. Certify's nearest band
    retains three runs and drops best/worst ranked by response-TTFB p50; each
    light band has only one 20-GET run.
-4. **Sustained upload (egress)** — parallel multipart PUTs of profile-sized
+4. **Sustained upload (egress)** — parallel PUTs of profile-sized
    random objects for the profile duration (32 MiB in quick so objects
-   complete and feed downloads; ~1 GiB in certify for sustained streams). Random data defeats provider-side
+   complete and feed downloads; ~1 GiB in certify for sustained streams). An
+   object that fits in a single part (`object_size <= part_size`) goes up as
+   ONE plain `PutObject`; only objects spanning several parts use multipart
+   (initiate + parts + complete). Single-part multipart costs three requests
+   per object, and providers limit request rate, not bytes (R2's ~100 PUT/s
+   per bucket surfaced as c=64 `502 InternalError` windows; the same load as
+   plain `PutObject` ran clean), so the request amplification is removed
+   rather than worked around. Multipart is retained for multi-part objects
+   because its bounded parts keep every request inside the 30 s socket
+   timeout — a whole-object PUT of 1 GiB at single-stream rates would outlive
+   it. `--upload-mode multipart` forces the three-request pattern for A/B
+   comparisons; `auto` (the default) applies the size rule. Random data defeats provider-side
    compression/dedup. With several buckets configured, streams are assigned
    round-robin across them at window start (§8). **Concurrent small-object TTFB probes** run during the
    window → loaded-latency signal: p95 under load, inflation vs test 3's
@@ -176,7 +187,9 @@ Throughput checks carry `detail`: single-stream MiB/s, p50/p95/p99 of the 1 s
 throughput buckets plus a steadiness ratio (p50/p95), retransmit %, TTFB
 percentiles of the measured ops, the per-request post-TTFB streaming rate,
 the ss socket-limit aggregate, and one ceiling verdict per retained window
-(below). For multi-band probes, the scalar value represents the
+(below). Upload checks additionally carry an `upload_modes` census of the
+retained run's samples (`{"put": n, "multipart": m}`); each upload sample
+and completed-object record names its own `upload_mode` additively. For multi-band probes, the scalar value represents the
 nearest/overridden band; JSON-encoded `detail` retains the effective region
 matrix, individual runs, unsupported-band reasons, raw path reports and timing
 samples. These survive in `bench.values.json` without a separate artifact
@@ -275,7 +288,9 @@ it.
   sends. GCS validates only CRC32C natively and mishandles the S3-style
   CRC32 headers, so gcs uploads omit the flexible-checksum headers and
   completion elements and carry the signed SHA256 payload digest;
-  downloads verify every byte client-side, as for every provider.
+  downloads verify every byte client-side, as for every provider. The
+  single-PUT rule (§4) applies unchanged: a single-part-sized gcs object is
+  one plain PutObject with the signed SHA256 digest and no CRC32 header.
 - Keys need only a scoped policy: create/delete one bench prefix + read/write
   objects in it. The doc ships the minimal IAM policy.
 - **Bucket configuration:** `--buckets s3=<name>,r2=<name>` is a provider-keyed

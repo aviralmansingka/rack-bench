@@ -389,8 +389,13 @@ run containing SKIPs can exit 0; inspect the checks, not just the exit code.
 #### Workload and ownership
 
 Path/DNS and a verified 100 KiB idle-TTFB baseline run first. Uploads use
-seeded, checksummed multipart objects (32 MiB quick, ~1 GiB certify) with
-concurrent small-object GETs
+seeded, checksummed objects (32 MiB quick, ~1 GiB certify): an object that
+fits in a single part goes up as one plain `PutObject`, larger objects use
+multipart — providers rate-limit requests rather than bytes (single-part
+multipart's 3 requests/object was the R2 c=64 502 trigger), while multipart's
+bounded parts keep large-object requests inside the 30 s socket timeout.
+`--upload-mode multipart` forces the old pattern for A/B comparisons. Upload
+windows run concurrent small-object GETs
 for loaded TTFB. Downloads verify ranges from this run's completed uploads; they
 never use pre-seeded data. All upload windows, including a separate unloaded
 concurrency-1 test, finish before download windows start. TCP socket sampling
@@ -466,6 +471,7 @@ Internet flags follow `bench internet`, not the `bench` parent.
 | `--buckets s3=<n1>,s3=<n2>,...` | Existing buckets; a provider may repeat for sharding   |
 | `--concurrent N`                | Override quick's 32 streams or certify's sweep        |
 | `--duration 60s`                | Per-window duration; defaults: quick 60s, certify 5m  |
+| `--upload-mode auto\|multipart` | `auto`: one plain PUT per single-part-sized object; `multipart` forces the 3-request pattern |
 | `--tool stdlib\|warp`           | Default `stdlib`; Warp execution unsupported          |
 | `--keep-data`                   | Retain completed objects under the run-owned prefix   |
 | `--yes`                         | Accept the certify reference cost estimate            |
