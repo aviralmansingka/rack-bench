@@ -135,7 +135,10 @@ Notes:
 - S3: GET tests incur S3 egress + request costs.
 - GCS interop = XML API + HMAC-SHA256, supports multipart upload; some
   S3 semantics differ (V4 signing details, no chunked
-  transfer-encoding).
+  transfer-encoding). Implemented in rack-bench's stdlib client behind
+  `--providers gcs`: the credential scope passes through unchanged
+  (location region + service `s3`), and GCS multipart bounds match S3's
+  (5 MiB..5 GiB per part, 10,000 parts).
 
 ### Tool recommendation: Warp (MinIO), single binary, for all three
 

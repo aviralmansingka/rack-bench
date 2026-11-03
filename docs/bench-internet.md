@@ -31,8 +31,8 @@ and S3 client unchanged.
 - Single-host, single-run measurement per provider: path audit, sustained
   upload/download throughput, single-stream throughput, small-object latency,
   TCP health.
-- Providers: **S3 + R2 primary**; GCS behind `--providers gcs` (interop
-  endpoint) as best-effort.
+- Providers: **S3 + R2 primary**; GCS implemented behind `--providers gcs`
+  (interop endpoint), opt-in and best-effort (§11).
 - Quick (default) and certify profiles.
 
 **Out (v1):**
@@ -194,7 +194,7 @@ handling become spec surface.
 **Option B — stdlib S3 client (recommended).** A minimal S3 client in
 `rack_bench/bench/internet/s3client.py`: AWS SigV4 HMAC signing
 (`hmac`/`hashlib`), multipart upload + range GET over `http.client` (not
-`urllib`). Targets S3 and R2; GCS interoperability remains follow-up work. No
+`urllib`). Targets S3, R2, and GCS (S3-interop endpoint with HMAC keys). No
 dependencies or external binary; per-request timing and streaming hooks support
 later probe instrumentation without SDK retries hiding bad samples.
 
@@ -207,15 +207,17 @@ it.
 - The S3 client reads only `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` and
   optional `AWS_SESSION_TOKEN`; R2 also requires `R2_ACCOUNT_ID` for its
   endpoint host. Set the AWS-named variables to the selected provider's
-  credentials. No config files, IMDS, or implicit credential discovery. Provider
-  orchestration and GCS interop remain later probe work.
+  credentials. GCS reads its own `GCS_ACCESS_KEY_ID` / `GCS_SECRET_ACCESS_KEY`
+  pair (HMAC keys from the console's Interoperability tab; no session token),
+  so a mixed `--providers s3,gcs` run can hold both pairs. No config files,
+  IMDS, or implicit credential discovery.
 - Keys need only a scoped policy: create/delete one bench prefix + read/write
   objects in it. The doc ships the minimal IAM policy.
 - **Bucket configuration:** `--buckets s3=<name>,r2=<name>` is a provider-keyed
   map of existing bucket names, following `--regions`: known providers only.
   A provider may name several buckets: repeat the provider key inside the
   list (`s3=one,s3=two`) or repeat the flag; occurrences merge in flag order,
-  and the same name twice is rejected. Names must be DNS-compatible; S3
+  and the same name twice is rejected. Names must be DNS-compatible; S3/GCS
   virtual-hosted TLS bucket names cannot contain dots. Flags are run
   configuration; environment variables remain credentials-only. Path and DNS
   ignore this map. Object probes without a bucket SKIP with a reason naming
@@ -305,7 +307,22 @@ The region matrix is probe policy, not S3-client policy. S3 resolves to
 `R2_ACCOUNT_ID` from the environment and signing region `auto`. R2 `apac` is a
 placement hint, _not_ a SigV4 region or a guarantee of a particular ingress POP.
 Do not claim Mumbai/Singapore/Virginia R2 paths without evidence; unsupported
-pinned-band measurements SKIP with a reason.
+pinned-band measurements SKIP with a reason. GCS resolves to the global anycast
+XML-interop endpoint `https://storage.googleapis.com` with virtual-hosted
+bucket requests (`https://<bucket>.storage.googleapis.com/<key>`), HMAC keys
+from `GCS_ACCESS_KEY_ID` / `GCS_SECRET_ACCESS_KEY`, and the bucket location as
+the SigV4 credential-scope region with service `s3` (Google's simple-migration
+doc passes the S3 credential scope through unchanged). The default band is
+`asia-south1` (Mumbai), matching the S3/R2 Chennai-origin band. The anycast
+endpoint gets no certify far-band expansion: a second band would sign with
+another location string but measure the same path. GCS XML multipart bounds
+match S3's (5 MiB minimum non-final part, 5 GiB maximum, 10,000 parts), so the
+shared `--part-size` validator and client checks apply unchanged; PUTs always
+send Content-Length (never chunked), as the interop API requires. GCS checksum
+handling beyond that is unverified until the live certification run: the
+client's `x-amz-checksum-*` headers and completion `ChecksumCRC32` elements
+have no documented GCS equivalent, and GCS is expected to ignore them (its own
+integrity headers are `Content-MD5` / `x-goog-hash` with CRC32C).
 
 ### Probe × band × volume budget
 
@@ -329,10 +346,12 @@ request fees and custom overrides still belong in the eventual cost gate. The
 current estimate is a full-transfer reference, not a quote for the probes
 implemented so far.
 
-Remaining implementation residue: GCS interoperability, certification
+Remaining implementation residue: certification
 thresholds/profile schema, optional Warp execution, and effective matrix-aware
-cost estimates. All v1 probes are implemented; cloud transfer interoperability
-still requires a paid live exercise. Reference cost output is not a quote for
+cost estimates. All v1 probes are implemented, GCS included; cloud transfer
+interoperability still requires a paid live exercise, and the GCS path has not
+run against the live service at all (no HMAC credentials exist yet). Reference
+cost output is not a quote for
 custom runs. Missing credentials still SKIP every provider check, including
 context and summary. See README for orchestration, TCP sampling limitations,
 part-boundary duration overruns, and filtered-prerequisite behavior.
