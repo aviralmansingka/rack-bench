@@ -31,8 +31,8 @@ and S3 client unchanged.
 - Single-host, single-run measurement per provider: path audit, sustained
   upload/download throughput, single-stream throughput, small-object latency,
   TCP health.
-- Providers: **S3 + R2 primary**; GCS behind `--providers gcs` (interop
-  endpoint) as best-effort.
+- Providers: **S3 + R2 primary**; GCS implemented behind `--providers gcs`
+  (S3 XML interop endpoint + HMAC keys), opt-in and best-effort.
 - Quick (default) and certify profiles.
 
 **Out (v1):**
@@ -194,7 +194,8 @@ handling become spec surface.
 **Option B — stdlib S3 client (recommended).** A minimal S3 client in
 `rack_bench/bench/internet/s3client.py`: AWS SigV4 HMAC signing
 (`hmac`/`hashlib`), multipart upload + range GET over `http.client` (not
-`urllib`). Targets S3 and R2; GCS interoperability remains follow-up work. No
+`urllib`). Targets S3 and R2; the GCS interop endpoint rides the same client
+with provider-keyed HMAC credentials and location-scoped SigV4. No
 dependencies or external binary; per-request timing and streaming hooks support
 later probe instrumentation without SDK retries hiding bad samples.
 
@@ -207,8 +208,11 @@ it.
 - The S3 client reads only `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` and
   optional `AWS_SESSION_TOKEN`; R2 also requires `R2_ACCOUNT_ID` for its
   endpoint host. Set the AWS-named variables to the selected provider's
-  credentials. No config files, IMDS, or implicit credential discovery. Provider
-  orchestration and GCS interop remain later probe work.
+  credentials. GCS reads `GCS_ACCESS_KEY_ID` / `GCS_SECRET_ACCESS_KEY`
+  (HMAC keys from the GCP console Interoperability tab, not OAuth); missing
+  variables SKIP every gcs check with a reason that names them. No config
+  files, IMDS, or implicit credential discovery. Provider
+  orchestration remains later probe work.
 - Keys need only a scoped policy: create/delete one bench prefix + read/write
   objects in it. The doc ships the minimal IAM policy.
 - **Bucket configuration:** `--buckets s3=<name>,r2=<name>` is a provider-keyed
@@ -329,7 +333,7 @@ request fees and custom overrides still belong in the eventual cost gate. The
 current estimate is a full-transfer reference, not a quote for the probes
 implemented so far.
 
-Remaining implementation residue: GCS interoperability, certification
+Remaining implementation residue: certification
 thresholds/profile schema, optional Warp execution, and effective matrix-aware
 cost estimates. All v1 probes are implemented; cloud transfer interoperability
 still requires a paid live exercise. Reference cost output is not a quote for

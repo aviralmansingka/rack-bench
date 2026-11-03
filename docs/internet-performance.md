@@ -135,7 +135,11 @@ Notes:
 - S3: GET tests incur S3 egress + request costs.
 - GCS interop = XML API + HMAC-SHA256, supports multipart upload; some
   S3 semantics differ (V4 signing details, no chunked
-  transfer-encoding).
+  transfer-encoding, no S3 flexible-checksum headers). Implemented in
+  `bench internet` as the opt-in `--providers gcs` path: one global endpoint
+  (`https://storage.googleapis.com`, path-style), bucket location pinned by
+  `--regions gcs=<location>` (default `asia-south1`), and any location string
+  accepted in the `AWS4-HMAC-SHA256` credential scope (service `s3`).
 
 ### Tool recommendation: Warp (MinIO), single binary, for all three
 
@@ -259,9 +263,9 @@ can verify it.
 **Provider scope (decided): S3 + R2 are the primary bench targets** —
 R2 because it is natively S3-compatible, has a Cloudflare Chennai POP
 (sub-10 ms edge RTT), and zero egress fees make regression testing
-free; S3 as the authoritative provider. GCS stays in this doc as a
-documented extension (S3-interop endpoint or `gcloud perfdiag`) but is
-not in the first implementation.
+free; S3 as the authoritative provider. GCS is implemented as an opt-in,
+best-effort provider (`--providers gcs`, S3-interop endpoint + HMAC keys);
+`gcloud perfdiag` stays an optional native cross-check.
 
 ---
 
