@@ -469,8 +469,10 @@ def transfer_window(client, *, direction, prefix, concurrency, duration, objects
                     incomplete_objects += worker_incomplete
                     attempted_bytes += worker_attempted
         finally:
-            end = clock()
+            # Stop before reading the end clock: a loaded probe stamped between
+            # them would record at_seconds past the window's elapsed time.
             stop.set()
+            end = clock()
             active.set()
             if thread:
                 thread.join()
