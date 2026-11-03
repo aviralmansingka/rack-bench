@@ -91,6 +91,28 @@ class SigningVectors(unittest.TestCase):
                          "s3/aws4_request,SignedHeaders=host;range;x-amz-content-sha256;x-amz-date,"
                          "Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41")
 
+    def test_gcs_signing_scope_uses_bucket_location_and_s3_service(self):
+        # Google publishes no SigV4 vectors; this locks the interop scope
+        # shape (<date>/<bucket-location>/s3/aws4_request) against a literal
+        # computed once from this implementation (regression lock, not an
+        # external vector). Google's signatures doc accepts any LOCATION in
+        # the scope and recommends the resource's location; the service stays
+        # s3 on the x-amz interop path. The algorithm itself is pinned by the
+        # AWS suite literals above.
+        credentials = s3.Credentials("GOOG1EXAMPLE", "gcs-secret")
+        headers = {"host": "bench.storage.googleapis.com", "range": "bytes=0-9",
+                   "x-amz-content-sha256": EMPTY_HASH, "x-amz-date": "20130524T000000Z"}
+        canonical = s3.canonical_request("GET", "/bench/test.txt", (), headers, EMPTY_HASH)
+        self.assertEqual(s3.string_to_sign(canonical, "20130524T000000Z", "asia-south1"),
+                         "AWS4-HMAC-SHA256\n20130524T000000Z\n20130524/asia-south1/s3/aws4_request\n"
+                         + hashlib.sha256(canonical.encode()).hexdigest())
+        signed = s3.sign_headers(credentials, "GET", "/bench/test.txt", (), headers,
+                                 EMPTY_HASH, "asia-south1", "20130524T000000Z")
+        self.assertEqual(signed["authorization"].replace(", ", ","),
+                         "AWS4-HMAC-SHA256 Credential=GOOG1EXAMPLE/20130524/asia-south1/"
+                         "s3/aws4_request,SignedHeaders=host;range;x-amz-content-sha256;x-amz-date,"
+                         "Signature=994fea6943485f5d80882d6c5b977889bafe3d658553615ebb48b15a4f725666")
+
     def test_s3_path_not_normalized_and_query_encoded_once(self):
         canonical = s3.canonical_request("GET", "/a//.././% +/ሴ", (
             ("z", ""), ("a", "+ %"), ("a", "/")), {}, EMPTY_HASH)
@@ -206,6 +228,24 @@ class PayloadTests(unittest.TestCase):
         self.assertEqual(headers["x-amz-content-sha256"],
                          "15e2b0d3c33891ebb0f1ef609ec419420c20e320ce94c65fbc8c3312448eb225")
 
+    def test_crc32c_known_vector_and_goog_headers(self):
+        # CRC32C ("123456789") == 0xE3069283 is the Castagnoli check value;
+        # zlib.crc32 of the same bytes differs, so this pins the polynomial.
+        self.assertEqual(s3.crc32c(b"123456789"), 0xE3069283)
+        self.assertEqual(s3.crc32c(b""), 0)
+        self.assertEqual(s3.crc32c(b"6789", s3.crc32c(b"12345")), 0xE3069283)  # continuation
+        headers = s3.goog_checksum_headers((b"123", b"456789"))
+        self.assertEqual(headers["x-goog-hash"],
+                         "crc32c=" + base64.b64encode((0xE3069283).to_bytes(4, "big")).decode())
+        self.assertNotIn("x-amz-checksum-crc32", headers)  # S3 flexible checksums stay off gcs
+        self.assertEqual(headers["x-amz-content-sha256"],
+                         "15e2b0d3c33891ebb0f1ef609ec419420c20e320ce94c65fbc8c3312448eb225")
+        # The digest LRU keys on provider: the same part shape yields the
+        # per-provider header pair from one cached pre-pass each.
+        payload = s3.SeededPayload("cache-seed", 32)
+        self.assertIn("x-goog-hash", s3.part_checksum_headers(payload, 0, 32, provider="gcs"))
+        self.assertIn("x-amz-checksum-crc32", s3.part_checksum_headers(payload, 0, 32))
+
     def test_env_only_credentials_and_provider_endpoints(self):
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaisesRegex(s3.CredentialError, "AWS_ACCESS_KEY_ID"):
@@ -289,6 +329,10 @@ class MockS3(BaseHTTPRequestHandler):
         remaining = int(headers.get("content-length", "0"))
         sha = hashlib.sha256()
         crc = 0
+        crcc = 0
+        # Pure-Python CRC32C is too slow to run over every bulk body; only
+        # gcs-style sends declare x-goog-hash, so only they pay for it.
+        need_crcc = "x-goog-hash" in headers
         xml = bytearray()
         while remaining:
             data = self.rfile.read(min(8192, remaining))
@@ -298,6 +342,8 @@ class MockS3(BaseHTTPRequestHandler):
             state["max_read"] = max(state["max_read"], len(data))
             sha.update(data)
             crc = zlib.crc32(data, crc)
+            if need_crcc:
+                crcc = s3.crc32c(data, crcc)
             if self.command == "POST":
                 xml.extend(data)
         record["body"] = bytes(xml)
@@ -318,9 +364,15 @@ class MockS3(BaseHTTPRequestHandler):
             record["crc32"] = expected_crc
             # GCS interop uploads carry no x-amz-checksum-crc32; the server
             # verifies a sent CRC32 and never invents one for gcs-style sends.
+            # GCS validates a supplied x-goog-hash CRC32C the same way (the
+            # XML API documents server-side validation per part and object).
             sent_crc = headers.get("x-amz-checksum-crc32")
+            sent_goog = headers.get("x-goog-hash")
+            expected_goog = ("crc32c=" + base64.b64encode(crcc.to_bytes(4, "big")).decode()
+                             if need_crcc else None)
             if ("content-md5" in headers or
                     self.command == "PUT" and sent_crc is not None and sent_crc != expected_crc or
+                    sent_goog is not None and sent_goog != expected_goog or
                     state.get("reject_digest")):
                 self.reply(400, b"<Error><Code>InvalidDigest</Code></Error>")
                 return
@@ -745,20 +797,34 @@ class GcsInteropTests(unittest.TestCase):
         self.assertIn("Credential=GOOGEXAMPLE/", request["headers"]["authorization"])
         self.assertIn("/asia-south1/s3/aws4_request", request["headers"]["authorization"])
         # The signed SHA256 payload digest rides on every upload; the S3
-        # flexible-checksum header does not (GCS validates CRC32C natively).
+        # flexible-checksum header does not. Integrity instead rides the
+        # documented x-goog-hash CRC32C, which GCS validates server-side.
         self.assertEqual(request["headers"]["x-amz-content-sha256"],
                          hashlib.sha256(b"".join(payload.iter_chunks())).hexdigest())
         self.assertNotIn("x-amz-checksum-crc32", request["headers"])
+        crcc = 0
+        for chunk in payload.iter_chunks():
+            crcc = s3.crc32c(chunk, crcc)
+        self.assertEqual(request["headers"]["x-goog-hash"],
+                         "crc32c=" + base64.b64encode(crcc.to_bytes(4, "big")).decode())
         self.assertNotIn("x-amz-security-token", request["headers"])  # static HMAC keys
 
-    def test_multipart_omits_checksum_headers_and_completion_elements(self):
-        self.client.multipart_upload("multi", s3.SeededPayload("large", 5 * 1024**2 + 99),
-                                     part_size=5 * 1024**2)
+    def test_multipart_carries_goog_hash_and_omits_s3_checksum_elements(self):
+        payload = s3.SeededPayload("large", 5 * 1024**2 + 99)
+        self.client.multipart_upload("multi", payload, part_size=5 * 1024**2)
         requests = self.state["requests"]
         self.assertEqual([r["method"] for r in requests], ["POST", "PUT", "PUT", "POST"])
         self.assertNotIn("x-amz-checksum-algorithm", requests[0]["headers"])
         self.assertNotIn("x-amz-checksum-type", requests[0]["headers"])
         self.assertTrue(all("x-amz-checksum-crc32" not in r["headers"] for r in requests[1:3]))
+        # Each part carries the documented per-part x-goog-hash CRC32C, and
+        # the loopback server validated it (InvalidDigest on mismatch).
+        crcc = 0
+        for chunk in payload.iter_chunks(0, 5 * 1024**2):
+            crcc = s3.crc32c(chunk, crcc)
+        self.assertEqual(requests[1]["headers"]["x-goog-hash"],
+                         "crc32c=" + base64.b64encode(crcc.to_bytes(4, "big")).decode())
+        self.assertIn("crc32c=", requests[2]["headers"]["x-goog-hash"])
         # GCS documents only PartNumber and ETag completion elements.
         root = ET.fromstring(requests[-1]["body"])
         self.assertEqual([part.findtext("PartNumber") for part in root], ["1", "2"])

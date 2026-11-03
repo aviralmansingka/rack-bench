@@ -318,6 +318,64 @@ class SeededPayload:
             consumed += len(expected)
 
 
+def _crc32c_tables() -> tuple:
+    """Slicing-by-8 tables for reflected CRC32C (Castagnoli, poly 0x82F63B78)."""
+    base = []
+    for i in range(256):
+        crc = i
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0x82F63B78 if crc & 1 else crc >> 1
+        base.append(crc)
+    tables = [base]
+    for _ in range(7):
+        previous = tables[-1]
+        tables.append([(previous[i] >> 8) ^ base[previous[i] & 0xFF] for i in range(256)])
+    return tuple(tuple(table) for table in tables)
+
+
+_CRC32C_TABLES = _crc32c_tables()
+
+
+def crc32c(data: bytes, value: int = 0) -> int:
+    """CRC32C with zlib.crc32 calling conventions (seedable continuation).
+
+    Pure Python because the stdlib has no CRC32C; GCS's documented integrity
+    header (x-goog-hash: crc32c=...) needs it. Slicing-by-8 keeps the one-time
+    per-part digest pre-pass cheap; the digest LRU then amortizes it across
+    sibling objects sharing the run seed.
+    """
+    crc = value ^ 0xFFFFFFFF
+    t0, t1, t2, t3, t4, t5, t6, t7 = _CRC32C_TABLES
+    index, size = 0, len(data)
+    while index + 8 <= size:
+        word = int.from_bytes(data[index:index + 8], "little") ^ crc
+        crc = (t7[word & 0xFF] ^ t6[word >> 8 & 0xFF] ^ t5[word >> 16 & 0xFF] ^
+               t4[word >> 24 & 0xFF] ^ t3[word >> 32 & 0xFF] ^ t2[word >> 40 & 0xFF] ^
+               t1[word >> 48 & 0xFF] ^ t0[word >> 56])
+        index += 8
+    while index < size:
+        crc = t0[(crc ^ data[index]) & 0xFF] ^ (crc >> 8)
+        index += 1
+    return crc ^ 0xFFFFFFFF
+
+
+def goog_checksum_headers(chunks: Iterable[bytes]) -> dict[str, str]:
+    """SigV4 payload hash plus GCS's documented integrity header.
+
+    The S3 flexible-checksum headers (x-amz-checksum-*) are not part of the
+    GCS XML interop API; GCS validates x-goog-hash CRC32C instead, including
+    per multipart part. CRC32C is Castagnoli, not the zlib CRC32 S3 takes;
+    the value is big-endian and base64-encoded per the XML API reference.
+    """
+    sha = hashlib.sha256()
+    crc = 0
+    for chunk in chunks:
+        sha.update(chunk)
+        crc = crc32c(chunk, crc)
+    return {"x-amz-content-sha256": sha.hexdigest(),
+            "x-goog-hash": "crc32c=" + base64.b64encode(crc.to_bytes(4, "big")).decode()}
+
+
 def checksum_headers(chunks: Iterable[bytes]) -> dict[str, str]:
     """One bounded pre-pass; CRC32 request server verification on every PUT.
 
@@ -334,21 +392,26 @@ def checksum_headers(chunks: Iterable[bytes]) -> dict[str, str]:
             "x-amz-checksum-crc32": base64.b64encode(crc.to_bytes(4, "big")).decode()}
 
 
-def part_checksum_headers(payload: SeededPayload, offset: int, size: int) -> dict[str, str]:
-    """Signed digests (SHA256+CRC32) for one payload part, via a bounded LRU.
+def part_checksum_headers(payload: SeededPayload, offset: int, size: int,
+                          *, provider: str = "s3") -> dict[str, str]:
+    """Signed digests (SHA256+CRC32; SHA256+CRC32C for gcs) per part, via a bounded LRU.
 
     Both digests are signed headers, so a pre-pass over the part body is
-    protocol-required; caching it keyed (seed, chunk_size, offset, size) makes
-    the pre-pass a hit whenever the same part shape repeats. A run-shared
-    payload seed makes the part at any given offset byte-identical across all
-    sibling objects, so after the first object the pre-pass is ~free.
+    protocol-required; caching it keyed (provider, seed, chunk_size, offset,
+    size) makes the pre-pass a hit whenever the same part shape repeats. A
+    run-shared payload seed makes the part at any given offset byte-identical
+    across all sibling objects, so after the first object the pre-pass is ~free.
     """
-    key = (payload.seed, payload.chunk_size, offset, size)
+    key = (provider, payload.seed, payload.chunk_size, offset, size)
     cached = _DIGEST_CACHE.get(key)
     if cached is None:
-        headers = checksum_headers(payload.iter_chunks(offset, size))
-        cached = (headers["x-amz-content-sha256"], headers["x-amz-checksum-crc32"])
+        digests = (goog_checksum_headers if provider == "gcs" else checksum_headers)
+        headers = digests(payload.iter_chunks(offset, size))
+        cached = (headers["x-amz-content-sha256"],
+                  headers.get("x-amz-checksum-crc32") or headers["x-goog-hash"])
         _DIGEST_CACHE.put(key, cached)
+    if provider == "gcs":
+        return {"x-amz-content-sha256": cached[0], "x-goog-hash": cached[1]}
     return {"x-amz-content-sha256": cached[0], "x-amz-checksum-crc32": cached[1]}
 
 
@@ -438,12 +501,15 @@ class S3Client:
         self.timeout = timeout
         self.control_retries = control_retries
         self.backoff = backoff
-        # S3 flexible checksums (x-amz-checksum-crc32 on parts, the initiate
-        # checksum headers, and completion ChecksumCRC32 elements) request
-        # server-side zlib-CRC32 verification. GCS validates only CRC32C
-        # natively and mishandles the S3-style headers, so gcs uploads carry
-        # the signed SHA256 payload digest only; downloads still verify every
-        # byte against the seeded payload client-side.
+        # Upload integrity policy: S3 flexible checksums (x-amz-checksum-crc32
+        # on parts, the initiate checksum headers, and completion ChecksumCRC32
+        # elements) request server-side zlib-CRC32 verification. The GCS XML
+        # interop API does not implement those headers; gcs uploads instead
+        # carry the documented x-goog-hash CRC32C, which GCS validates per
+        # part and per object, and gcs completion XML omits the S3-only
+        # ChecksumCRC32 elements. Downloads verify every byte against the
+        # seeded payload client-side for all providers.
+        self.provider = provider
         self.s3_checksums = provider != "gcs"
         self._connections = threading.local()
 
@@ -635,9 +701,7 @@ class S3Client:
     def _upload(self, key: str, payload: SeededPayload, offset: int, size: int,
                 query=(), on_progress=None) -> Response:
         body = lambda: payload.iter_chunks(offset, size)
-        headers = part_checksum_headers(payload, offset, size)
-        if not self.s3_checksums:
-            del headers["x-amz-checksum-crc32"]
+        headers = part_checksum_headers(payload, offset, size, provider=self.provider)
         result = self._request("PUT", key, query=query, headers=headers,
                                body=body, size=size, measurement=True, on_progress=on_progress)
         result.upload_crc32 = headers.get("x-amz-checksum-crc32")

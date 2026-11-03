@@ -1041,7 +1041,8 @@ class ProcessPoolTransferTests(unittest.TestCase):
 
     def test_gcs_single_part_put_omits_checksum_headers(self):
         # The gcs provider path in put mode: one path-style PUT per object with
-        # the signed SHA256 payload digest and no S3 flexible-checksum header.
+        # the signed SHA256 payload digest, the documented x-goog-hash CRC32C,
+        # and no S3 flexible-checksum header.
         env = patch.dict(os.environ, {"GCS_ACCESS_KEY_ID": "fake", "GCS_SECRET_ACCESS_KEY": "fake"})
         env.start()
         self.addCleanup(env.stop)
@@ -1057,10 +1058,15 @@ class ProcessPoolTransferTests(unittest.TestCase):
                                            tcp_factory=FakeTCP, host="127.0.0.1", provider="gcs")
         self.assertEqual(run["status"], "pass")
         self.assertEqual([method for method, _ in self.server.state["requests"]], ["PUT", "PUT"])
+        crcc = 0
+        for chunk in payload.iter_chunks():
+            crcc = s3.crc32c(chunk, crcc)
+        expected = "crc32c=" + base64.b64encode(crcc.to_bytes(4, "big")).decode()
         for path, headers in self.server.state["put_headers"]:
             self.assertTrue(path.startswith("/bucket/gcs-put/"))  # path-style
             self.assertNotIn("x-amz-checksum-crc32", headers)  # gcs: no CRC32 headers
             self.assertIn("x-amz-content-sha256", headers)  # signed digest still rides
+            self.assertEqual(headers["x-goog-hash"], expected)  # CRC32C integrity rides instead
 
     def test_download_worker_processes_stream_verified_ranges(self):
         self.server.state = {"payload": s3.SeededPayload("proc-seed", self.size), "requests": []}
