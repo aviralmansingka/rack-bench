@@ -256,9 +256,10 @@ handling become spec surface.
 **Option B — stdlib S3 client (recommended).** A minimal S3 client in
 `rack_bench/bench/internet/s3client.py`: AWS SigV4 HMAC signing
 (`hmac`/`hashlib`), multipart upload + range GET over `http.client` (not
-`urllib`). Targets S3 and R2; GCS interoperability remains follow-up work. No
-dependencies or external binary; per-request timing and streaming hooks support
-later probe instrumentation without SDK retries hiding bad samples.
+`urllib`). Targets S3, R2, and opt-in GCS through the XML interoperability
+endpoint (§8). No dependencies or external binary; per-request timing and
+streaming hooks support later probe instrumentation without SDK retries
+hiding bad samples.
 
 The certify profile can still optionally use warp (`--tool warp`) for
 cross-checking against an industry-recognized tool; quick/default never requires
@@ -267,9 +268,10 @@ it.
 ## 8. Credentials & security
 
 - The S3 client reads only `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` and
-  optional `AWS_SESSION_TOKEN`; R2 also requires `R2_ACCOUNT_ID` for its
-  endpoint host. Set the AWS-named variables to the selected provider's
-  credentials. No config files, IMDS, or implicit credential discovery.
+  optional `AWS_SESSION_TOKEN` for S3 and R2; R2 also requires
+  `R2_ACCOUNT_ID` for its endpoint host. Set the AWS-named variables to the
+  selected S3 or R2 credentials. No config files, IMDS, or implicit
+  credential discovery.
 - **GCS interoperability (opt-in, best-effort):** `--providers gcs` targets
   the S3-style XML interoperability endpoint `https://storage.googleapis.com`.
   One global endpoint serves every location; requests are path-style, so
@@ -377,10 +379,12 @@ The following four contracts are frozen for Session 2 and later probes:
    measured PUTs or GETs. Control operations may retry connection errors and 5xx
    with bounded backoff; their timings are not throughput samples.
 4. **Tiered regions, not three full-volume certifications.** Quick uses nearest
-   S3 `ap-south-1` (Mumbai) and R2 `apac`. Certify keeps Mumbai full-volume and
-   adds Singapore (`ap-southeast-1`) and N. Virginia (`us-east-1`) as light
-   physics probes. `--regions` overrides this policy; record the effective
-   matrix and volumes in artifacts and cost estimates.
+   S3 `ap-south-1` (Mumbai), R2 `apac`, and GCS `asia-south1` (Mumbai bucket
+   location). Certify keeps Mumbai full-volume and adds Singapore
+   (`ap-southeast-1`) and N. Virginia (`us-east-1`) as light physics probes for
+   S3 and R2. GCS far bands SKIP: the global interop endpoint cannot establish a
+   distinct regional path. `--regions` overrides this policy; record the
+   effective matrix and volumes in artifacts and cost estimates.
 
 The region matrix is probe policy, not S3-client policy. S3 resolves to
 `https://s3.<region>.amazonaws.com` with virtual-hosted bucket requests

@@ -367,11 +367,10 @@ usable, measured end-to-end; NIC link-up time; time-to-job-ready.
 
 ### Internet — external network
 
-`rack-bench bench internet` measures single-host north-south performance to S3
-and R2 using an IPv4-only, stdlib S3 client. GCS is an opt-in third provider
-(`--providers gcs`) through its S3 XML interoperability endpoint: best-effort,
-loopback-tested, with live certification pending credentials. All 13 checks
-per provider are
+`rack-bench bench internet` measures single-host north-south performance to S3,
+R2, and opt-in GCS using an IPv4-only, stdlib S3 client. GCS uses its S3 XML
+interoperability endpoint: best-effort, loopback-tested, with live
+certification pending credentials. All 13 checks per provider are
 wired: path AS/hops/RTT, DNS, idle TTFB, upload/download MiB/s and obj/s, loaded
 TTFB, PMTUD, TCP retransmits, and summary. Single-stream rates live in
 throughput detail, not a new check name. Warp execution
@@ -426,9 +425,10 @@ SKIP. S3 redirects at inaccessible regional endpoints also SKIP rather than
 silently changing the measured region.
 
 Supply `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` and optional
-`AWS_SESSION_TOKEN`; R2 additionally needs `R2_ACCOUNT_ID`. These AWS-named
-variables must contain the selected provider's credentials; separate provider
-invocations are usually appropriate. GCS reads `GCS_ACCESS_KEY_ID` /
+`AWS_SESSION_TOKEN` for S3 and R2; R2 additionally needs `R2_ACCOUNT_ID`.
+These AWS-named variables must contain the selected S3 or R2 credentials;
+separate provider invocations are usually appropriate. GCS reads
+`GCS_ACCESS_KEY_ID` /
 `GCS_SECRET_ACCESS_KEY` instead — static HMAC keys from the GCP console
 Interoperability tab or `gcloud storage hmac create` — so AWS and GCS
 credentials can coexist in one environment. There is no SDK/config/IMDS
@@ -583,7 +583,7 @@ the first implementation:
 
 Internet egress/ingress performance to public object stores (S3, R2, GCS) is
 outside ClusterMAX's scope entirely. `bench internet` now measures it for S3 and
-R2; the longer `smoke internet` soak remains future work.
+R2, plus opt-in GCS; the longer `smoke internet` soak remains future work.
 
 ## Certification flow
 
