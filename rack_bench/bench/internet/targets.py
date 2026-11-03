@@ -4,14 +4,19 @@ from uuid import uuid4
 from .s3client import Credentials, CredentialError, resolve_endpoint
 
 
+DEFAULT_REGIONS = {"s3": "ap-south-1", "r2": "apac", "gcs": "asia-south1"}
+
+
 def targets(provider, options):
     """Nearest band first; unsupported providers/bands remain explicit records."""
-    Credentials.from_env()  # Spec §6: even context probes require provider credentials.
-    if provider == "gcs":
-        raise ValueError("GCS interoperability not implemented")
-    nearest = options.regions.get(provider, "ap-south-1" if provider == "s3" else "apac")
-    regions = [nearest]
-    if options.profile == "certify" and provider not in options.regions:
+    Credentials.from_env(provider)  # Spec §6: even context probes require provider credentials.
+    regions = [options.regions.get(provider, DEFAULT_REGIONS[provider])]
+    # GCS gets no far bands: its interoperability endpoint is one global
+    # anycast host, so a second "band" would re-measure the identical frontend.
+    # The pinned location describes the bucket, not a distinct network path;
+    # bucket-location routing happens inside Google's network.
+    if (options.profile == "certify" and provider != "gcs"
+            and provider not in options.regions):
         regions += ["ap-southeast-1", "us-east-1"]
     result = []
     for index, region in enumerate(regions):
@@ -20,7 +25,8 @@ def targets(provider, options):
         if provider == "r2" and region not in {"apac", "auto"}:
             reason = "unsupported pinned R2 band: placement hint does not establish a regional path"
         result.append({"region": region, "endpoint": f"https://{endpoint.host}",
-                       "host": endpoint.host, "band": "nearest" if index == 0 else "light",
+                       "host": endpoint.host, "path_style": endpoint.path_style,
+                       "band": "nearest" if index == 0 else "light",
                        "runs": 3 if options.profile == "certify" and index == 0 else 1,
                        "reason": reason})
     return result

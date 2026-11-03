@@ -61,13 +61,16 @@ def regions(value):
 def _bucket_name(provider, bucket):
     if not bucket:
         raise argparse.ArgumentTypeError(f"empty bucket name for {provider}")
-    if (not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket) or
+    # GCS bucket names additionally allow underscores; the bench addresses GCS
+    # path-style, so dots and underscores never enter a TLS hostname.
+    letters = r"[a-z0-9._-]" if provider == "gcs" else r"[a-z0-9.-]"
+    if (not re.fullmatch(rf"[a-z0-9]{letters}{{1,61}}[a-z0-9]", bucket) or
             ".." in bucket or ".-" in bucket or "-." in bucket or
             re.fullmatch(r"[0-9]+(?:\.[0-9]+){3}", bucket) or
             provider == "s3" and "." in bucket):
         raise argparse.ArgumentTypeError(
             "expected provider=bucket pairs with DNS-compatible bucket names "
-            "(S3 virtual-hosted TLS names cannot contain dots)")
+            "(S3 virtual-hosted TLS names cannot contain dots; GCS also allows underscores)")
     return bucket
 
 
@@ -120,7 +123,8 @@ def part_size_mib(value):
     except ValueError:
         raise argparse.ArgumentTypeError("expected a positive integer") from None
     if not 8 <= number <= 512:
-        raise argparse.ArgumentTypeError("expected 8..512 (MiB); every non-final part must stay above S3's 5 MiB minimum")
+        raise argparse.ArgumentTypeError(
+            "expected 8..512 (MiB); every non-final part must stay above the 5 MiB minimum S3 and GCS share")
     return number
 
 
