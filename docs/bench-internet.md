@@ -112,9 +112,19 @@ Run in this order; each is one or more `Check` entries per provider.
    Failed/invalid samples never become zero latency. Certify's nearest band
    retains three runs and drops best/worst ranked by response-TTFB p50; each
    light band has only one 20-GET run.
-4. **Sustained upload (egress)** — parallel multipart PUTs of profile-sized
+4. **Sustained upload (egress)** — parallel PUTs of profile-sized
    random objects for the profile duration (32 MiB in quick so objects
-   complete and feed downloads; ~1 GiB in certify for sustained streams). Random data defeats provider-side
+   complete and feed downloads; ~1 GiB in certify for sustained streams). An
+   object that fits in one part goes up as a **single plain `PutObject`** —
+   one request per object, no initiate+part+complete amplification (≈3× the
+   request rate, which trips provider-side ingest limits such as R2's per-bucket
+   PUT ceiling). Objects spanning several parts keep multipart: each part is
+   bounded to `--part-size` bytes, so no single request outlives the 30 s
+   per-socket timeout at slow single-stream rates. `--upload-mode multipart`
+   forces the multipart pattern for every object (forced A/B comparisons);
+   `auto` is the default. Upload samples and completion records name the mode
+   (`upload_mode: put|multipart`) and the check detail counts samples per mode
+   (`upload_modes`). Random data defeats provider-side
    compression/dedup. With several buckets configured, streams are assigned
    round-robin across them at window start (§8). **Concurrent small-object TTFB probes** run during the
    window → loaded-latency signal: p95 under load, inflation vs test 3's
@@ -175,8 +185,9 @@ internet.<p>.summary                 dict  region, endpoint, tool, bytes
 Throughput checks carry `detail`: single-stream MiB/s, p50/p95/p99 of the 1 s
 throughput buckets plus a steadiness ratio (p50/p95), retransmit %, TTFB
 percentiles of the measured ops, the per-request post-TTFB streaming rate,
-the ss socket-limit aggregate, and one ceiling verdict per retained window
-(below). For multi-band probes, the scalar value represents the
+the ss socket-limit aggregate, one ceiling verdict per retained window
+(below), and — upload checks only — `upload_modes` sample counts
+(`put` vs `multipart`, §4). For multi-band probes, the scalar value represents the
 nearest/overridden band; JSON-encoded `detail` retains the effective region
 matrix, individual runs, unsupported-band reasons, raw path reports and timing
 samples. These survive in `bench.values.json` without a separate artifact
@@ -239,7 +250,8 @@ handling become spec surface.
 
 **Option B — stdlib S3 client (recommended).** A minimal S3 client in
 `rack_bench/bench/internet/s3client.py`: AWS SigV4 HMAC signing
-(`hmac`/`hashlib`), multipart upload + range GET over `http.client` (not
+(`hmac`/`hashlib`), single PUT + multipart upload + range GET over
+`http.client` (not
 `urllib`). Targets S3 and R2; GCS interoperability remains follow-up work. No
 dependencies or external binary; per-request timing and streaming hooks support
 later probe instrumentation without SDK retries hiding bad samples.
@@ -327,7 +339,7 @@ it.
 | Piece                                                      | Estimate    |
 | ---------------------------------------------------------- | ----------- |
 | bench dispatch (mirrors audit runner)                      | 0.5 session |
-| `bench/internet/s3client.py` (SigV4, multipart, range GET) | 1 session   |
+| `bench/internet/s3client.py` (SigV4, PUT/multipart, range GET) | 1 session   |
 | `bench/internet/` (7 probes, CHECKS, parsing)              | 1 session   |
 | Cost gate, README section, integration tests               | 0.5 session |
 
