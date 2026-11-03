@@ -91,6 +91,24 @@ class SigningVectors(unittest.TestCase):
                          "s3/aws4_request,SignedHeaders=host;range;x-amz-content-sha256;x-amz-date,"
                          "Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41")
 
+    def test_gcs_location_scope_signing_golden(self):
+        # Google recommends the bucket location as the credential-scope
+        # LOCATION; x-amz extensions keep service s3 and request type
+        # aws4_request. Literal values pin the scope against signer drift.
+        credentials = s3.Credentials("GOOGKEY", "gcs-secret")
+        canonical = s3.canonical_request("GET", "/bucket/key", (), {
+            "host": "storage.googleapis.com",
+            "x-amz-date": "20150830T123600Z"}, EMPTY_HASH)
+        self.assertEqual(s3.string_to_sign(canonical, "20150830T123600Z", "asia-south1"),
+                         "AWS4-HMAC-SHA256\n20150830T123600Z\n"
+                         "20150830/asia-south1/s3/aws4_request\n"
+                         "15cac148498c8cb86a22923c7d3ad95786951faa6541d8df86fa2011216d2662")
+        self.assertEqual(
+            s3.authorization(credentials, canonical, "20150830T123600Z", "asia-south1"),
+            "AWS4-HMAC-SHA256 Credential=GOOGKEY/20150830/asia-south1/s3/aws4_request, "
+            "SignedHeaders=host;x-amz-date, Signature="
+            "5b4b2a0b63c8927fa99de7055d64c55662c7755cbbaab57114dacfddebe4f0fe")
+
     def test_s3_path_not_normalized_and_query_encoded_once(self):
         canonical = s3.canonical_request("GET", "/a//.././% +/ሴ", (
             ("z", ""), ("a", "+ %"), ("a", "/")), {}, EMPTY_HASH)
@@ -454,6 +472,12 @@ class TransportTests(unittest.TestCase):
                          [r["crc32"] for r in requests[1:3]])
         self.assertEqual(len(parts), 2)
         self.assertTrue(all(part.timing.attempts == 1 for part in parts))
+
+    def test_s3_completion_requires_part_crc32_but_gcs_does_not(self):
+        # The S3/R2 path always computes part CRC32; a missing digest is a
+        # programming error, not a valid completion. GCS omits it by design.
+        with self.assertRaisesRegex(ValueError, "CRC32"):
+            self.client.complete_multipart("key", "upload-id", [(1, '"etag"', None)])
 
     def test_checksum_rejection_is_typed_and_aborts_without_retry(self):
         self.state["reject_digest"] = True

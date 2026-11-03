@@ -74,8 +74,8 @@ def upload_reports(provider, options, *, client_factory=S3Client, window=transfe
                                       provider=provider, upload_mode=options.upload_mode,
                                       # ss diagnostics anchor to the first bucket's virtual host;
                                       # sibling buckets share the endpoint IPs in practice.
-                                      # Path-style providers (r2, gcs) pass the bare endpoint host.
-                                      host=target["host"] if provider in ("r2", "gcs") else f'{names[0]}.{target["host"]}')
+                                      # Path-style endpoints pass the bare host; the path carries the bucket.
+                                      host=target["host"] if target["path_style"] else f'{names[0]}.{target["host"]}')
                 run.update(kind=kind, run=index)
                 record["runs_detail"].append(run)
                 record["objects"].extend(objects)

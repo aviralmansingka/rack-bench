@@ -129,6 +129,7 @@ class PathTests(unittest.TestCase):
         gcs = targets("gcs", Options())
         self.assertEqual([t["region"] for t in gcs], ["asia-south1"])
         self.assertEqual(gcs[0]["endpoint"], "https://storage.googleapis.com")
+        self.assertTrue(gcs[0]["path_style"])
         self.assertIsNone(gcs[0]["reason"])
         certified = targets("gcs", Options(profile="certify"))
         self.assertEqual([t["region"] for t in certified], ["asia-south1", "ap-southeast-1", "us-east-1"])

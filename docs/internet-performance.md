@@ -126,7 +126,7 @@ exercises **ingress**.
 | --- | --- | --- |
 | AWS S3 | S3 | warp or stdlib client → `s3.amazonaws.com` |
 | Cloudflare R2 | S3-compatible | `https://<account>.r2.cloudflarestorage.com` |
-| GCS | JSON/XML | S3-interop endpoint + HMAC keys, or `gcloud perfdiag` |
+| GCS | JSON/XML | implemented opt-in: `https://storage.googleapis.com` + HMAC keys |
 
 Notes:
 
@@ -185,7 +185,7 @@ review-ready spec lives in the main repo at
 
 ```text
 rack-bench bench internet
-    [--providers s3,r2]        # default all three
+    [--providers s3,r2]        # default s3,r2; gcs opt-in
     [--directions up,down]     # default both
     [--profile quick|certify]  # quick=60s/8-32 concurrent
     [--regions <map>]          # e.g. s3=us-east-1,gcs=us-east1,r2=auto
@@ -264,9 +264,9 @@ can verify it.
 **Provider scope (decided): S3 + R2 are the primary bench targets** —
 R2 because it is natively S3-compatible, has a Cloudflare Chennai POP
 (sub-10 ms edge RTT), and zero egress fees make regression testing
-free; S3 as the authoritative provider. GCS stays in this doc as a
-documented extension (S3-interop endpoint or `gcloud perfdiag`) but is
-not in the first implementation.
+free; S3 as the authoritative provider. GCS is implemented opt-in over
+the XML interop API and stays best-effort until a live certification run
+with HMAC credentials.
 
 ---
 

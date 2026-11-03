@@ -29,7 +29,8 @@ def targets(provider, options):
             reason = ("unsupported far band: the global interop endpoint and one bucket location "
                       "do not establish a distinct regional path")
         result.append({"region": region, "endpoint": f"https://{endpoint.host}",
-                       "host": endpoint.host, "band": "nearest" if index == 0 else "light",
+                       "host": endpoint.host, "path_style": endpoint.path_style,
+                       "band": "nearest" if index == 0 else "light",
                        "runs": 3 if options.profile == "certify" and index == 0 else 1,
                        "reason": reason})
     return result
