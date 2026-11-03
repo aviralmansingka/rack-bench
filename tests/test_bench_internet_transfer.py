@@ -343,6 +343,22 @@ class TransferTests(unittest.TestCase):
         self.assertTrue(objects)
         self.assertTrue(all(obj["upload_mode"] == "put" for obj in objects))
 
+    def test_put_mode_5xx_fails_the_window_without_a_retry(self):
+        # A measured PUT is never retried: one 5xx ends the window as a skip and
+        # records the error, exactly like a failing multipart part. The key is
+        # still owned, so an ambiguous PUT stays cleanable.
+        self.client.put_object = Mock(
+            side_effect=s3.ServiceError("S3 response 503: SlowDown", status=503))
+        owned = []
+        run = transfer.transfer_window(self.client, direction="up", prefix="rack-bench/test/",
+                                       concurrency=1, duration=.1, objects=[], owned=owned, size=16,
+                                       clock=Clock(), tcp_factory=FakeTCP, part_size=16)[0]
+        self.assertEqual(run["status"], "skip")
+        self.assertEqual(self.client.put_object.call_count, 1)
+        self.assertEqual(run["errors"][0]["type"], "ServiceError")
+        self.assertEqual(run["objects"], 0)
+        self.assertEqual(owned, [("bench-test", "rack-bench/test/0-0.bin")])
+
     def test_part_size_flag_reaches_transfer_windows_both_directions(self):
         records = self.reports()
         self.assertTrue(all(c["part_size"] == 64 * transfer.MIB for c in self.calls))
