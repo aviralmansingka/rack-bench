@@ -108,6 +108,26 @@ class SigningVectors(unittest.TestCase):
         with self.assertRaises(ValueError):
             s3.sign_headers(s3.Credentials("key", "secret"), "GET", "/", (),
                             {}, "UNSIGNED-PAYLOAD", "auto")
+    def test_gcs_interop_signs_with_bucket_location_scope(self):
+        # Google's XML API accepts AWS4-HMAC-SHA256 from S3 clients; the scope
+        # location may be any string and Google recommends the resource's
+        # location, so gcs signs with the bucket location and the s3 service
+        # name. Golden string freezes the exact derivation; a different
+        # location must derive a different signature.
+        digest = hashlib.sha256(b"gcs interop payload").hexdigest()
+        headers = {"host": "storage.googleapis.com", "x-amz-checksum-crc32": "y/Q5Jg=="}
+        signed = s3.sign_headers(s3.Credentials("GOOG1EXAMPLEACCESSID", "goog-secret-key"),
+                                 "PUT", "/bench-gcs/rack-bench/x.bin", (), headers,
+                                 digest, "asia-south1", "20260319T000000Z")
+        self.assertEqual(signed["authorization"],
+                         "AWS4-HMAC-SHA256 Credential=GOOG1EXAMPLEACCESSID/20260319/asia-south1/"
+                         "s3/aws4_request, SignedHeaders=host;x-amz-checksum-crc32;"
+                         "x-amz-content-sha256;x-amz-date, "
+                         "Signature=32d2cd8d4f7c703dcad884aa24bbaf24faf889c42e08f8af8d775e17896a4a58")
+        central = s3.sign_headers(s3.Credentials("GOOG1EXAMPLEACCESSID", "goog-secret-key"),
+                                  "PUT", "/bench-gcs/rack-bench/x.bin", (), headers,
+                                  digest, "us-central1", "20260319T000000Z")
+        self.assertNotEqual(signed["authorization"], central["authorization"])
 
 
 class PayloadTests(unittest.TestCase):
@@ -225,8 +245,21 @@ class PayloadTests(unittest.TestCase):
                          s3.Endpoint("s3.ap-south-1.amazonaws.com", "ap-south-1", False))
         with self.assertRaises(ValueError):
             s3.resolve_endpoint("s3", "bad/region")
+        # GCS interoperability: one global anycast host, path-style addressing,
+        # and GCS-named HMAC credentials; GCS keys have no session token.
+        with patch.dict(os.environ, {"AWS_SESSION_TOKEN": "session"}, clear=True):
+            with self.assertRaisesRegex(s3.CredentialError, "GCS_ACCESS_KEY_ID"):
+                s3.Credentials.from_env("gcs")
+            os.environ["GCS_ACCESS_KEY_ID"] = "GOOG1KEY"
+            with self.assertRaisesRegex(s3.CredentialError, "GCS_SECRET_ACCESS_KEY"):
+                s3.Credentials.from_env("gcs")
+            os.environ["GCS_SECRET_ACCESS_KEY"] = "goog-secret"
+            self.assertEqual(s3.Credentials.from_env("gcs"),
+                             s3.Credentials("GOOG1KEY", "goog-secret"))
+            self.assertEqual(s3.resolve_endpoint("gcs", "asia-south1"),
+                             s3.Endpoint("storage.googleapis.com", "asia-south1", True))
         with self.assertRaises(ValueError):
-            s3.resolve_endpoint("gcs", "auto")
+            s3.resolve_endpoint("gcs", "bad/region")
 
     def test_ipv4_connection_uses_local_timeout(self):
         with patch.object(s3.socket, "getaddrinfo", return_value=[
@@ -418,6 +451,33 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(request["path"], "/key")
         self.assertEqual(request["headers"]["host"], f"bucket.localhost:{self.server.server_port}")
         self.assertIn("/us-east-1/s3/aws4_request", request["headers"]["authorization"])
+
+    def test_gcs_interop_requests_are_path_style_with_location_scope(self):
+        # The gcs provider reuses the unchanged transport: path-style URLs (the
+        # bucket rides in the path, the authority is the endpoint host), GCS-
+        # named env credentials, and the bucket location in the SigV4 scope.
+        # AWS-named variables stay unset to prove the credential source.
+        env = patch.dict(os.environ, {"GCS_ACCESS_KEY_ID": "GOOG1KEY",
+                                      "GCS_SECRET_ACCESS_KEY": "goog-secret"}, clear=True)
+        env.start()
+        self.addCleanup(env.stop)
+        client = s3.S3Client("bench_gcs", "asia-south1", provider="gcs", timeout=2, backoff=0,
+                             endpoint=s3.Endpoint("127.0.0.1", "asia-south1", True,
+                                                  self.server.server_port, False))
+        self.addCleanup(client.close)
+        self.assertEqual((client.provider, client.bucket), ("gcs", "bench_gcs"))
+        payload = self.state["payload"]
+        client.put_object("rack-bench/x.bin", s3.SeededPayload("gcs-roundtrip", 200000))
+        client.get_object("rack-bench/x.bin", byte_range=(0, 99), payload=payload)
+        put, get = self.state["requests"][-2:]
+        for request in (put, get):
+            self.assertEqual(request["path"], "/bench_gcs/rack-bench/x.bin")
+            self.assertEqual(request["headers"]["host"], f"127.0.0.1:{self.server.server_port}")
+            self.assertIn("Credential=GOOG1KEY/", request["headers"]["authorization"])
+            self.assertIn("/asia-south1/s3/aws4_request", request["headers"]["authorization"])
+        os.environ.update(AWS_ACCESS_KEY_ID="key", AWS_SECRET_ACCESS_KEY="secret")
+        with self.assertRaises(ValueError):
+            s3.S3Client("bench_gcs", "us-east-1")  # underscores stay GCS-only
 
     def test_multipart_sequence_etags_checksums_and_completion_xml(self):
         parts = []

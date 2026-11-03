@@ -87,8 +87,11 @@ class BenchTests(unittest.TestCase):
         self.assertEqual(internet.cli.buckets("s3=bench"), {"s3": ("bench",)})
         self.assertEqual(internet.cli.buckets("s3=one,s3=two,r2=r2bench"),
                          {"s3": ("one", "two"), "r2": ("r2bench",)})
+        # GCS bucket names allow underscores; the bench addresses GCS path-style.
+        self.assertEqual(internet.cli.buckets("gcs=bench_gcs"), {"gcs": ("bench_gcs",)})
         for value in ("", "azure=x", "s3=", "s3=bench,", "s3=bench,s3=bench",
-                      "s3=dotted.bucket", "r2=bad..bucket", "r2=127.0.0.1", "s3=a=b"):
+                      "s3=dotted.bucket", "s3=under_score", "gcs=dotted..bucket",
+                      "r2=bad..bucket", "r2=127.0.0.1", "s3=a=b"):
             with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError) as error:
                 internet.cli.buckets(value)
             self.assertIn("bucket", str(error.exception))
@@ -183,6 +186,19 @@ class BenchTests(unittest.TestCase):
                  "source": []} for name in names(("s3", "r2"))])
             self.assertEqual((Path(tmp) / "bench.values.json").read_text(), output.getvalue())
             self.assertIn("SKIP=26", (Path(tmp) / "bench.out").read_text())
+
+    def test_gcs_provider_missing_credentials_envelope(self):
+        # Opt-in gcs runs without GCS-named HMAC credentials SKIP every check
+        # with the same reason shape as missing AWS credentials; nothing runs.
+        with tempfile.TemporaryDirectory() as tmp, redirect_stdout(StringIO()) as output:
+            self.assertEqual(main(["bench", "internet", "--providers", "gcs", "--json",
+                                   "--run-dir", tmp]), 0)
+            document = json.loads(output.getvalue())
+            self.assertIn("SKIP=13", (Path(tmp) / "bench.out").read_text())
+        self.assertEqual(document["results"][0]["checks"], [
+            {"name": name, "status": "skip", "value": None, "expected": None,
+             "detail": "credentials not set: missing environment variable: GCS_ACCESS_KEY_ID",
+             "source": []} for name in names(("gcs",))])
 
     def test_json_file_and_full_stage_dispatch(self):
         with tempfile.TemporaryDirectory() as tmp, redirect_stdout(StringIO()) as output:

@@ -366,6 +366,32 @@ class TransferTests(unittest.TestCase):
         self.assertEqual(json.loads(check.detail)["buckets"], ["bench-a", "bench-b"])
         self.assertIn("buckets=bench-a,bench-b", check.source[0])
 
+    def test_gcs_provider_pins_bucket_location_and_global_endpoint(self):
+        # The gcs provider path selects the bucket location (asia-south1) and
+        # the global interop endpoint; ss anchors use the endpoint host because
+        # GCS is addressed path-style, and prefixes carry the provider/region.
+        env = patch.dict(os.environ, {"GCS_ACCESS_KEY_ID": "GOOG1KEY",
+                                      "GCS_SECRET_ACCESS_KEY": "goog-secret"})
+        env.start()
+        self.addCleanup(env.stop)
+        self.options = Options(providers=("gcs",), buckets={"gcs": "bench-gcs"}, duration=1)
+        self.calls = []
+        records = upload.upload_reports("gcs", self.options, client_factory=lambda *a, **k: self.client,
+                                        window=self.fake_window)
+        self.assertEqual(records[0]["region"], "asia-south1")
+        self.assertEqual(records[0]["endpoint"], "https://storage.googleapis.com")
+        self.assertTrue(records[0]["path_style"])
+        self.assertTrue(all(call["host"] == "storage.googleapis.com" for call in self.calls))
+        self.assertTrue(all("/gcs/asia-south1/transfer/" in call["prefix"] for call in self.calls))
+        check = transfer.transfer_check("gcs", "up", "throughput", self.options, records)
+        self.assertEqual((check.name, check.status), ("internet.gcs.upload.throughput", "pass"))
+        self.assertIn("https://storage.googleapis.com", check.source[0])
+        download.download_reports("gcs", self.options, client_factory=lambda *a, **k: self.client,
+                                  window=self.fake_window)
+        down = transfer.transfer_check("gcs", "down", "throughput", self.options,
+                                       self.options._transfer_reports["gcs"]["down"])
+        self.assertEqual((down.name, down.status), ("internet.gcs.download.throughput", "pass"))
+
     def test_single_bucket_regression_normalized_shape(self):
         # A bare name normalizes to a 1-tuple; single-bucket runs keep today's shape.
         self.assertEqual(self.options.buckets, {"s3": ("bench-test",)})
@@ -845,11 +871,20 @@ class ProcessPoolTransferTests(unittest.TestCase):
         import pickle
         slots = multiprocessing.Array("i", 2)
         stop = multiprocessing.Event()
-        transfer._pool_initialiser((("bucket", self.endpoint, 10, 2, 0),), stop, slots,
+        transfer._pool_initialiser((("bucket", self.endpoint, 10, 2, 0, "s3"),), stop, slots,
                                    2 * 1024 * 1024, None)
         self.assertIsInstance(transfer._POOL_STATE["clients"]["bucket"], S3Client)
         self.assertIs(transfer._POOL_STATE["stop"], stop)
         self.assertIn(os.getpid(), list(slots))
+        # The provider rides the plain config: worker processes resolve GCS-
+        # named credentials exactly like the parent-side gcs clients do.
+        with patch.dict(os.environ, {"GCS_ACCESS_KEY_ID": "GOOG1KEY",
+                                     "GCS_SECRET_ACCESS_KEY": "goog-secret"}, clear=True):
+            transfer._pool_initialiser((("bench_gcs", self.endpoint, 10, 2, 0, "gcs"),), stop, slots,
+                                       2 * 1024 * 1024, None)
+            worker_client = transfer._POOL_STATE["clients"]["bench_gcs"]
+            self.assertEqual(worker_client.credentials.access_key, "GOOG1KEY")
+            self.assertEqual(worker_client.provider, "gcs")
         s3.clear_payload_caches()
         payload = s3.SeededPayload("cap-seed", 6 * 1024 * 1024)
         for chunk_index in range(3):
@@ -860,6 +895,98 @@ class ProcessPoolTransferTests(unittest.TestCase):
                 "one_object": True, "deadline": 1.5, "start": .5, "part_size": 8, "seed": None,
                 "clock": time.monotonic, "bucket": "bucket", "clients": None, "stop": None, "active": None}
         self.assertEqual(pickle.loads(pickle.dumps(task)), task)  # the process-mode task payload
+
+
+class GCSLoopbackS3(WorkerProcessS3):
+    """Loopback XML API for the gcs provider path; also records the auth scope.
+
+    Every reply asks the client to close the connection, so worker threads
+    hold no pooled socket after their window and the suite stays
+    ResourceWarning-clean; pooled keep-alive itself is covered by the
+    transport tests against MockS3."""
+
+    def _record(self):
+        self.server.state.setdefault("requests", []).append(
+            (self.command, self.path, self.headers.get("Authorization", "")))
+
+    def _reply(self, status=200, body=b"", headers=None):
+        self.close_connection = True  # http.client then closes its own socket
+        return super()._reply(status, body, {**(headers or {}), "Connection": "close"})
+
+
+class GCSProviderLoopbackTests(unittest.TestCase):
+    """The gcs provider path end-to-end against a loopback XML-API server:
+    credential and region resolution, real multipart PUTs and verified range
+    GETs, grading, and owned-key cleanup. The loopback endpoint stands in for
+    storage.googleapis.com; no cloud data, and FakeTCP stands in for ss.
+
+    Concurrency 1 keeps windows on the in-process thread executor (the single-
+    stream control group), so the run needs no worker processes; the process-
+    pool gcs config is covered by the pool-initialiser test above."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), GCSLoopbackS3)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join()
+
+    def setUp(self):
+        env = patch.dict(os.environ, {"GCS_ACCESS_KEY_ID": "GOOG1FAKEKEY",
+                                      "GCS_SECRET_ACCESS_KEY": "goog-fake-secret"}, clear=True)
+        env.start()
+        self.addCleanup(env.stop)
+        self.addCleanup(s3.clear_payload_caches)
+        self.options = Options(providers=("gcs",), buckets={"gcs": "bench-gcs"},
+                               duration=1, concurrent=1, object_size=1, part_size=8)
+        # A known run-shared seed: the loopback server serves the exact bytes
+        # the seeded payloads generate, so range GETs verify end-to-end.
+        self.options._internet_seed = "gcs-e2e-seed"
+        self.server.state = {"payload": s3.SeededPayload("gcs-e2e-seed", transfer.MIB),
+                             "requests": []}
+
+    def test_upload_download_and_cleanup_through_gcs_provider(self):
+        def factory(bucket, region, *, provider, **kwargs):
+            self.assertEqual((bucket, region, provider), ("bench-gcs", "asia-south1", "gcs"))
+            return S3Client(bucket, region, provider=provider, timeout=10, backoff=0,
+                            endpoint=s3.Endpoint("127.0.0.1", region, True,
+                                                 self.server.server_port, False))
+
+        def window(client, **kwargs):
+            kwargs.setdefault("tcp_factory", FakeTCP)
+            return transfer.transfer_window(client, **kwargs)
+
+        uploads = upload.upload_reports("gcs", self.options, client_factory=factory, window=window)
+        self.assertEqual(uploads[0]["region"], "asia-south1")
+        self.assertEqual(uploads[0]["endpoint"], "https://storage.googleapis.com")
+        up = transfer.transfer_check("gcs", "up", "throughput", self.options, uploads)
+        self.assertEqual((up.name, up.status), ("internet.gcs.upload.throughput", "pass"))
+        self.assertIn("multipart PUT https://storage.googleapis.com", up.source[0])
+        downloads = download.download_reports("gcs", self.options, client_factory=factory, window=window)
+        down = transfer.transfer_check("gcs", "down", "throughput", self.options, downloads)
+        self.assertEqual((down.name, down.status), ("internet.gcs.download.throughput", "pass"))
+        self.assertIsNotNone(json.loads(down.detail)["download_to_upload_ratio"])
+        # Every observed request is path-style (/bench-gcs/<key>) and carries
+        # the bucket location in the SigV4 credential scope.
+        self.assertTrue(self.server.state["requests"])
+        for method, path, authorization in self.server.state["requests"]:
+            self.assertTrue(path.startswith("/bench-gcs/"), path)
+            self.assertIn("Credential=GOOG1FAKEKEY/", authorization)
+            self.assertIn("/asia-south1/s3/aws4_request", authorization)
+        objects = uploads[0]["objects"]
+        self.assertTrue(objects)
+        self.assertTrue(all(obj["bucket"] == "bench-gcs" and obj["payload"]["seed"] == "gcs-e2e-seed"
+                            for obj in objects))
+        transfer.cleanup(self.options)
+        self.assertEqual(uploads[0]["cleanup"], "deleted exact owned keys")
+        deletes = sorted(path for method, path, _ in self.server.state["requests"]
+                         if method == "DELETE" and "uploadId" not in path)
+        self.assertEqual(deletes, sorted(f"/bench-gcs/{obj['key']}" for obj in objects))
 
 
 class TCPTests(unittest.TestCase):
@@ -924,6 +1051,19 @@ class TCPTests(unittest.TestCase):
                 self.assertEqual((check.status, check.value, check.expected), (status, value, None))
                 if value == 1200:
                     self.assertIn("possible PMTUD blackhole", check.detail)
+
+    def test_pmtud_unavailable_ping_is_skip_not_crash(self):
+        # A missing/misbehaving ping must SKIP with the tool reason, never
+        # crash the collection (gcs reaches this path once credentials exist).
+        options = Options(providers=("gcs",))
+        with patch.dict(os.environ, {"GCS_ACCESS_KEY_ID": "GOOG1",
+                                     "GCS_SECRET_ACCESS_KEY": "s"}, clear=True):
+            command = Mock(side_effect=tcp.Unavailable("ping -4 -n -M do -c 2 -W 1 -s 1472 storage.googleapis.com",
+                                                       "ping exited 64: usage error"))
+            check = tcp.pmtud_probe("gcs", options, command=command)
+        self.assertEqual((check.status, check.value), ("skip", None))
+        self.assertIn("no passing DF probe", check.detail)
+        self.assertIn("ping exited 64: usage error", check.detail)
 
     def test_tcp_window_brackets_with_owned_snapshots_and_no_remote_io(self):
         text = (FIXTURES / "internet-ss.txt").read_text().replace("127.0.0.1:35823", f'127.0.0.1:35823 users:(("python",pid={os.getpid()},fd=4))')

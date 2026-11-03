@@ -171,11 +171,27 @@ class LatencyTests(unittest.TestCase):
         self.assertEqual([r["status"] for r in regions], ["pass", "skip", "skip"])
         self.assertIn("https://test.r2.cloudflarestorage.com/bench-r2/", check.source[0])
 
-    def test_gcs_and_warp_are_explicitly_unsupported(self):
-        self.assertEqual(self.probe("gcs").status, "skip")
+    def test_gcs_provider_gated_credentials_and_path_style_urls(self):
+        # GCS is now an implemented, opt-in provider: missing GCS-named HMAC
+        # credentials SKIP with a reason exactly like S3/R2; with credentials
+        # the probe runs and builds path-style URLs on the global endpoint.
+        with patch.dict(os.environ, {}, clear=True):
+            check = self.probe("gcs")
+            self.assertEqual(check.status, "skip")
+            self.assertIn("credentials not set: missing environment variable: GCS_ACCESS_KEY_ID",
+                          check.detail)
+            self.factory.assert_not_called()
         self.options.tool = "warp"
         self.assertIn("Warp execution not implemented", self.probe().detail)
         self.factory.assert_not_called()
+        self.options.tool = "stdlib"
+        self.options.buckets = {"gcs": "bench-gcs"}
+        with patch.dict(os.environ, {"GCS_ACCESS_KEY_ID": "GOOGTEST",
+                                     "GCS_SECRET_ACCESS_KEY": "test"}):
+            check = self.probe("gcs")
+        self.assertEqual(check.status, "pass")
+        self.assertIn("https://storage.googleapis.com/bench-gcs/", check.source[0])
+        self.assertIn("/gcs/asia-south1/latency.bin", check.source[0])
 
     def test_part_two_dependencies_do_not_launch_hidden_uploads(self):
         for suffix, needed in (("download.throughput", "upload objects"),

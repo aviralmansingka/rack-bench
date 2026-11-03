@@ -22,7 +22,8 @@ from rack_bench.bench.internet import path
 from rack_bench.bench.internet.targets import targets
 
 FIXTURES = Path(__file__).parent / "fixtures"
-ENV = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test", "R2_ACCOUNT_ID": "test"}
+ENV = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test", "R2_ACCOUNT_ID": "test",
+       "GCS_ACCESS_KEY_ID": "GOOGTEST", "GCS_SECRET_ACCESS_KEY": "test"}
 MTR = (FIXTURES / "internet-mtr.txt").read_text()
 TRACE = (FIXTURES / "internet-traceroute.txt").read_text()
 DEST = "  4. AS16509 strange.aws-name.example (192.0.2.4) 0.0% 10 25.0 25.0 20.0 30.0 1.0\n"
@@ -121,6 +122,40 @@ class PathTests(unittest.TestCase):
         self.assertTrue(all(t["reason"] for t in r2[1:]))
         override = targets("s3", Options(profile="certify", regions={"s3": "eu-west-1"}))
         self.assertEqual(len(override), 1)
+
+    def test_gcs_global_endpoint_bucket_location_and_single_band(self):
+        gcs = targets("gcs", Options())
+        self.assertEqual(gcs, [{"region": "asia-south1", "endpoint": "https://storage.googleapis.com",
+                                "host": "storage.googleapis.com", "path_style": True,
+                                "band": "nearest", "runs": 1, "reason": None}])
+        # Certify adds no far bands: the interop endpoint is one global anycast
+        # host, so a second band would re-measure the identical frontend.
+        certify = targets("gcs", Options(profile="certify"))
+        self.assertEqual([t["region"] for t in certify], ["asia-south1"])
+        self.assertEqual([t["band"] for t in certify], ["nearest"])
+        self.assertEqual(certify[0]["runs"], 3)
+        self.assertEqual(targets("gcs", Options(regions={"gcs": "us-central1"}))[0]["region"],
+                         "us-central1")
+
+    def test_gcs_rtt_sanity_uses_anycast_edge_band(self):
+        # storage.googleapis.com is global anycast: from Chennai the frontend
+        # may land in the Chennai edge POP or the Mumbai region, so the band
+        # spans 5-35 ms. In band passes; a distant POP warns; a pinned location
+        # without a reference band stays ungradable, never a fabricated pass.
+        def probe(stdout, options=None):
+            run = Mock(return_value=SimpleNamespace(stdout=stdout, stderr="", returncode=0))
+            return path.path_probe("gcs", "rtt_sanity", options or Options(), run=run,
+                                   which=lambda name: "/usr/bin/" + name, resolve=self.resolve)
+        check = probe(MTR + DEST)
+        self.assertEqual(check.status, "pass")
+        self.assertEqual(check.value, "asia-south1: 25 ms (reference 5-35 ms)")
+        self.resolve.assert_called_with("storage.googleapis.com", 443,
+                                        socket.AF_INET, socket.SOCK_STREAM)
+        self.assertEqual(probe(MTR + DEST.replace("25.0", "4.")).status, "warn")  # below the edge band
+        self.assertEqual(probe(MTR + DEST.replace("25.0", "300.0")).status, "warn")
+        pinned = probe(MTR + DEST, Options(regions={"gcs": "us-central1"}))
+        self.assertEqual(pinned.status, "skip")
+        self.assertIn("RTT ungradable", pinned.detail)
 
     def test_context_missing_credentials_no_io(self):
         with patch.dict(os.environ, {}, clear=True):
