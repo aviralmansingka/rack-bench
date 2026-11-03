@@ -32,7 +32,7 @@ import zlib
 from rack_bench.bench import internet, runner
 from rack_bench.bench.internet import download, s3client as s3, stats, targets, tcp, transfer, upload
 from rack_bench.bench.internet.latency import OBJECT_SIZE as LATENCY_SIZE
-from rack_bench.bench.internet.cli import Options, before_run, part_size_mib
+from rack_bench.bench.internet.cli import Options, add_arguments, before_run, options_from_args, part_size_mib
 from rack_bench.bench.internet.s3client import S3Client, Timing, TransportError
 from rack_bench.common.models import Check
 
@@ -305,6 +305,41 @@ class TransferTests(unittest.TestCase):
         self.assertEqual(len(objects), 1)
         self.assertEqual(run["incomplete_objects"], 0)
         self.assertEqual(run["bytes"], 8)
+
+    def test_upload_modes_land_in_records_samples_and_check_detail(self):
+        # Quick 32 MiB objects under the 64 MiB part budget upload as single
+        # PUTs; the mode lands on samples, object records and the check detail.
+        def real_window(client, **kwargs):
+            return transfer.transfer_window(client, clock=Clock(), tcp_factory=FakeTCP,
+                                            pool_factory=transfer._thread_pool_factory, **kwargs)
+        self.baseline()
+        records = upload.upload_reports("s3", self.options, client_factory=lambda *a, **k: self.client,
+                                        window=real_window)
+        bulk = next(r for r in records[0]["runs_detail"] if r["kind"] == "bulk")
+        self.assertTrue(bulk["samples"])
+        self.assertTrue(all(s["upload_mode"] == "put" for r in records[0]["runs_detail"] for s in r["samples"]))
+        self.assertTrue(all(obj["upload_mode"] == "put" for obj in records[0]["objects"]))
+        check = transfer.transfer_check("s3", "up", "throughput", self.options, records)
+        detail = json.loads(check.detail)
+        self.assertEqual(detail["upload_modes"], {"put": len(bulk["samples"])})
+        self.assertEqual(detail["selection"],
+                         "nearest; median of 3 by MiB/s per concurrency, scalar is largest concurrency; all runs retained")
+
+    def test_upload_mode_flag_default_and_window_plumbing(self):
+        self.assertEqual(Options().upload_mode, "auto")
+        self.reports()
+        self.assertTrue(all(c["upload_mode"] == "auto" for c in self.calls))
+        self.options = Options(providers=("s3",), buckets={"s3": "bench-test"}, duration=1, upload_mode="multipart")
+        self.reports()
+        self.assertTrue(all(c["upload_mode"] == "multipart" for c in self.calls))
+
+    def test_upload_mode_cli_parse_and_bounds(self):
+        parser = argparse.ArgumentParser()
+        add_arguments(parser)
+        self.assertEqual(options_from_args(parser.parse_args([])).upload_mode, "auto")
+        self.assertEqual(options_from_args(parser.parse_args(["--upload-mode", "multipart"])).upload_mode, "multipart")
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(["--upload-mode", "put"])
 
     def test_part_size_kwarg_sizes_multipart_and_range_gets(self):
         seen = {}
