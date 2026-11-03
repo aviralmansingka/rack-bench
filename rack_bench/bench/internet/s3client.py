@@ -687,8 +687,10 @@ class S3Client:
         if not 1 <= len(parts) <= 10000 or [part[0] for part in parts] != list(range(1, len(parts) + 1)):
             raise ValueError("completion requires 1..10000 consecutive parts from 1")
         for number, etag, crc32 in parts:
-            if not etag or crc32 is not None and len(base64.b64decode(crc32, validate=True)) != 4:
-                raise ValueError("completion requires ETags and base64 CRC32 digests where sent")
+            if not etag or (crc32 is None and self.s3_checksums):
+                raise ValueError("completion requires ETags and base64 CRC32 digests")
+            if crc32 is not None and len(base64.b64decode(crc32, validate=True)) != 4:
+                raise ValueError("completion CRC32 must be base64 of 4 bytes")
             part = ET.SubElement(root, "Part")
             ET.SubElement(part, "PartNumber").text = str(number)
             ET.SubElement(part, "ETag").text = etag
