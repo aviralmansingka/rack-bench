@@ -119,7 +119,8 @@ class FakeClient:
 
 class TransferTests(unittest.TestCase):
     def setUp(self):
-        env = patch.dict(os.environ, {"AWS_ACCESS_KEY_ID": "fake", "AWS_SECRET_ACCESS_KEY": "fake", "R2_ACCOUNT_ID": "fake"}, clear=True)
+        env = patch.dict(os.environ, {"AWS_ACCESS_KEY_ID": "fake", "AWS_SECRET_ACCESS_KEY": "fake", "R2_ACCOUNT_ID": "fake",
+                                      "GCS_ACCESS_KEY_ID": "fake", "GCS_SECRET_ACCESS_KEY": "fake"}, clear=True)
         env.start()
         self.addCleanup(env.stop)
         self.options = Options(providers=("s3",), buckets={"s3": "bench-test"}, duration=1)
@@ -772,6 +773,34 @@ class ProcessPoolTransferTests(unittest.TestCase):
         self.assertEqual(len(run["samples"]), 4)
         self.assertEqual(run["errors"], [])
 
+    def test_gcs_worker_processes_upload_and_stream_verified_ranges(self):
+        # End-to-end gcs provider path through the real worker processes:
+        # children build gcs clients (GCS env names, location-scoped signing,
+        # no flexible checksums), upload parts, then read verified ranges back.
+        env = patch.dict(os.environ, {"GCS_ACCESS_KEY_ID": "fake", "GCS_SECRET_ACCESS_KEY": "fake"})
+        env.start()
+        self.addCleanup(env.stop)
+        endpoint = s3.Endpoint("127.0.0.1", "asia-south1", True, self.server.server_port, False)
+        client = S3Client("bucket", "asia-south1", provider="gcs", timeout=10, backoff=0,
+                          endpoint=endpoint)
+        self.addCleanup(client.close)
+        self.server.state = {"payload": s3.SeededPayload("gcs-seed", self.size), "requests": []}
+        owned = []
+        run, objects = transfer.transfer_window(client, direction="up", prefix="gcs/", concurrency=2,
+                                                 duration=.05, objects=[], owned=owned, size=self.size,
+                                                 one_object=True, part_size=self.part, seed="gcs-seed",
+                                                 tcp_factory=FakeTCP, host="127.0.0.1", provider="gcs")
+        self.assertEqual(run["status"], "pass")
+        self.assertEqual(run["bytes"], 2 * self.size)
+        self.assertEqual(run["errors"], [])
+        run, completed = transfer.transfer_window(client, direction="down", prefix="unused/",
+                                                   concurrency=2, duration=.05, objects=objects,
+                                                   owned=[], one_object=True, part_size=self.part,
+                                                   tcp_factory=FakeTCP, host="127.0.0.1", provider="gcs")
+        self.assertEqual(run["status"], "pass")
+        self.assertEqual(run["bytes"], 2 * self.size)
+        self.assertEqual(run["errors"], [])
+
     def test_multi_bucket_worker_processes_route_by_recorded_bucket(self):
         # Two loopback roots, one per bucket: worker processes build a client
         # per bucket from the pool initargs, streams shard round-robin, and
@@ -845,7 +874,7 @@ class ProcessPoolTransferTests(unittest.TestCase):
         import pickle
         slots = multiprocessing.Array("i", 2)
         stop = multiprocessing.Event()
-        transfer._pool_initialiser((("bucket", self.endpoint, 10, 2, 0),), stop, slots,
+        transfer._pool_initialiser((("bucket", self.endpoint, 10, 2, 0, "s3"),), stop, slots,
                                    2 * 1024 * 1024, None)
         self.assertIsInstance(transfer._POOL_STATE["clients"]["bucket"], S3Client)
         self.assertIs(transfer._POOL_STATE["stop"], stop)
