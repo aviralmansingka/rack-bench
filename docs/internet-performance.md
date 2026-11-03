@@ -126,7 +126,7 @@ exercises **ingress**.
 | --- | --- | --- |
 | AWS S3 | S3 | warp or stdlib client → `s3.amazonaws.com` |
 | Cloudflare R2 | S3-compatible | `https://<account>.r2.cloudflarestorage.com` |
-| GCS | JSON/XML | S3-interop endpoint + HMAC keys, or `gcloud perfdiag` |
+| GCS | JSON/XML | stdlib client → `storage.googleapis.com` interop, opt-in (`--providers gcs`), or `gcloud perfdiag` |
 
 Notes:
 
@@ -135,7 +135,9 @@ Notes:
 - S3: GET tests incur S3 egress + request costs.
 - GCS interop = XML API + HMAC-SHA256, supports multipart upload; some
   S3 semantics differ (V4 signing details, no chunked
-  transfer-encoding).
+  transfer-encoding). The bench implements this path as an opt-in
+  best-effort provider (`--providers gcs`; see
+  `docs/bench-internet.md` §11).
 
 ### Tool recommendation: Warp (MinIO), single binary, for all three
 
@@ -260,8 +262,9 @@ can verify it.
 R2 because it is natively S3-compatible, has a Cloudflare Chennai POP
 (sub-10 ms edge RTT), and zero egress fees make regression testing
 free; S3 as the authoritative provider. GCS stays in this doc as a
-documented extension (S3-interop endpoint or `gcloud perfdiag`) but is
-not in the first implementation.
+documented extension (S3-interop endpoint or `gcloud perfdiag`); the
+bench now implements the interop path as an opt-in best-effort provider
+(`--providers gcs`, see `docs/bench-internet.md`).
 
 ---
 

@@ -367,12 +367,16 @@ usable, measured end-to-end; NIC link-up time; time-to-job-ready.
 
 ### Internet — external network
 
-`rack-bench bench internet` measures single-host north-south performance to S3
-and R2 using an IPv4-only, stdlib S3 client. All 13 checks per provider are
-wired: path AS/hops/RTT, DNS, idle TTFB, upload/download MiB/s and obj/s, loaded
-TTFB, PMTUD, TCP retransmits, and summary. Single-stream rates live in
-throughput detail, not a new check name. GCS interoperability and Warp execution
-remain unsupported and SKIP explicitly.
+`rack-bench bench internet` measures single-host north-south performance to
+S3 and R2 (and GCS, opt-in) using an IPv4-only, stdlib S3 client. All 13
+checks per provider are wired: path AS/hops/RTT, DNS, idle TTFB,
+upload/download MiB/s and obj/s, loaded TTFB, PMTUD, TCP retransmits, and
+summary. Single-stream rates live in throughput detail, not a new check
+name. GCS is best-effort behind `--providers gcs`: it rides the S3 XML
+interoperability endpoint with `GCS_ACCESS_KEY_ID` and
+`GCS_SECRET_ACCESS_KEY` HMAC keys, pinned to the bucket location (default
+`asia-south1`), and is loopback-tested only pending a live certification
+run. Warp execution remains unsupported and SKIPs explicitly.
 
 **PASS means observed, not certified.** `expected` stays `null` until the
 certification profile schema exists. Only path RTT sanity can WARN; instability,
@@ -436,7 +440,7 @@ Internet flags follow `bench internet`, not the `bench` parent.
 
 | Flag                            | Description                                           |
 | ------------------------------- | ----------------------------------------------------- |
-| `--providers s3,r2`             | Unique providers: `s3`, `r2`, `gcs` (GCS unsupported) |
+| `--providers s3,r2`             | Unique providers: `s3`, `r2`, `gcs` (GCS opt-in)      |
 | `--directions up,down`          | Selected directions; down needs this run's uploads    |
 | `--profile quick\|certify`      | Default `quick`; certify requires `--yes`             |
 | `--regions s3=us-east-1,...`    | Override the tiered provider region matrix            |
@@ -553,8 +557,9 @@ the first implementation:
   network segmentation.
 
 Internet egress/ingress performance to public object stores (S3, R2, GCS) is
-outside ClusterMAX's scope entirely. `bench internet` now measures it for S3 and
-R2; the longer `smoke internet` soak remains future work.
+outside ClusterMAX's scope entirely. `bench internet` now measures it for S3
+and R2, and for GCS behind `--providers gcs`; the longer `smoke internet`
+soak remains future work.
 
 ## Certification flow
 
