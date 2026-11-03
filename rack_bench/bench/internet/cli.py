@@ -8,6 +8,7 @@ from rack_bench.common.output import show_cost_estimate
 
 PROVIDERS = ("s3", "r2", "gcs")
 DIRECTIONS = ("up", "down")
+UPLOAD_MODES = ("auto", "multipart")
 
 
 @dataclass
@@ -21,6 +22,7 @@ class Options:
     duration: int | None = None  # seconds per test; defaults depend on profile
     object_size: int | None = None  # MiB per uploaded object; default depends on profile
     part_size: int | None = None  # MiB per multipart part / range GET; default 64
+    upload_mode: str = "auto"  # auto: one PUT for single-part-sized objects; multipart forces the 3-request pattern
     tool: str = "stdlib"
     keep_data: bool = False
     yes: bool = False
@@ -33,6 +35,8 @@ class Options:
             self.duration = 300 if self.profile == "certify" else 60
         if self.part_size is None:
             self.part_size = 64  # MiB; see transfer.PART_SIZE for the timeout rationale
+        if self.upload_mode not in UPLOAD_MODES:
+            raise ValueError(f"upload_mode must be one of: {','.join(UPLOAD_MODES)}")
         # Library callers may pass a bare name; normalize to the ordered tuple
         # every consumer reads (targets.bucket_names).
         self.buckets = {provider: (names,) if isinstance(names, str) else tuple(names)
@@ -151,6 +155,10 @@ def add_arguments(parser):
                         help="uploaded object size in MiB (default: quick 32, certify 1024)")
     parser.add_argument("--part-size", type=part_size_mib, metavar="MIB",
                         help="multipart part / range GET size in MiB (default: 64; 8..512)")
+    parser.add_argument("--upload-mode", choices=UPLOAD_MODES, default="auto",
+                        help="auto uploads single-part-sized objects as one plain PutObject, "
+                             "multipart forces initiate/part/complete for every object "
+                             "(forced comparisons; default: auto)")
     parser.add_argument("--tool", choices=("stdlib", "warp"), default="stdlib")
     parser.add_argument("--keep-data", action="store_true", help="retain objects under this run's rack-bench/ prefix")
     parser.add_argument("--yes", action="store_true", help="accept the certify reference cost estimate")
