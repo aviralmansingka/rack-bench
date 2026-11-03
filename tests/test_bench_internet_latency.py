@@ -171,11 +171,22 @@ class LatencyTests(unittest.TestCase):
         self.assertEqual([r["status"] for r in regions], ["pass", "skip", "skip"])
         self.assertIn("https://test.r2.cloudflarestorage.com/bench-r2/", check.source[0])
 
-    def test_gcs_and_warp_are_explicitly_unsupported(self):
-        self.assertEqual(self.probe("gcs").status, "skip")
+    def test_gcs_interop_credentials_and_path_style_baseline(self):
+        # GCS is implemented: without its HMAC variables every gcs check SKIPs
+        # naming them; with them, the baseline runs path-style at the bucket's
+        # location through the same client contract.
+        check = self.probe("gcs")
+        self.assertEqual(check.status, "skip")
+        self.assertIn("GCS_ACCESS_KEY_ID", check.detail)
+        self.factory.assert_not_called()
+        self.options.buckets["gcs"] = "bench-gcs"
+        with patch.dict(os.environ, {"GCS_ACCESS_KEY_ID": "GOOG1", "GCS_SECRET_ACCESS_KEY": "gcs-secret"}):
+            check = self.probe("gcs")
+        self.assertEqual(check.status, "pass")
+        self.factory.assert_called_once_with("bench-gcs", "asia-south1", provider="gcs")
+        self.assertIn("https://storage.googleapis.com/bench-gcs/", check.source[0])
         self.options.tool = "warp"
         self.assertIn("Warp execution not implemented", self.probe().detail)
-        self.factory.assert_not_called()
 
     def test_part_two_dependencies_do_not_launch_hidden_uploads(self):
         for suffix, needed in (("download.throughput", "upload objects"),

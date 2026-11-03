@@ -53,8 +53,11 @@ def latency_probe(provider, options, *, client_factory=S3Client, cpu_clock=time.
         key = f'{prefix}{provider}/{target["region"]}/latency.bin'
         payload = SeededPayload(key, OBJECT_SIZE)
         record.update(key=key, seed=payload.seed, size=payload.size, chunk_size=payload.chunk_size)
-        host = target["host"] if provider == "r2" else f'{bucket}.{target["host"]}'
-        url = f'https://{host}/' + (f'{bucket}/' if provider == "r2" else "") + key
+        # R2 and GCS interop requests are path-style; the endpoint host carries
+        # no bucket, so the URL spells the bucket into the path.
+        path_style = provider in ("r2", "gcs")
+        host = target["host"] if path_style else f'{bucket}.{target["host"]}'
+        url = f'https://{host}/' + (f'{bucket}/' if path_style else "") + key
         sources.append(f"PUT {url}; {target['runs']} x {SAMPLES} sequential GETs; " +
                        ("retain (--keep-data)" if options.keep_data else f"DELETE {url}"))
         client = None

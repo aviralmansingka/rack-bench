@@ -120,7 +120,8 @@ def part_size_mib(value):
     except ValueError:
         raise argparse.ArgumentTypeError("expected a positive integer") from None
     if not 8 <= number <= 512:
-        raise argparse.ArgumentTypeError("expected 8..512 (MiB); every non-final part must stay above S3's 5 MiB minimum")
+        raise argparse.ArgumentTypeError(
+            "expected 8..512 (MiB); every non-final part must stay above the 5 MiB minimum S3 and GCS enforce")
     return number
 
 

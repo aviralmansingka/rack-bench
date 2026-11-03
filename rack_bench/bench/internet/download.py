@@ -43,7 +43,8 @@ def download_reports(provider, options, *, client_factory=S3Client, window=trans
                                 concurrency=concurrency, duration=options.duration,
                                 objects=upload["objects"], owned=[], one_object=upload["band"] == "light",
                                 part_size=options.part_size * MIB, buckets=names, clients=clients,
-                                host=upload["host"] if provider == "r2" else f'{names[0]}.{upload["host"]}')
+                                provider=provider,
+                                host=upload["host"] if provider in ("r2", "gcs") else f'{names[0]}.{upload["host"]}')
                 run.update(kind=kind, run=index)
                 record["runs_detail"].append(run)
         for client in clients.values():
