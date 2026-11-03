@@ -225,8 +225,41 @@ class PayloadTests(unittest.TestCase):
                          s3.Endpoint("s3.ap-south-1.amazonaws.com", "ap-south-1", False))
         with self.assertRaises(ValueError):
             s3.resolve_endpoint("s3", "bad/region")
+        # GCS's XML interoperability API is global anycast and signs with auto.
+        self.assertEqual(s3.resolve_endpoint("gcs", "asia-south1"),
+                         s3.Endpoint("storage.googleapis.com", "auto", True))
         with self.assertRaises(ValueError):
-            s3.resolve_endpoint("gcs", "auto")
+            s3.resolve_endpoint("gcs", "bad/location")
+
+    def test_gcs_credentials_are_env_only_and_have_no_session_token(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(s3.CredentialError, "GCS_ACCESS_KEY_ID"):
+                s3.Credentials.from_env("gcs")
+            os.environ["GCS_ACCESS_KEY_ID"] = "gcs-key"
+            with self.assertRaisesRegex(s3.CredentialError, "GCS_SECRET_ACCESS_KEY"):
+                s3.Credentials.from_env("gcs")
+            os.environ["GCS_SECRET_ACCESS_KEY"] = "gcs-secret"
+            # S3/R2 variables must not be mistaken for GCS credentials.
+            with self.assertRaises(s3.CredentialError):
+                s3.Credentials.from_env()
+            credentials = s3.Credentials.from_env("gcs")
+        self.assertEqual((credentials.access_key, credentials.secret_key),
+                         ("gcs-key", "gcs-secret"))
+        self.assertIsNone(credentials.token)
+
+    def test_gcs_signing_scope_golden_string(self):
+        # Google's S3-compatible samples sign the credential scope as
+        # <date>/auto/s3/aws4_request; the service segment stays s3.
+        signed = s3.sign_headers(
+            s3.Credentials("key", "secret"), "GET", "/bucket/key", (),
+            {"host": "storage.googleapis.com"}, hashlib.sha256(b"").hexdigest(),
+            "auto", timestamp="20260101T000000Z")
+        self.assertEqual(
+            signed["authorization"],
+            "AWS4-HMAC-SHA256 Credential=key/20260101/auto/s3/aws4_request, "
+            "SignedHeaders=host;x-amz-content-sha256;x-amz-date, "
+            "Signature=4eb3aec615d15370778dc3c5758ed35d124647425bec4057b0ed9f81f45879bc")
+        self.assertNotIn("x-amz-security-token", signed)
 
     def test_ipv4_connection_uses_local_timeout(self):
         with patch.object(s3.socket, "getaddrinfo", return_value=[
@@ -304,8 +337,9 @@ class MockS3(BaseHTTPRequestHandler):
         if self.command == "PUT" or xml:
             expected_crc = base64.b64encode(crc.to_bytes(4, "big")).decode()
             record["crc32"] = expected_crc
+            sent_crc = headers.get("x-amz-checksum-crc32")
             if ("content-md5" in headers or
-                    self.command == "PUT" and headers.get("x-amz-checksum-crc32") != expected_crc or
+                    self.command == "PUT" and sent_crc is not None and sent_crc != expected_crc or
                     state.get("reject_digest")):
                 self.reply(400, b"<Error><Code>InvalidDigest</Code></Error>")
                 return
@@ -378,7 +412,9 @@ class TransportTests(unittest.TestCase):
 
     def setUp(self):
         self.env = patch.dict(os.environ, {"AWS_ACCESS_KEY_ID": "key",
-                             "AWS_SECRET_ACCESS_KEY": "secret", "AWS_SESSION_TOKEN": "token"})
+                             "AWS_SECRET_ACCESS_KEY": "secret", "AWS_SESSION_TOKEN": "token",
+                             "GCS_ACCESS_KEY_ID": "gcs-key",
+                             "GCS_SECRET_ACCESS_KEY": "gcs-secret"})
         self.env.start()
         self.addCleanup(self.env.stop)
         self.state = {"counts": Counter(), "requests": [], "max_read": 0,
@@ -388,6 +424,60 @@ class TransportTests(unittest.TestCase):
                                   endpoint=s3.Endpoint("127.0.0.1", "auto", True,
                                                        self.server.server_port, False))
         self.addCleanup(self.client.close)
+
+    def gcs_client(self):
+        return s3.S3Client(
+            "bucket", "asia-south1", provider="gcs", timeout=2, backoff=0,
+            endpoint=s3.Endpoint("127.0.0.1", "auto", True,
+                                 self.server.server_port, False))
+
+    def test_gcs_put_omits_flexible_checksum_and_signs_auto_scope(self):
+        client = self.gcs_client()
+        self.addCleanup(client.close)
+        client.credentials = s3.Credentials("key", "secret")
+        client.put_object("key", s3.SeededPayload("gcs-put", 123))
+        request = self.state["requests"][0]
+        self.assertNotIn("x-amz-checksum-crc32", request["headers"])
+        self.assertNotIn("x-amz-checksum-algorithm", request["headers"])
+        self.assertNotIn("x-amz-security-token", request["headers"])
+        self.assertIn("/auto/s3/aws4_request", request["headers"]["authorization"])
+        self.assertEqual(request["path"], "/bucket/key")
+
+    def test_gcs_multipart_omits_checksum_negotiation_and_completion_fields(self):
+        client = self.gcs_client()
+        self.addCleanup(client.close)
+        client.credentials = s3.Credentials("key", "secret")
+        client.multipart_upload("multi", s3.SeededPayload("gcs-multi", 5 * 1024**2 + 99),
+                                part_size=5 * 1024**2)
+        requests = self.state["requests"]
+        self.assertEqual([r["method"] for r in requests], ["POST", "PUT", "PUT", "POST"])
+        self.assertNotIn("x-amz-checksum-algorithm", requests[0]["headers"])
+        self.assertNotIn("x-amz-checksum-type", requests[0]["headers"])
+        self.assertTrue(all("x-amz-checksum-crc32" not in r["headers"] for r in requests[1:3]))
+        root = ET.fromstring(requests[-1]["body"])
+        self.assertEqual([part.findtext("ChecksumCRC32") for part in root], [None, None])
+        self.assertIn("/auto/s3/aws4_request", requests[-1]["headers"]["authorization"])
+
+    def test_gcs_part_size_bounds_match_documented_s3_limits(self):
+        client = self.gcs_client()
+        self.addCleanup(client.close)
+        client.credentials = s3.Credentials("key", "secret")
+        for size in (5 * 1024**2 - 1, 5 * 1024**3 + 1):
+            with self.subTest(part_size=size), \
+                    self.assertRaisesRegex(ValueError, "5 MiB..5 GiB"):
+                client.multipart_upload("key", s3.SeededPayload("x", 123), part_size=size)
+        self.assertEqual(self.state["requests"], [])  # rejected before any I/O
+
+    def test_gcs_range_get_is_inclusive_and_verified(self):
+        client = self.gcs_client()
+        self.addCleanup(client.close)
+        client.credentials = s3.Credentials("key", "secret")
+        response = client.get_object("key", byte_range=(65000, 65009),
+                                     payload=self.state["payload"])
+        self.assertEqual(response.status, 206)
+        self.assertEqual(response.timing.bytes_received, 10)
+        request = self.state["requests"][0]
+        self.assertEqual(request["headers"]["range"], "bytes=65000-65009")
 
     def test_put_shapes_auth_and_checksums(self):
         progress = []

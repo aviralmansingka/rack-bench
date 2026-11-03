@@ -73,6 +73,19 @@ class BenchTests(unittest.TestCase):
         self.assertTrue(run.call_args.kwargs["show_command"])
         self.assertTrue(run.call_args.kwargs["quiet"])
 
+    def test_gcs_stays_opt_in_and_default_providers_are_unchanged(self):
+        parser = argparse.ArgumentParser()
+        internet.add_arguments(parser)
+        self.assertEqual(parser.parse_args([]).providers, ("s3", "r2"))
+        self.assertEqual(parser.parse_args(["--providers", "gcs"]).providers, ("gcs",))
+        self.assertEqual(parser.parse_args(["--providers", "gcs,s3"]).providers, ("gcs", "s3"))
+        self.assertEqual(parser.parse_args(["--regions", "gcs=asia-south1"]).regions,
+                         {"gcs": "asia-south1"})
+        self.assertEqual(parser.parse_args(["--buckets", "gcs=bench-gcs"]).buckets,
+                         {"gcs": ("bench-gcs",)})
+        # GCS has no virtual-hosted TLS bucket restriction.
+        self.assertEqual(internet.cli.buckets("gcs=bench.example"), {"gcs": ("bench.example",)})
+
     def test_profile_duration_defaults_and_units(self):
         for flags, seconds in [([], 60), (["--profile", "certify"], 300),
                                (["--duration", "90"], 90), (["--duration", "1h"], 3600),

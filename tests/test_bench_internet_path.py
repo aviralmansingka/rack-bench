@@ -22,7 +22,8 @@ from rack_bench.bench.internet import path
 from rack_bench.bench.internet.targets import targets
 
 FIXTURES = Path(__file__).parent / "fixtures"
-ENV = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test", "R2_ACCOUNT_ID": "test"}
+ENV = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test", "R2_ACCOUNT_ID": "test",
+       "GCS_ACCESS_KEY_ID": "test", "GCS_SECRET_ACCESS_KEY": "test"}
 MTR = (FIXTURES / "internet-mtr.txt").read_text()
 TRACE = (FIXTURES / "internet-traceroute.txt").read_text()
 DEST = "  4. AS16509 strange.aws-name.example (192.0.2.4) 0.0% 10 25.0 25.0 20.0 30.0 1.0\n"
@@ -121,6 +122,20 @@ class PathTests(unittest.TestCase):
         self.assertTrue(all(t["reason"] for t in r2[1:]))
         override = targets("s3", Options(profile="certify", regions={"s3": "eu-west-1"}))
         self.assertEqual(len(override), 1)
+
+    def test_gcs_keeps_one_anycast_target_and_grades_its_bucket_location(self):
+        gcs = targets("gcs", Options(profile="certify"))
+        self.assertEqual([t["region"] for t in gcs], ["asia-south1"])  # no far bands
+        self.assertEqual(gcs[0]["endpoint"], "https://storage.googleapis.com")
+        self.assertTrue(gcs[0]["path_style"])
+        self.assertEqual(gcs[0]["runs"], 3)
+        self.assertIsNone(gcs[0]["reason"])
+        check = path.path_probe("gcs", "rtt_sanity", self.options, run=self.run,
+                                which=lambda name: "/usr/bin/mtr", resolve=self.resolve)
+        self.assertEqual(check.status, "pass")
+        self.assertEqual(check.value, "asia-south1: 25 ms (reference 20-35 ms)")
+        self.resolve.assert_called_once_with("storage.googleapis.com", 443,
+                                              socket.AF_INET, socket.SOCK_STREAM)
 
     def test_context_missing_credentials_no_io(self):
         with patch.dict(os.environ, {}, clear=True):

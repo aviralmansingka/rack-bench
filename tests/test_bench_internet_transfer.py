@@ -15,6 +15,7 @@ import argparse
 import base64
 from contextlib import redirect_stdout
 from copy import deepcopy
+from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import StringIO
 import json
@@ -119,7 +120,9 @@ class FakeClient:
 
 class TransferTests(unittest.TestCase):
     def setUp(self):
-        env = patch.dict(os.environ, {"AWS_ACCESS_KEY_ID": "fake", "AWS_SECRET_ACCESS_KEY": "fake", "R2_ACCOUNT_ID": "fake"}, clear=True)
+        env = patch.dict(os.environ, {"AWS_ACCESS_KEY_ID": "fake", "AWS_SECRET_ACCESS_KEY": "fake",
+                                      "R2_ACCOUNT_ID": "fake", "GCS_ACCESS_KEY_ID": "fake",
+                                      "GCS_SECRET_ACCESS_KEY": "fake"}, clear=True)
         env.start()
         self.addCleanup(env.stop)
         self.options = Options(providers=("s3",), buckets={"s3": "bench-test"}, duration=1)
@@ -719,7 +722,9 @@ class ProcessPoolTransferTests(unittest.TestCase):
         cls.thread_beta.join()
 
     def setUp(self):
-        env = patch.dict(os.environ, {"AWS_ACCESS_KEY_ID": "fake", "AWS_SECRET_ACCESS_KEY": "fake", "R2_ACCOUNT_ID": "fake"}, clear=True)
+        env = patch.dict(os.environ, {"AWS_ACCESS_KEY_ID": "fake", "AWS_SECRET_ACCESS_KEY": "fake",
+                                      "R2_ACCOUNT_ID": "fake", "GCS_ACCESS_KEY_ID": "fake",
+                                      "GCS_SECRET_ACCESS_KEY": "fake"}, clear=True)
         env.start()
         self.addCleanup(env.stop)
         self.addCleanup(s3.clear_payload_caches)
@@ -757,6 +762,45 @@ class ProcessPoolTransferTests(unittest.TestCase):
         self.assertTrue(run["loaded_samples"])
         self.assertTrue(all(0 <= sample["at_seconds"] <= run["elapsed_seconds"] for sample in run["loaded_samples"]))
         self.assertGreaterEqual(run["loaded_bytes"], LATENCY_SIZE)
+
+    def test_gcs_provider_loopback_upload_download_and_cleanup(self):
+        # End-to-end through the opt-in provider path: upload manifests come
+        # from upload_reports, worker processes build GCS-credential clients,
+        # downloads verify every range, and cleanup deletes exactly owned keys.
+        options = Options(providers=("gcs",), buckets={"gcs": "gcs-bucket"},
+                          concurrent=2, duration=.05, object_size=1, part_size=8)
+        self.server.state = {"payload": s3.SeededPayload(targets.run_seed(options), 1 * transfer.MIB),
+                             "requests": []}
+
+        def factory(name, region, *, provider):
+            return S3Client(name, region, provider=provider, timeout=10, backoff=0,
+                            endpoint=self.endpoint)
+
+        window = partial(transfer.transfer_window, tcp_factory=FakeTCP)
+        # Process-mode bulk windows only: single-stream windows would leave
+        # worker-thread sockets owned by a dead thread-local pool (elsewhere
+        # covered with in-memory clients, which own no sockets).
+        bulk = [(2, "bulk", 1)]
+        with patch.object(upload, "plan", return_value=bulk), \
+                patch.object(download, "plan", return_value=bulk):
+            uploads = upload.upload_reports("gcs", options, client_factory=factory, window=window)
+            downloads = download.download_reports("gcs", options, client_factory=factory, window=window)
+        self.assertEqual(uploads[0]["region"], "asia-south1")
+        self.assertEqual(uploads[0]["endpoint"], "https://storage.googleapis.com")
+        self.assertTrue(uploads[0]["path_style"])
+        self.assertTrue(uploads[0]["objects"])
+        self.assertTrue(all(run["status"] == "pass" for run in uploads[0]["runs_detail"]))
+        self.assertTrue(all(run["status"] == "pass" for run in downloads[0]["runs_detail"]))
+        self.assertTrue(all(run["errors"] == [] for run in downloads[0]["runs_detail"]))
+        paths = [path for _, path in self.server.state["requests"]]
+        self.assertTrue(paths)
+        self.assertTrue(all(path.startswith("/gcs-bucket/") for path in paths))  # path-style
+        owned = uploads[0]["owned"]
+        self.assertTrue(owned)
+        transfer.cleanup(options)
+        deletes = [path for method, path in self.server.state["requests"] if method == "DELETE"]
+        self.assertEqual(len(deletes), len(owned))
+        self.assertEqual(uploads[0]["cleanup"], "deleted exact owned keys")
 
     def test_download_worker_processes_stream_verified_ranges(self):
         self.server.state = {"payload": s3.SeededPayload("proc-seed", self.size), "requests": []}
@@ -845,9 +889,10 @@ class ProcessPoolTransferTests(unittest.TestCase):
         import pickle
         slots = multiprocessing.Array("i", 2)
         stop = multiprocessing.Event()
-        transfer._pool_initialiser((("bucket", self.endpoint, 10, 2, 0),), stop, slots,
+        transfer._pool_initialiser((("bucket", self.endpoint, 10, 2, 0, "s3"),), stop, slots,
                                    2 * 1024 * 1024, None)
         self.assertIsInstance(transfer._POOL_STATE["clients"]["bucket"], S3Client)
+        self.assertEqual(transfer._POOL_STATE["clients"]["bucket"].provider, "s3")
         self.assertIs(transfer._POOL_STATE["stop"], stop)
         self.assertIn(os.getpid(), list(slots))
         s3.clear_payload_caches()

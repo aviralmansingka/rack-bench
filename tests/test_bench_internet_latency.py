@@ -13,7 +13,8 @@ from rack_bench.bench import runner
 from rack_bench.bench.internet import CHECKS, Options, before_run
 from rack_bench.bench.internet import latency, s3client as s3
 
-ENV = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test", "R2_ACCOUNT_ID": "test"}
+ENV = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test", "R2_ACCOUNT_ID": "test",
+       "GCS_ACCESS_KEY_ID": "test", "GCS_SECRET_ACCESS_KEY": "test"}
 
 
 class MemoryS3:
@@ -171,8 +172,27 @@ class LatencyTests(unittest.TestCase):
         self.assertEqual([r["status"] for r in regions], ["pass", "skip", "skip"])
         self.assertIn("https://test.r2.cloudflarestorage.com/bench-r2/", check.source[0])
 
-    def test_gcs_and_warp_are_explicitly_unsupported(self):
-        self.assertEqual(self.probe("gcs").status, "skip")
+    def test_gcs_probe_is_opt_in_and_uses_the_bucket_location(self):
+        self.options.buckets = {"gcs": "bench-gcs"}
+        check = self.probe("gcs")
+        self.assertEqual(check.status, "pass")
+        self.assertEqual(self.factory.call_args.kwargs["provider"], "gcs")
+        region = json.loads(check.detail)["regions"][0]
+        self.assertEqual(region["region"], "asia-south1")
+        self.assertEqual(region["endpoint"], "https://storage.googleapis.com")
+        self.assertTrue(region["path_style"])
+        self.assertIn("https://storage.googleapis.com/bench-gcs/", check.source[0])
+
+    def test_gcs_missing_credentials_skip_with_reason_and_no_io(self):
+        self.options.buckets = {"gcs": "bench-gcs"}
+        with patch.dict(os.environ, {}, clear=True):
+            check = self.probe("gcs")
+        self.assertEqual(check.status, "skip")
+        self.assertIn("credentials not set", check.detail)
+        self.assertIn("GCS_ACCESS_KEY_ID", check.detail)
+        self.factory.assert_not_called()
+
+    def test_warp_is_explicitly_unsupported(self):
         self.options.tool = "warp"
         self.assertIn("Warp execution not implemented", self.probe().detail)
         self.factory.assert_not_called()
