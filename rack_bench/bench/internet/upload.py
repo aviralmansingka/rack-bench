@@ -69,6 +69,7 @@ def upload_reports(provider, options, *, client_factory=S3Client, window=transfe
                 run, objects = window(client, direction="up", prefix=f"{prefix}{kind}-{concurrency}-{index}/",
                                       concurrency=concurrency, duration=options.duration, objects=[], owned=record["owned"],
                                       size=size, part_size=options.part_size * MIB, seed=run_seed(options),
+                                      upload_mode=options.upload_mode,
                                       buckets=names, clients=clients,
                                       one_object=target["band"] == "light", loaded=loaded if kind == "bulk" else None,
                                       provider=provider,

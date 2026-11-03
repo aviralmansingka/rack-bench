@@ -21,6 +21,7 @@ class Options:
     duration: int | None = None  # seconds per test; defaults depend on profile
     object_size: int | None = None  # MiB per uploaded object; default depends on profile
     part_size: int | None = None  # MiB per multipart part / range GET; default 64
+    upload_mode: str = "auto"  # auto: one PutObject for single-part-sized objects
     tool: str = "stdlib"
     keep_data: bool = False
     yes: bool = False
@@ -151,6 +152,9 @@ def add_arguments(parser):
                         help="uploaded object size in MiB (default: quick 32, certify 1024)")
     parser.add_argument("--part-size", type=part_size_mib, metavar="MIB",
                         help="multipart part / range GET size in MiB (default: 64; 8..512)")
+    parser.add_argument("--upload-mode", choices=("auto", "multipart"), default="auto",
+                        help="auto: one plain PutObject when the object fits in one part (default); "
+                             "multipart: force the initiate/part/complete pattern for comparisons")
     parser.add_argument("--tool", choices=("stdlib", "warp"), default="stdlib")
     parser.add_argument("--keep-data", action="store_true", help="retain objects under this run's rack-bench/ prefix")
     parser.add_argument("--yes", action="store_true", help="accept the certify reference cost estimate")
